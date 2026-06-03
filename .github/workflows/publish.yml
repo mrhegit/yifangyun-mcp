@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -42,6 +44,37 @@ jobs:
       - name: Check package contents
         run: npm pack --dry-run
 
+      - name: Generate release notes
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          PREVIOUS_TAG="$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
+
+          {
+            echo "## yifangyun-mcp-server v${VERSION}"
+            echo ""
+            echo "### Package"
+            echo ""
+            echo "- npm: \`yifangyun-mcp-server@${VERSION}\`"
+            echo "- Global install: \`npm install -g yifangyun-mcp-server\`"
+            echo "- npx: \`npx -y yifangyun-mcp-server\`"
+            echo ""
+            echo "### Changes"
+            echo ""
+            if [ -n "$PREVIOUS_TAG" ]; then
+              git log --pretty=format:"- %s (%h)" "${PREVIOUS_TAG}..HEAD"
+            else
+              git log --pretty=format:"- %s (%h)" --max-count=20
+            fi
+            echo ""
+            echo ""
+            echo "### Verification"
+            echo ""
+            echo "- \`npm ci\`"
+            echo "- \`npm run build\`"
+            echo "- \`npm pack --dry-run\`"
+          } > release-notes.md
+
       - name: Publish to npm
         run: npm publish
         env:
@@ -50,4 +83,4 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: release-notes.md
