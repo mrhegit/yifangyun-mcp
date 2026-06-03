@@ -85,6 +85,106 @@ npm install git+ssh://git@github.com:mrhegit/yifangyun-mcp.git
 
 包内配置了 `prepare` 脚本，安装时会执行 TypeScript 构建。
 
+## npm 市场安装
+
+发布到 npm 后，可以全局安装：
+
+```bash
+npm install -g yifangyun-mcp-server
+```
+
+MCP 客户端配置：
+
+```json
+{
+  "mcpServers": {
+    "yifangyun": {
+      "command": "yifangyun-mcp-server",
+      "args": [],
+      "env": {
+        "YFY_CLIENT_ID": "your-client-id",
+        "YFY_CLIENT_SECRET": "your-client-secret",
+        "YFY_ENTERPRISE_ID": "115",
+        "YFY_DEFAULT_USER_ID": "530"
+      }
+    }
+  }
+}
+```
+
+也可以用 npx：
+
+```json
+{
+  "mcpServers": {
+    "yifangyun": {
+      "command": "npx",
+      "args": ["-y", "yifangyun-mcp-server"],
+      "env": {
+        "YFY_CLIENT_ID": "your-client-id",
+        "YFY_CLIENT_SECRET": "your-client-secret",
+        "YFY_ENTERPRISE_ID": "115",
+        "YFY_DEFAULT_USER_ID": "530"
+      }
+    }
+  }
+}
+```
+
+## GitHub Actions 自动发布 npm
+
+仓库已配置 GitHub Actions，通过仓库 Secret `NPM_TOKEN` 发布到 npm。
+
+工作流文件：
+
+```text
+.github/workflows/publish.yml
+```
+
+触发条件：推送 `v*` tag。
+
+发布前需要在 GitHub 仓库中配置：
+
+```text
+Settings -> Secrets and variables -> Actions -> New repository secret -> NPM_TOKEN
+```
+
+建议使用 npm 的 Automation Token。
+
+发版流程：
+
+```bash
+npm run build
+npm version patch
+git push
+git push --tags
+```
+
+`npm version patch` 会把 `package.json` 版本从例如 `0.1.0` 升到 `0.1.1`，并自动创建 `v0.1.1` tag。GitHub Actions 会校验 tag 版本和 `package.json` 版本一致，不一致会拒绝发布。
+
+工作流步骤：
+
+```text
+checkout
+setup-node@v4
+校验 tag 与 package.json version
+npm ci
+npm run build
+npm pack --dry-run
+npm publish
+创建 GitHub Release
+```
+
+发布前包内容由 `package.json` 的 `files` 字段控制，仅包含：
+
+```text
+dist/
+README.md
+LICENSE
+docs/
+.env.example
+```
+
 ## 验证步骤
 
 推荐按以下顺序验证。

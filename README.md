@@ -145,6 +145,29 @@ npm run build
 npm run dev
 ```
 
+## npm 自动发布
+
+仓库内置 GitHub Actions 发布流程：`.github/workflows/publish.yml`。
+
+触发方式是推送 `v*` tag：
+
+```bash
+npm version patch
+git push
+git push --tags
+```
+
+Action 会自动执行 `npm ci`、`npm run build`、`npm pack --dry-run` 和 `npm publish`。发布前需要在 GitHub 仓库 Actions Secrets 中配置 `NPM_TOKEN`。
+
+发布后可全局安装或通过 npx 使用：
+
+```bash
+npm install -g yifangyun-mcp-server
+yifangyun-mcp-server
+
+npx -y yifangyun-mcp-server
+```
+
 ## 版本状态
 
 当前版本：`0.1.0`。
