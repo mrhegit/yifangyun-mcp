@@ -5,12 +5,13 @@ import { redactSensitiveText, YifangyunClient, YifangyunError } from "../client.
 import type { AppConfig, IdLike, JsonArray, JsonObject, JsonPrimitive, JsonValue, ToolOutput } from "../types.js";
 
 const IdSchema = z.union([
-  z.string().regex(/^\d+$/, "id must contain digits only"),
+  z.string().trim().regex(/^\d+$/, "id must contain digits only"),
   z.number().int().nonnegative()
 ]);
+const OptionalIdSchema = z.union([IdSchema, z.literal("")]).optional();
 
 const OptionalUserShape = {
-  user_id: IdSchema.optional().describe("Yifangyun user id used to access cloud-drive resources. Defaults to server strategy.")
+  user_id: OptionalIdSchema.describe("Yifangyun user id used to access cloud-drive resources. Empty or omitted values use the server strategy.")
 };
 
 const PageShape = {
@@ -178,6 +179,10 @@ function idToPath(value: IdLike): string {
   return encodeURIComponent(String(value));
 }
 
+function normalizeOptionalId(value: IdLike | "" | undefined): IdLike | undefined {
+  return value === "" ? undefined : value;
+}
+
 function ok(data: JsonValue): ToolResponse {
   const output: ToolOutput = { ok: true, data };
   return {
@@ -216,16 +221,17 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
       title: "Test Yifangyun Authentication",
       description: "Validate enterprise JWT authentication, user JWT authentication, and lightweight organization/user API access. Returns no token values.",
       inputSchema: {
-        user_id: IdSchema.optional().describe("Optional user id to test. Defaults to YFY_DEFAULT_USER_ID.")
+        user_id: OptionalIdSchema.describe("Optional user id to test. Empty or omitted values default to YFY_DEFAULT_USER_ID.")
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
     },
     async ({ user_id }) => {
+      const resolvedUserId = normalizeOptionalId(user_id);
       try {
         await client.getEnterpriseToken();
-        await client.getUserToken(user_id ?? config.defaultUserId);
+        await client.getUserToken(resolvedUserId ?? config.defaultUserId);
         const departmentInfo = await client.getEnterprise("/v2/admin/department/0/info");
-        const userInfo = await client.getAsUser("/v2/user/info", user_id ?? config.defaultUserId);
+        const userInfo = await client.getAsUser("/v2/user/info", resolvedUserId ?? config.defaultUserId);
         return ok({
           config: getConfigSummary(config),
           enterprise_token_ok: true,
@@ -244,12 +250,12 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     {
       title: "Get Yifangyun User Info",
       description: "Get basic information for a Yifangyun user token. Defaults to the configured default user.",
-      inputSchema: { user_id: IdSchema.optional().describe("User id to inspect. Defaults to YFY_DEFAULT_USER_ID.") },
+      inputSchema: { user_id: OptionalIdSchema.describe("User id to inspect. Empty or omitted values default to YFY_DEFAULT_USER_ID.") },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
     },
     async ({ user_id }) => {
       try {
-        const data = await client.getAsUser("/v2/user/info", user_id ?? config.defaultUserId);
+        const data = await client.getAsUser("/v2/user/info", normalizeOptionalId(user_id) ?? config.defaultUserId);
         return ok(compactUser(data, false) ?? { raw_keys: isObject(data) ? Object.keys(data) : [] });
       } catch (error) {
         return fail(error);
@@ -328,7 +334,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     },
     async ({ user_id, page_id, page_capacity }) => {
       try {
-        const data = await client.getAsUser("/v2/folder/personal_items", user_id, { page_id, page_capacity: clampPageCapacity(page_capacity, config) });
+        const data = await client.getAsUser("/v2/folder/personal_items", normalizeOptionalId(user_id), { page_id, page_capacity: clampPageCapacity(page_capacity, config) });
         return ok(compactItemList(data));
       } catch (error) {
         return fail(error);
@@ -346,7 +352,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     },
     async ({ department_id, user_id, page_id, page_capacity }) => {
       try {
-        const data = await client.getAsUser("/v2/folder/department_folders", user_id, {
+        const data = await client.getAsUser("/v2/folder/department_folders", normalizeOptionalId(user_id), {
           department_id: String(department_id),
           page_id,
           page_capacity: clampPageCapacity(page_capacity, config)
@@ -373,7 +379,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     },
     async ({ folder_id, type, user_id, page_id, page_capacity }) => {
       try {
-        const data = await client.getAsUser(`/v2/folder/${idToPath(folder_id)}/children`, user_id, {
+        const data = await client.getAsUser(`/v2/folder/${idToPath(folder_id)}/children`, normalizeOptionalId(user_id), {
           type,
           page_id,
           page_capacity: clampPageCapacity(page_capacity, config)
@@ -395,7 +401,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
         type: SearchTypeSchema.default("all").describe("Search target type."),
         query_filter: QueryFilterSchema.default("all").describe("Search field: file_name, content, creator, tag, or all."),
         department_id: z.union([z.string(), z.number().int()]).optional().describe("Search space: 0 personal, -1 collaborations, or a department id."),
-        search_in_folder: IdSchema.optional().describe("Restrict search to a parent folder."),
+        search_in_folder: OptionalIdSchema.describe("Restrict search to a parent folder."),
         sort_by: SortBySchema.default("date"),
         sort_direction: SortDirectionSchema.default("desc"),
         precise_search: z.boolean().optional().describe("Whether to enable precise search when supported."),
@@ -407,12 +413,12 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     },
     async (params) => {
       try {
-        const data = await client.getAsUser("/v2/item/search", params.user_id, {
+        const data = await client.getAsUser("/v2/item/search", normalizeOptionalId(params.user_id), {
           query_words: params.query_words,
           type: params.type,
           query_filter: params.query_filter,
           department_id: params.department_id === undefined ? undefined : String(params.department_id),
-          search_in_folder: params.search_in_folder === undefined ? undefined : String(params.search_in_folder),
+          search_in_folder: normalizeOptionalId(params.search_in_folder) === undefined ? undefined : String(normalizeOptionalId(params.search_in_folder)),
           sort_by: params.sort_by,
           sort_direction: params.sort_direction,
           precise_search: params.precise_search,
@@ -434,15 +440,16 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
       description: "Get file metadata by file id. Uses user-token permissions.",
       inputSchema: {
         file_id: IdSchema.describe("File id."),
-        external_enterprise_id: IdSchema.optional().describe("External collaboration enterprise id when required."),
+        external_enterprise_id: OptionalIdSchema.describe("External collaboration enterprise id when required."),
         ...OptionalUserShape
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
     },
     async ({ file_id, external_enterprise_id, user_id }) => {
       try {
-        const data = await client.getAsUser(`/v2/file/${idToPath(file_id)}/info_v2`, user_id, {
-          external_enterprise_id: external_enterprise_id === undefined ? undefined : String(external_enterprise_id)
+        const resolvedExternalEnterpriseId = normalizeOptionalId(external_enterprise_id);
+        const data = await client.getAsUser(`/v2/file/${idToPath(file_id)}/info_v2`, normalizeOptionalId(user_id), {
+          external_enterprise_id: resolvedExternalEnterpriseId === undefined ? undefined : String(resolvedExternalEnterpriseId)
         });
         return ok(compactItem(data));
       } catch (error) {
@@ -458,8 +465,8 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
       description: "Get a pre-signed download URL for a file. The server never downloads the file content and never logs the URL.",
       inputSchema: {
         file_id: IdSchema.describe("File id."),
-        version: IdSchema.optional().describe("File version id or 0 for current version when supported."),
-        external_enterprise_id: IdSchema.optional().describe("External collaboration enterprise id when required."),
+        version: OptionalIdSchema.describe("File version id or 0 for current version when supported."),
+        external_enterprise_id: OptionalIdSchema.describe("External collaboration enterprise id when required."),
         ...OptionalUserShape
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
@@ -469,9 +476,11 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
         if (!config.allowDownloadUrl) {
           throw new YifangyunError("Download URL output is disabled by YFY_ALLOW_DOWNLOAD_URL.");
         }
-        const data = await client.getAsUser(`/v2/file/${idToPath(file_id)}/download_v2`, user_id, {
-          version: version === undefined ? undefined : String(version),
-          external_enterprise_id: external_enterprise_id === undefined ? undefined : String(external_enterprise_id)
+        const resolvedVersion = normalizeOptionalId(version);
+        const resolvedExternalEnterpriseId = normalizeOptionalId(external_enterprise_id);
+        const data = await client.getAsUser(`/v2/file/${idToPath(file_id)}/download_v2`, normalizeOptionalId(user_id), {
+          version: resolvedVersion === undefined ? undefined : String(resolvedVersion),
+          external_enterprise_id: resolvedExternalEnterpriseId === undefined ? undefined : String(resolvedExternalEnterpriseId)
         });
         if (!isObject(data)) {
           return ok({ raw: data });

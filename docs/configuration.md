@@ -79,6 +79,8 @@ https://qiyeyun.example.com/openapi/api/v2/...
 
 文件访问接口需要用户 token。服务通过 `YFY_FILE_ACCESS_USER_STRATEGY` 决定未显式传 `user_id` 时使用哪个用户。
 
+如果 MCP 客户端把未填写的可选 ID 传成空字符串，服务会按“未传”处理并继续走默认策略。数字 `0` 仍然会被当成真实 ID，不会被转换成默认用户。
+
 | 策略值 | 行为 | 适用场景 |
 |---|---|---|
 | `default` | 使用 `YFY_DEFAULT_USER_ID` | 常规使用，推荐默认值 |
@@ -172,3 +174,5 @@ YFY_LOG_LEVEL=info
 | 部门能查，文件不能查 | 企业 token 正常，但默认用户没有云盘权限 | 换 `user_id` 或配置管理员用户 |
 | 私有化部署 404 | OpenAPI 地址少了或多了 `/api` | 优先使用 `YFY_OPENAPI_BASE_URL=https://host/openapi` |
 | 下载工具失败 | 文件不存在、用户无权限、或 `YFY_ALLOW_DOWNLOAD_URL=disabled` | 先调用 `yfy_get_file_info` 验证文件可见性 |
+| 提示响应不是合法 JSON | 地址打到登录页、网关错误页、反向代理拦截页或凭证错误页 | 查看错误详情里的 `endpoint`、`content_type` 和 `response_preview` |
+| 空 `user_id` 被误填 | 客户端把空输入传成空字符串 | 留空即可，服务会按默认用户策略处理；不要用 `0` 代表默认用户 |

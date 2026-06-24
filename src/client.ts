@@ -58,6 +58,10 @@ export function redactSensitiveText(text: string): string {
     .replace(/([?&](?:sign|token|access_token|authorization)=)[^&\s]+/gi, "$1***redacted***");
 }
 
+function summarizeText(text: string): string {
+  return redactSensitiveText(text.replace(/\s+/g, " ").trim()).slice(0, 300);
+}
+
 export class YifangyunClient {
   private readonly tokenCache = new Map<string, TokenRecord>();
 
@@ -170,7 +174,12 @@ export class YifangyunClient {
     try {
       const response = await fetch(url, { ...init, signal: controller.signal });
       const text = await response.text();
-      const parsed: unknown = text ? JSON.parse(text) : null;
+      let parsed: unknown = null;
+      try {
+        parsed = text ? JSON.parse(text) : null;
+      } catch (error) {
+        throw this.invalidJsonError(response, text, url, error);
+      }
       if (!response.ok) {
         throw this.httpError(response.status, parsed, url);
       }
@@ -178,9 +187,6 @@ export class YifangyunClient {
     } catch (error) {
       if (error instanceof YifangyunError) {
         throw error;
-      }
-      if (error instanceof SyntaxError) {
-        throw new YifangyunError("Yifangyun response was not valid JSON.", { retryable: false });
       }
       if (error instanceof Error && error.name === "AbortError") {
         throw new YifangyunError("Yifangyun request timed out.", { retryable: true });
@@ -211,6 +217,24 @@ export class YifangyunClient {
       return new YifangyunError("Resource not found. Check the department, folder, or file id.", { statusCode, retryable, details });
     }
     return new YifangyunError(`Yifangyun API request failed with HTTP ${statusCode}.`, { statusCode, retryable, details });
+  }
+
+  private invalidJsonError(response: Response, text: string, url: string, error: unknown): YifangyunError {
+    const parsedUrl = new URL(url);
+    const statusCode = response.status;
+    const retryable = statusCode === 429 || statusCode >= 500;
+    const reason = error instanceof Error ? error.message : String(error);
+    return new YifangyunError("Yifangyun response was not valid JSON. Check base URL, reverse proxy, and credentials.", {
+      statusCode,
+      retryable,
+      details: {
+        status_code: statusCode,
+        endpoint: parsedUrl.pathname,
+        content_type: response.headers.get("content-type") ?? "",
+        response_preview: summarizeText(text),
+        parse_error: redactSensitiveText(reason)
+      }
+    });
   }
 }
 

@@ -64,6 +64,8 @@ Windows 路径示例：
 
 路径建议使用正斜杠，避免 JSON 中反斜杠转义问题。
 
+OpenCode 配置使用 `mcp.<name>.env` 注入环境变量，不要写成 `environment`。修改配置后需要重启 OpenCode，已启动的 MCP 进程不会热更新环境变量。
+
 ## 从 GitHub 克隆部署
 
 ```bash
@@ -296,6 +298,8 @@ stdio MCP 不能向 stdout 打普通日志，因为 stdout 用于 MCP 协议通�
 | 部门能查但文件不能查 | 默认用户没有文件权限 | 换 `user_id` 或启用管理员策略 |
 | 私有化部署返回 404 | OpenAPI 路径拼接错误 | 在 `YFY_OPENAPI_BASE_URL` 与 `YFY_API_BASE_URL` 两种写法中选择正确一种 |
 | 下载链接为空 | 文件不存在、无权限或安全开关关闭 | 先查 `yfy_get_file_info`，再查 `YFY_ALLOW_DOWNLOAD_URL` |
+| 提示响应不是合法 JSON | 请求命中登录页、HTML 网关错误页或代理拦截页 | 查看返回详情里的 `endpoint`、`content_type` 和 `response_preview` |
+| 空 `user_id` 触发校验 | 客户端把未填写的可选参数传成空字符串 | 升级到当前版本后空字符串按未传处理；不要用 `0` 表示默认用户 |
 
 ## 生产化建议
 
