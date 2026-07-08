@@ -116,10 +116,34 @@ test("live read-only tools work against configured Yifangyun environment", { ski
   if (folderCandidate?.id !== undefined) {
     const folderId = folderCandidate.id;
     await required(server, "yfy_get_folder_info", { folder_id: folderId });
-    await required(server, "yfy_list_folder_children", { folder_id: folderId, page_id: 0, page_capacity: 5, type: "all" });
+    const folderChildren = await required(server, "yfy_list_folder_children", { folder_id: folderId, page_id: 0, page_capacity: 5, type: "all" });
     await required(server, "yfy_get_folder_ancestors", { folder_id: folderId });
     await required(server, "yfy_build_scope_snapshot", { root_folder_id: folderId, max_depth: 1, max_items: 20, page_capacity: 5 });
     await required(server, "yfy_list_folder_tree", { root_folder_id: folderId, max_depth: 1, max_items: 20, page_capacity: 5 });
+    const childSearchItem = firstObject(folderChildren.files) ?? firstObject(folderChildren.folders);
+    const recursiveQuery = childSearchItem?.name !== undefined ? String(childSearchItem.name) : "__mcp_live_probe_no_match__";
+    const recursive = await required(server, "yfy_search_items_recursive", {
+        root_folder_id: folderId,
+        query_words: recursiveQuery,
+        type: "all",
+        match_mode: "contains",
+        case_sensitive: false,
+        max_depth: 1,
+        max_items: 20,
+        max_results: 5,
+        page_capacity: 5,
+        include_full_metadata: false
+      });
+    if (childSearchItem?.name !== undefined) {
+      const recursiveItems = Array.isArray(recursive.items) ? recursive.items : [];
+      assert.ok(recursiveItems.length >= 1, "Expected recursive search to return at least one match for a known child item name");
+      assert.ok(String(recursiveItems[0]?.path_display ?? "").includes(recursiveQuery), "Expected recursive search result path to include the queried child name");
+    } else {
+      const recursiveStats = recursive.stats && typeof recursive.stats === "object" && !Array.isArray(recursive.stats)
+        ? recursive.stats as Record<string, unknown>
+        : {};
+      assert.equal(Number(recursiveStats.returned_count ?? 0), 0, "Expected no recursive matches when probing a synthetic no-match query in an empty folder");
+    }
   }
 
   if (fileCandidate?.id !== undefined) {

@@ -221,7 +221,9 @@ yfy_list_department_users
 yfy_list_personal_items
 yfy_list_department_folders
 yfy_list_folder_children
+yfy_search_items_recursive
 yfy_search_items
+yfy_search_items_advanced
 yfy_get_file_info
 yfy_get_file_info_full
 yfy_get_folder_info

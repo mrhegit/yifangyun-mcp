@@ -307,6 +307,337 @@ test("yfy_search_items_advanced toggles output density with include_full_metadat
   assert.equal(fullFile.description, "detailed");
 });
 
+test("yfy_build_scope_snapshot keeps direct-children semantics when max_depth is zero", async () => {
+  const server = new FakeServer();
+  const seen: string[] = [];
+  const client = makeClient({
+    getAsUser: async (pathname: string, _userId: IdLike | undefined, params?: Record<string, unknown>) => {
+      seen.push(pathname);
+      const pageId = Number(params?.page_id ?? 0);
+      if (pathname === "/v2/folder/70/info") {
+        return makeResponse(pathname, { id: 70, type: "folder", name: "Root" });
+      }
+      if (pathname === "/v2/folder/70/children" && pageId === 0) {
+        return makeResponse(pathname, {
+          folders: [{ id: 71, type: "folder", name: "ChildFolder" }],
+          files: [{ id: 72, type: "file", name: "top.txt" }],
+          page_id: 0,
+          page_capacity: 200,
+          page_count: 1,
+          total_count: 2
+        });
+      }
+      if (pathname === "/v2/folder/71/children") {
+        throw new Error("max_depth=0 should not descend into grandchild listings");
+      }
+      throw new Error(`Unexpected path ${pathname} page ${pageId}`);
+    }
+  });
+
+  registerTools(server as unknown as McpServer, client, makeConfig());
+  const tool = getTool(server, "yfy_build_scope_snapshot");
+  const result = await tool.handler({ root_folder_id: 70, max_depth: 0, max_items: 10, page_capacity: 200, include_files: true, include_folders: true });
+  const envelope = result.structuredContent as { ok: boolean; data: { folders: Array<Record<string, unknown>>; files: Array<Record<string, unknown>>; stats: Record<string, unknown> }; warnings?: string[] };
+
+  assert.equal(envelope.ok, true);
+  assert.deepEqual(envelope.data.folders.map((item) => item.name), ["ChildFolder"]);
+  assert.deepEqual(envelope.data.files.map((item) => item.name), ["top.txt"]);
+  assert.equal(envelope.data.stats.max_depth, 0);
+  assert.equal(envelope.data.stats.visited_count, 2);
+  assert.equal(envelope.data.stats.truncated, false);
+  assert.deepEqual(envelope.warnings ?? [], []);
+  assert.ok(!seen.includes("/v2/folder/71/children"));
+});
+
+test("yfy_search_items_recursive walks paginated descendants without using official search", async () => {
+  const server = new FakeServer();
+  const seen: string[] = [];
+  const client = makeClient({
+    getAsUser: async (pathname: string, _userId: IdLike | undefined, params?: Record<string, unknown>) => {
+      seen.push(pathname);
+      const pageId = Number(params?.page_id ?? 0);
+      if (pathname === "/v2/folder/1/info") {
+        return makeResponse(pathname, { id: 1, type: "folder", name: "Root" });
+      }
+      if (pathname === "/v2/folder/1/children" && pageId === 0) {
+        return makeResponse(pathname, {
+          folders: [{ id: 2, type: "folder", name: "Target Specs" }],
+          files: [{ id: 10, type: "file", name: "notes.txt" }],
+          page_id: 0,
+          page_capacity: 200,
+          page_count: 2,
+          total_count: 3
+        });
+      }
+      if (pathname === "/v2/folder/1/children" && pageId === 1) {
+        return makeResponse(pathname, {
+          folders: [],
+          files: [{ id: 11, type: "file", name: "target-overview.docx", description: "root hit", sha1: "root-sha" }],
+          page_id: 1,
+          page_capacity: 200,
+          page_count: 2,
+          total_count: 3
+        });
+      }
+      if (pathname === "/v2/folder/2/children" && pageId === 0) {
+        return makeResponse(pathname, {
+          folders: [{ id: 3, type: "folder", name: "Nested" }],
+          files: [{ id: 12, type: "file", name: "bid-target.pdf", description: "child hit", sha1: "child-sha" }],
+          page_id: 0,
+          page_capacity: 200,
+          page_count: 1,
+          total_count: 2
+        });
+      }
+      if (pathname === "/v2/folder/3/children" && pageId === 0) {
+        return makeResponse(pathname, {
+          folders: [],
+          files: [{ id: 13, type: "file", name: "target-appendix.docx", description: "deep hit", sha1: "deep-sha" }],
+          page_id: 0,
+          page_capacity: 200,
+          page_count: 1,
+          total_count: 1
+        });
+      }
+      if (pathname === "/v2/item/search") {
+        throw new Error("recursive search must not call /v2/item/search");
+      }
+      throw new Error(`Unexpected path ${pathname} page ${pageId}`);
+    }
+  });
+
+  registerTools(server as unknown as McpServer, client, makeConfig());
+  const tool = getTool(server, "yfy_search_items_recursive");
+  const result = await tool.handler({
+    root_folder_id: 1,
+    query_words: "target",
+    type: "all",
+    match_mode: "contains",
+    case_sensitive: false,
+    max_depth: 5,
+    max_items: 20,
+    max_results: 10,
+    page_capacity: 200,
+    include_full_metadata: false
+  });
+  const envelope = result.structuredContent as { ok: boolean; data: { items: Array<Record<string, unknown>>; stats: Record<string, unknown> } };
+  const items = envelope.data.items;
+  const stats = envelope.data.stats;
+
+  assert.equal(envelope.ok, true);
+  assert.deepEqual(items.map((item) => item.name), ["Target Specs", "bid-target.pdf", "target-appendix.docx", "target-overview.docx"]);
+  assert.deepEqual(items.map((item) => item.path_display), [
+    "Root/Target Specs",
+    "Root/Target Specs/bid-target.pdf",
+    "Root/Target Specs/Nested/target-appendix.docx",
+    "Root/target-overview.docx"
+  ]);
+  assert.equal(stats.scanned_count, 6);
+  assert.equal(stats.matched_count, 4);
+  assert.equal(stats.folder_match_count, 1);
+  assert.equal(stats.file_match_count, 3);
+  assert.ok(!Object.prototype.hasOwnProperty.call(items[0], "description"));
+  assert.ok(!Object.prototype.hasOwnProperty.call(items[1], "sha1"));
+  assert.ok(!seen.includes("/v2/item/search"));
+});
+
+test("yfy_search_items_recursive supports full metadata output", async () => {
+  const server = new FakeServer();
+  const client = makeClient({
+    getAsUser: async (pathname: string, _userId: IdLike | undefined, params?: Record<string, unknown>) => {
+      const pageId = Number(params?.page_id ?? 0);
+      if (pathname === "/v2/folder/8/info") {
+        return makeResponse(pathname, { id: 8, type: "folder", name: "Root" });
+      }
+      if (pathname === "/v2/folder/8/children" && pageId === 0) {
+        return makeResponse(pathname, {
+          folders: [],
+          files: [{ id: 20, type: "file", name: "target.docx", description: "rich", sha1: "sha-rich", parent_folder_id: 8, modified_at: 1700000000 }],
+          page_id: 0,
+          page_capacity: 200,
+          page_count: 1,
+          total_count: 1
+        });
+      }
+      throw new Error(`Unexpected path ${pathname} page ${pageId}`);
+    }
+  });
+
+  registerTools(server as unknown as McpServer, client, makeConfig());
+  const tool = getTool(server, "yfy_search_items_recursive");
+  const result = await tool.handler({
+    root_folder_id: 8,
+    query_words: "target",
+    type: "file",
+    match_mode: "contains",
+    case_sensitive: false,
+    max_depth: 1,
+    max_items: 10,
+    max_results: 10,
+    page_capacity: 200,
+    include_full_metadata: true
+  });
+  const item = (((result.structuredContent as { data: { items: Array<Record<string, unknown>> } }).data.items)[0]);
+
+  assert.equal(item.description, "rich");
+  assert.equal(item.sha1, "sha-rich");
+  assert.equal(item.path_display, "Root/target.docx");
+});
+
+test("yfy_search_items_recursive respects max_depth and type filtering", async () => {
+  const server = new FakeServer();
+  const seen: string[] = [];
+  const client = makeClient({
+    getAsUser: async (pathname: string, _userId: IdLike | undefined, params?: Record<string, unknown>) => {
+      seen.push(pathname);
+      const pageId = Number(params?.page_id ?? 0);
+      if (pathname === "/v2/folder/30/info") {
+        return makeResponse(pathname, { id: 30, type: "folder", name: "Root" });
+      }
+      if (pathname === "/v2/folder/30/children" && pageId === 0) {
+        return makeResponse(pathname, {
+          folders: [{ id: 31, type: "folder", name: "Target" }],
+          files: [{ id: 32, type: "file", name: "target.txt", parent_folder_id: 30, modified_at: 1700000000 }],
+          page_id: 0,
+          page_capacity: 200,
+          page_count: 1,
+          total_count: 2
+        });
+      }
+      throw new Error(`Unexpected path ${pathname} page ${pageId}`);
+    }
+  });
+
+  registerTools(server as unknown as McpServer, client, makeConfig());
+  const tool = getTool(server, "yfy_search_items_recursive");
+  const result = await tool.handler({
+    root_folder_id: 30,
+    query_words: "target.txt",
+    type: "file",
+    match_mode: "exact",
+    case_sensitive: false,
+    max_depth: 0,
+    max_items: 10,
+    max_results: 10,
+    page_capacity: 200,
+    include_full_metadata: false
+  });
+  const envelope = result.structuredContent as { data: { items: Array<Record<string, unknown>>; stats: Record<string, unknown> } };
+
+  assert.deepEqual(envelope.data.items.map((item) => item.name), ["target.txt"]);
+  assert.equal(envelope.data.stats.folder_match_count, 0);
+  assert.equal(envelope.data.stats.file_match_count, 1);
+  assert.ok(!seen.includes("/v2/folder/31/children"));
+});
+
+test("yfy_search_items_recursive exposes traversal truncation and result limiting", async () => {
+  const server = new FakeServer();
+  const client = makeClient({
+    getAsUser: async (pathname: string, _userId: IdLike | undefined, params?: Record<string, unknown>) => {
+      const pageId = Number(params?.page_id ?? 0);
+      if (pathname === "/v2/folder/40/info") {
+        return makeResponse(pathname, { id: 40, type: "folder", name: "Root" });
+      }
+      if (pathname === "/v2/folder/40/children" && pageId === 0) {
+        return makeResponse(pathname, {
+          folders: [],
+          files: [
+            { id: 41, type: "file", name: "target-a.txt" },
+            { id: 42, type: "file", name: "target-b.txt" },
+            { id: 43, type: "file", name: "target-c.txt" }
+          ],
+          page_id: 0,
+          page_capacity: 200,
+          page_count: 1,
+          total_count: 3
+        });
+      }
+      throw new Error(`Unexpected path ${pathname} page ${pageId}`);
+    }
+  });
+
+  registerTools(server as unknown as McpServer, client, makeConfig());
+  const tool = getTool(server, "yfy_search_items_recursive");
+  const result = await tool.handler({
+    root_folder_id: 40,
+    query_words: "target",
+    type: "file",
+    match_mode: "contains",
+    case_sensitive: false,
+    max_depth: 1,
+    max_items: 2,
+    max_results: 1,
+    page_capacity: 200,
+    include_full_metadata: false
+  });
+  const envelope = result.structuredContent as { data: { items: Array<Record<string, unknown>>; stats: Record<string, unknown> }; warnings?: string[] };
+
+  assert.equal(envelope.data.stats.truncated, true);
+  assert.equal(envelope.data.stats.result_limited, true);
+  assert.equal(envelope.data.stats.scanned_count, 2);
+  assert.equal(envelope.data.stats.matched_count, 2);
+  assert.equal(envelope.data.stats.returned_count, 1);
+  assert.deepEqual(envelope.warnings, [
+    "Recursive search truncated by max_items. Increase max_items for a fuller result.",
+    "Recursive search truncated by max_results. Increase max_results for more matches."
+  ]);
+});
+
+test("yfy_search_items_recursive returns empty results when nothing matches", async () => {
+  const server = new FakeServer();
+  const client = makeClient({
+    getAsUser: async (pathname: string, _userId: IdLike | undefined, params?: Record<string, unknown>) => {
+      const pageId = Number(params?.page_id ?? 0);
+      if (pathname === "/v2/folder/50/info") {
+        return makeResponse(pathname, { id: 50, type: "folder", name: "Root" });
+      }
+      if (pathname === "/v2/folder/50/children" && pageId === 0) {
+        return makeResponse(pathname, {
+          folders: [{ id: 51, type: "folder", name: "Specs" }],
+          files: [{ id: 52, type: "file", name: "notes.txt" }],
+          page_id: 0,
+          page_capacity: 200,
+          page_count: 1,
+          total_count: 2
+        });
+      }
+      if (pathname === "/v2/folder/51/children" && pageId === 0) {
+        return makeResponse(pathname, {
+          folders: [],
+          files: [{ id: 53, type: "file", name: "appendix.pdf" }],
+          page_id: 0,
+          page_capacity: 200,
+          page_count: 1,
+          total_count: 1
+        });
+      }
+      throw new Error(`Unexpected path ${pathname} page ${pageId}`);
+    }
+  });
+
+  registerTools(server as unknown as McpServer, client, makeConfig());
+  const tool = getTool(server, "yfy_search_items_recursive");
+  const result = await tool.handler({
+    root_folder_id: 50,
+    query_words: "missing-keyword",
+    type: "all",
+    match_mode: "contains",
+    case_sensitive: false,
+    max_depth: 5,
+    max_items: 20,
+    max_results: 10,
+    page_capacity: 200,
+    include_full_metadata: false
+  });
+  const envelope = result.structuredContent as { ok: boolean; data: { items: Array<Record<string, unknown>>; stats: Record<string, unknown> } };
+
+  assert.equal(envelope.ok, true);
+  assert.deepEqual(envelope.data.items, []);
+  assert.equal(envelope.data.stats.matched_count, 0);
+  assert.equal(envelope.data.stats.returned_count, 0);
+  assert.equal(envelope.data.stats.truncated, false);
+});
+
 test("yfy_resolve_path paginates root and child listings", async () => {
   const server = new FakeServer();
   const client = makeClient({

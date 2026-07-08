@@ -27,6 +27,7 @@ const PageShape = {
 const SortBySchema = z.enum(["name", "date", "size", "score"]);
 const SortDirectionSchema = z.enum(["asc", "desc"]);
 const SearchTypeSchema = z.enum(["file", "folder", "all"]);
+const RecursiveSearchMatchModeSchema = z.enum(["contains", "exact", "prefix", "suffix"]);
 const QueryFilterSchema = z.enum(["file_name", "content", "creator", "tag", "all"]);
 const FolderChildTypeSchema = z.enum(["file", "folder", "all"]);
 const ItemTypeSchema = z.enum(["file", "folder"]);
@@ -55,6 +56,8 @@ type ToolResponse = {
   structuredContent?: ToolOutput;
   isError?: boolean;
 };
+
+type RecursiveSearchMatchMode = z.infer<typeof RecursiveSearchMatchModeSchema>;
 
 function isObject(value: JsonValue | undefined): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -271,8 +274,52 @@ function compactItemBasic(value: JsonValue | undefined): JsonObject {
   addPrimitive(output, "size", value);
   addId(output, "parent_folder_id", value);
   addPrimitive(output, "extension_category", value);
-  addTimeFields(output, "modified_at", value);
+  if (numberValue(value.modified_at) !== undefined) {
+    addTimeFields(output, "modified_at", value);
+  } else {
+    addPrimitive(output, "modified_at_unix", value);
+    addPrimitive(output, "modified_at_iso", value);
+  }
   return output;
+}
+
+function compactScopedItemWithMode(item: JsonObject, includeFullMetadata: boolean): JsonObject {
+  const output = includeFullMetadata ? { ...item } : compactItemBasic(item);
+  addPrimitive(output, "depth", item);
+  addPrimitive(output, "path_display", item);
+  return output;
+}
+
+function annotateScopedItem(item: JsonObject, depth: number, pathDisplay: string): JsonObject {
+  item.depth = depth;
+  item.path_display = pathDisplay;
+  return item;
+}
+
+function normalizeMatchText(value: string, caseSensitive: boolean): string {
+  const normalized = value.normalize("NFKC").trim();
+  return caseSensitive ? normalized : normalized.toLocaleLowerCase();
+}
+
+function matchesScopedItemName(name: string | undefined, queryWords: string, matchMode: RecursiveSearchMatchMode, caseSensitive: boolean): boolean {
+  if (!name) {
+    return false;
+  }
+  const normalizedName = normalizeMatchText(name, caseSensitive);
+  const normalizedQuery = normalizeMatchText(queryWords, caseSensitive);
+  if (normalizedQuery.length === 0) {
+    return false;
+  }
+  if (matchMode === "exact") {
+    return normalizedName === normalizedQuery;
+  }
+  if (matchMode === "prefix") {
+    return normalizedName.startsWith(normalizedQuery);
+  }
+  if (matchMode === "suffix") {
+    return normalizedName.endsWith(normalizedQuery);
+  }
+  return normalizedName.includes(normalizedQuery);
 }
 
 function compactVersion(value: JsonValue | undefined): JsonObject {
@@ -831,18 +878,35 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     return { download, metas: [infoResponse.meta, ticket.meta, downloaded.meta] };
   };
 
-  const buildScopeSnapshot = async (
+  const listFolderChildrenPage = async (
+    folderId: IdLike,
+    userId: IdLike | undefined,
+    pageId: number,
+    pageCapacity: number,
+    metas: ApiResponseMeta[]
+  ): Promise<JsonObject> => {
+    const response = await client.getAsUser(`/v2/folder/${idToPath(folderId)}/children`, userId, {
+      type: "all",
+      page_id: pageId,
+      page_capacity: clampPageCapacity(pageCapacity, config)
+    });
+    metas.push(response.meta);
+    return compactItemList(response.data);
+  };
+
+  const walkFolderScope = async (
     rootFolderId: IdLike,
     userId: IdLike | undefined,
-    options: { includeFiles: boolean; includeFolders: boolean; maxDepth: number; maxItems: number; pageCapacity: number }
-  ): Promise<{ data: JsonObject; metas: ApiResponseMeta[]; warnings: string[] }> => {
+    options: { maxDepth: number; maxItems: number; pageCapacity: number },
+    visitor: {
+      onFolder?: (folder: JsonObject, context: { depth: number; pathDisplay: string }) => Promise<{ descend?: boolean } | void> | { descend?: boolean } | void;
+      onFile?: (file: JsonObject, context: { depth: number; pathDisplay: string }) => Promise<void> | void;
+    }
+  ): Promise<{ rootFolder: JsonObject; metas: ApiResponseMeta[]; truncated: boolean; visitedCount: number }> => {
     const metas: ApiResponseMeta[] = [];
-    const warnings: string[] = [];
     const rootInfo = await getFolderInfo(rootFolderId, userId);
     metas.push(rootInfo.meta);
     const rootFolder = compactItem(rootInfo.data);
-    const folders: JsonObject[] = [];
-    const files: JsonObject[] = [];
     let truncated = false;
     let visited = 0;
 
@@ -852,13 +916,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
       }
       let pageId = 0;
       while (!truncated) {
-        const response = await client.getAsUser(`/v2/folder/${idToPath(folderId)}/children`, userId, {
-          type: "all",
-          page_id: pageId,
-          page_capacity: clampPageCapacity(options.pageCapacity, config)
-        });
-        metas.push(response.meta);
-        const list = compactItemList(response.data);
+        const list = await listFolderChildrenPage(folderId, userId, pageId, options.pageCapacity, metas);
         const childFolders = arrayValue(list.folders).filter((value): value is JsonObject => isObject(value));
         const childFiles = arrayValue(list.files).filter((value): value is JsonObject => isObject(value));
 
@@ -869,12 +927,11 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
           }
           visited += 1;
           const nextDisplay = `${displayPath}/${String(folder.name ?? folder.id ?? "folder")}`;
-          folder.depth = depth + 1;
-          folder.path_display = nextDisplay;
-          if (options.includeFolders) {
-            folders.push(folder);
+          annotateScopedItem(folder, depth + 1, nextDisplay);
+          const decision = await visitor.onFolder?.(folder, { depth: depth + 1, pathDisplay: nextDisplay });
+          if ((decision?.descend ?? true) && !truncated) {
+            await walk(String(folder.id ?? "0"), depth + 1, nextDisplay);
           }
-          await walk(String(folder.id ?? "0"), depth + 1, nextDisplay);
           if (truncated) {
             break;
           }
@@ -886,10 +943,11 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
             break;
           }
           visited += 1;
-          file.depth = depth + 1;
-          file.path_display = `${displayPath}/${String(file.name ?? file.id ?? "file")}`;
-          if (options.includeFiles) {
-            files.push(file);
+          const nextDisplay = `${displayPath}/${String(file.name ?? file.id ?? "file")}`;
+          annotateScopedItem(file, depth + 1, nextDisplay);
+          await visitor.onFile?.(file, { depth: depth + 1, pathDisplay: nextDisplay });
+          if (truncated) {
+            break;
           }
         }
 
@@ -901,12 +959,36 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     };
 
     await walk(rootFolderId, 0, String(rootFolder.name ?? rootFolder.id ?? rootFolderId));
-    if (truncated) {
+    return { rootFolder, metas, truncated, visitedCount: visited };
+  };
+
+  const buildScopeSnapshot = async (
+    rootFolderId: IdLike,
+    userId: IdLike | undefined,
+    options: { includeFiles: boolean; includeFolders: boolean; maxDepth: number; maxItems: number; pageCapacity: number }
+  ): Promise<{ data: JsonObject; metas: ApiResponseMeta[]; warnings: string[] }> => {
+    const warnings: string[] = [];
+    const folders: JsonObject[] = [];
+    const files: JsonObject[] = [];
+    const walked = await walkFolderScope(rootFolderId, userId, options, {
+      onFolder: async (folder) => {
+        if (options.includeFolders) {
+          folders.push(folder);
+        }
+        return { descend: true };
+      },
+      onFile: async (file) => {
+        if (options.includeFiles) {
+          files.push(file);
+        }
+      }
+    });
+    if (walked.truncated) {
       warnings.push("Snapshot truncated by max_items. Increase max_items for a fuller result.");
     }
     return {
       data: {
-        root_folder: rootFolder,
+        root_folder: walked.rootFolder,
         folders,
         files,
         stats: {
@@ -914,11 +996,88 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
           max_items: options.maxItems,
           folder_count: folders.length,
           file_count: files.length,
-          truncated,
-          visited_count: visited
+          truncated: walked.truncated,
+          visited_count: walked.visitedCount
         }
       },
-      metas,
+      metas: walked.metas,
+      warnings
+    };
+  };
+
+  const searchItemsRecursive = async (
+    rootFolderId: IdLike,
+    userId: IdLike | undefined,
+    options: {
+      caseSensitive: boolean;
+      includeFullMetadata: boolean;
+      matchMode: RecursiveSearchMatchMode;
+      maxDepth: number;
+      maxItems: number;
+      maxResults: number;
+      pageCapacity: number;
+      queryWords: string;
+      type: "file" | "folder" | "all";
+    }
+  ): Promise<{ data: JsonObject; metas: ApiResponseMeta[]; warnings: string[] }> => {
+    const warnings: string[] = [];
+    const matches: JsonObject[] = [];
+    let matchedFileCount = 0;
+    let matchedFolderCount = 0;
+
+    const walked = await walkFolderScope(rootFolderId, userId, {
+      maxDepth: options.maxDepth,
+      maxItems: options.maxItems,
+      pageCapacity: options.pageCapacity
+    }, {
+      onFolder: async (folder, context) => {
+        if (options.type !== "file" && matchesScopedItemName(stringValue(folder.name), options.queryWords, options.matchMode, options.caseSensitive)) {
+          matchedFolderCount += 1;
+          const output = compactScopedItemWithMode(folder, options.includeFullMetadata);
+          matches.push(annotateScopedItem(output, context.depth, context.pathDisplay));
+        }
+        return { descend: true };
+      },
+      onFile: async (file, context) => {
+        if (options.type !== "folder" && matchesScopedItemName(stringValue(file.name), options.queryWords, options.matchMode, options.caseSensitive)) {
+          matchedFileCount += 1;
+          const output = compactScopedItemWithMode(file, options.includeFullMetadata);
+          matches.push(annotateScopedItem(output, context.depth, context.pathDisplay));
+        }
+      }
+    });
+
+    if (walked.truncated) {
+      warnings.push("Recursive search truncated by max_items. Increase max_items for a fuller result.");
+    }
+    matches.sort((left, right) => String(left.path_display ?? "").localeCompare(String(right.path_display ?? "")));
+    const resultLimited = matches.length > options.maxResults;
+    if (resultLimited) {
+      warnings.push("Recursive search truncated by max_results. Increase max_results for more matches.");
+    }
+    const items = matches.slice(0, options.maxResults);
+    return {
+      data: {
+        root_folder: walked.rootFolder,
+        items,
+        stats: {
+          query_words: options.queryWords,
+          type: options.type,
+          match_mode: options.matchMode,
+          case_sensitive: options.caseSensitive,
+          max_depth: options.maxDepth,
+          max_items: options.maxItems,
+          max_results: options.maxResults,
+          scanned_count: walked.visitedCount,
+          matched_count: matches.length,
+          returned_count: items.length,
+          folder_match_count: matchedFolderCount,
+          file_match_count: matchedFileCount,
+          truncated: walked.truncated,
+          result_limited: resultLimited
+        }
+      },
+      metas: walked.metas,
       warnings
     };
   };
@@ -1361,7 +1520,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
       description: "Build a flat structured snapshot for a root folder using official list-children pagination.",
       inputSchema: {
         root_folder_id: IdSchema.describe("Root folder id."),
-        max_depth: z.number().int().min(0).default(5),
+        max_depth: z.number().int().min(0).default(5).describe("Maximum descendant folder depth to expand. Direct children are depth 1, so max_depth=0 still scans only direct children."),
         max_items: z.number().int().min(1).max(10000).default(1000),
         include_files: z.boolean().default(true),
         include_folders: z.boolean().default(true),
@@ -1388,7 +1547,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
       description: "List a recursive folder tree as a flat item array using only official OpenAPI list endpoints.",
       inputSchema: {
         root_folder_id: IdSchema.describe("Root folder id."),
-        max_depth: z.number().int().min(0).default(5),
+        max_depth: z.number().int().min(0).default(5).describe("Maximum descendant folder depth to expand. Direct children are depth 1, so max_depth=0 still scans only direct children."),
         max_items: z.number().int().min(1).max(10000).default(1000),
         page_capacity: z.number().int().min(1).max(500).default(200),
         ...OptionalUserShape
@@ -1406,6 +1565,41 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
       const files = arrayValue(snapshot.data.files).filter((value): value is JsonObject => isObject(value));
       const items = [...folders, ...files].sort((left, right) => String(left.path_display ?? "").localeCompare(String(right.path_display ?? "")));
       return ok({ root_folder: snapshot.data.root_folder, items, stats: snapshot.data.stats }, workflowMeta("yfy_list_folder_tree", snapshot.metas), { warnings: snapshot.warnings });
+    }
+  );
+
+  registerReadTool(
+    "yfy_search_items_recursive",
+    {
+      title: "Search Yifangyun Items Recursively",
+      description: "Recursively search descendant file and folder names under a root folder using official children pagination. This is a bounded local tree search, not the official /v2/item/search endpoint.",
+      inputSchema: {
+        root_folder_id: IdSchema.describe("Root folder id."),
+        query_words: z.string().trim().min(1).max(200).describe("Name keyword to match inside the root folder subtree."),
+        type: SearchTypeSchema.default("all").describe("Search target type."),
+        match_mode: RecursiveSearchMatchModeSchema.default("contains").describe("Name matching mode: contains, exact, prefix, or suffix."),
+        case_sensitive: z.boolean().default(false).describe("Whether name matching is case-sensitive."),
+        max_depth: z.number().int().min(0).default(5).describe("Maximum descendant folder depth to expand. Direct children are depth 1, so max_depth=0 still scans only direct children."),
+        max_items: z.number().int().min(1).max(10000).default(1000).describe("Maximum descendants to scan before truncation."),
+        max_results: z.number().int().min(1).max(1000).default(100).describe("Maximum matched items to return."),
+        page_capacity: z.number().int().min(1).max(500).default(200).describe("Requested page size. Clamped by YFY_MAX_PAGE_CAPACITY."),
+        include_full_metadata: z.boolean().default(false).describe("Whether to return richer metadata for each match."),
+        ...OptionalUserShape
+      }
+    },
+    async ({ root_folder_id, query_words, type, match_mode, case_sensitive, max_depth, max_items, max_results, page_capacity, include_full_metadata, user_id }) => {
+      const result = await searchItemsRecursive(root_folder_id as IdLike, normalizeOptionalId(user_id as IdLike | "" | undefined), {
+        caseSensitive: case_sensitive as boolean,
+        includeFullMetadata: include_full_metadata as boolean,
+        matchMode: match_mode as RecursiveSearchMatchMode,
+        maxDepth: max_depth as number,
+        maxItems: max_items as number,
+        maxResults: max_results as number,
+        pageCapacity: page_capacity as number,
+        queryWords: query_words as string,
+        type: type as "file" | "folder" | "all"
+      });
+      return ok(result.data, workflowMeta("yfy_search_items_recursive", result.metas), { warnings: result.warnings });
     }
   );
 

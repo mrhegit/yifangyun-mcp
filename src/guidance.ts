@@ -9,7 +9,7 @@ export const SERVER_INSTRUCTIONS = [
   "Prefer read-only discovery, metadata, scope proof, then download/hash workflows.",
   "Pass user_id only when the caller specifies an access identity; otherwise use the configured default strategy.",
   "Mutation/admin tools are gated by environment variables and may be absent.",
-  "For new automation prefer atomic tools over compatibility wrappers, and prefer temp_path+sha256 over exposing download_url."
+  "For new automation prefer atomic tools and explicit scope-bounded workflows, and prefer temp_path+sha256 over exposing download_url."
 ].join(" ");
 
 function asIdText(value: string | number | undefined): string {
@@ -34,11 +34,13 @@ export function registerGuidance(server: McpServer, config: AppConfig): void {
     async (uri) => textResource(uri, [
       "# Yifangyun MCP",
       "",
-      "Use search/list tools to discover files and folders, then use info/ancestors/scope tools to prove authority.",
+      "Use yfy_resolve_path when you know the exact relative path under a personal, department, or folder root.",
+      "Use yfy_search_items for official indexed search across accessible spaces, and pass search_in_folder when you want server-side search within a known folder scope.",
+      "Use yfy_search_items_recursive when you already know root_folder_id and need bounded descendant name search via children pagination instead of relying on server-side search semantics.",
       "Download URL exposure is disabled by default; use temp download tools for evidence workflows.",
       "Mutation tools are registered only when YFY_ENABLE_MUTATION_TOOLS is enabled.",
       "Admin tools are registered only when YFY_ENABLE_ADMIN_TOOLS is enabled.",
-      "Prefer atomic admin/collab tools for new agents; compatibility wrappers remain for broad OpenAPI pass-through.",
+      "Prefer atomic admin/collab tools for new agents.",
       "",
       `Capabilities: mutation=${config.enableMutationTools ? "enabled" : "disabled"}, admin=${config.enableAdminTools ? "enabled" : "disabled"}, download_url=${config.allowDownloadUrl ? "enabled" : "disabled"}.`
     ].join("\n"))
@@ -56,7 +58,7 @@ export function registerGuidance(server: McpServer, config: AppConfig): void {
       "# Workflows",
       "",
       "## Find and lock original",
-      "1. yfy_search_items or yfy_resolve_path",
+      "1. Exact path -> yfy_resolve_path; known folder scope + official indexed search -> yfy_search_items(search_in_folder=...); bounded descendant name search -> yfy_search_items_recursive; otherwise -> yfy_search_items",
       "2. yfy_get_file_info_full",
       "3. yfy_assert_file_in_scope",
       "4. yfy_lock_current_original",
@@ -112,7 +114,7 @@ export function registerGuidance(server: McpServer, config: AppConfig): void {
             `Find the Yifangyun file matching: ${file_hint}.`,
             `Use root_folder_id=${root_folder_id} to prove scope before downloading.`,
             `Use user_id=${asIdText(user_id)} and external_enterprise_id=${asIdText(external_enterprise_id)} when applicable.`,
-            "Recommended tools: yfy_search_items or yfy_resolve_path, yfy_get_file_info_full, yfy_assert_file_in_scope, yfy_lock_current_original.",
+            "Recommended tools: if file_hint is an exact relative path use yfy_resolve_path; if you want official indexed search inside the authorized folder scope use yfy_search_items with search_in_folder=root_folder_id; if you need bounded descendant name search independent of server-side search semantics use yfy_search_items_recursive; then yfy_get_file_info_full, yfy_assert_file_in_scope, yfy_lock_current_original.",
             "Return the file id, path/ancestor proof, sha256, size_bytes, and temp_path."
           ].join("\n")
         }

@@ -46,6 +46,7 @@
 
 - `yfy_build_scope_snapshot`
 - `yfy_list_folder_tree`
+- `yfy_search_items_recursive`
 - `yfy_batch_get_file_info`
 - `yfy_resolve_path`
 - `yfy_search_items`
@@ -57,6 +58,8 @@
 - `yfy_list_groups`
 - `yfy_get_group_users`
 - `yfy_get_user_by_query`
+
+搜索定位建议：已知精确相对路径时优先 `yfy_resolve_path`；已知 folder scope 且希望继续走官方索引时优先 `yfy_search_items` / `yfy_search_items_advanced` 并传 `search_in_folder`；只有在已知 `root_folder_id` 且需要对子树后代名称做有界递归搜索时，再使用 `yfy_search_items_recursive`。
 
 ### 可选写入与管理员能力
 

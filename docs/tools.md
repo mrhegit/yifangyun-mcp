@@ -77,11 +77,14 @@
 | `yfy_list_personal_items` | 个人空间首层文件/文件夹 |
 | `yfy_list_department_folders` | 部门首层文件夹 |
 | `yfy_list_folder_children` | 文件夹单层 children |
+| `yfy_search_items_recursive` | 基于 children 分页的有界递归名称搜索 |
 | `yfy_search_items` | 官方搜索包装 |
 | `yfy_search_items_advanced` | 同一官方搜索端点的增强包装 |
 | `yfy_get_file_info` | 文件元信息 |
 | `yfy_get_file_info_full` | richer file metadata |
 | `yfy_get_folder_info` | 文件夹元信息 |
+
+说明：`yfy_search_items_recursive` 不是 `/v2/item/search` 的直包，而是基于 `/v2/folder/{id}/children` 的分页递归能力，只在已知 `root_folder_id` 的前提下对子树后代名称做搜索。直接 children 记为深度 1，所以 `max_depth=0` 仍会扫描 root 的直接 children。结果完整性受 `max_depth`、`max_items`、`max_results` 与 `page_capacity` 共同约束。
 
 ### Authority 工具
 
@@ -163,7 +166,7 @@
 ### 找文件并锁原件
 
 ```text
-1. yfy_search_items / yfy_resolve_path
+1. 精确相对路径 -> yfy_resolve_path；已知 folder scope 且希望走官方索引 -> yfy_search_items(search_in_folder=...)；已知 root_folder_id 且需要对子树后代名称做有界递归搜索 -> yfy_search_items_recursive；否则 -> yfy_search_items
 2. yfy_get_file_info_full
 3. yfy_assert_file_in_scope
 4. yfy_lock_current_original

@@ -41,10 +41,12 @@
 |---|---|---|
 | `/v2/folder/personal_items` | `yfy_list_personal_items` | 已覆盖 |
 | `/v2/folder/department_folders` | `yfy_list_department_folders` | 已覆盖 |
-| `/v2/folder/{id}/children` | `yfy_list_folder_children`, `yfy_list_folder_tree`, `yfy_build_scope_snapshot`, `yfy_resolve_path` | 已覆盖 |
+| `/v2/folder/{id}/children` | `yfy_list_folder_children`, `yfy_list_folder_tree`, `yfy_build_scope_snapshot`, `yfy_search_items_recursive`, `yfy_resolve_path` | 已覆盖 |
 | `/v2/folder/{id}/info` | `yfy_get_folder_info` | 已覆盖 |
 | `/v2/file/{id}/info_v2` | `yfy_get_file_info`, `yfy_get_file_info_full` | 已覆盖 |
 | `/v2/item/search` | `yfy_search_items`, `yfy_search_items_advanced` | 已覆盖 |
+
+注：`yfy_search_items_recursive` 是基于 `children` 分页递归出来的组合型只读能力，不是官方 `/v2/item/search` 的直包。
 
 ### Authority / 证据链
 
