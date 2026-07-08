@@ -1,40 +1,103 @@
 # yifangyun-mcp-server
 
-亿方云云盘访问 MCP Server。它让支持 MCP 的智能体可以通过亿方云 OpenAPI 查询企业组织、部门云盘目录、文件详情和下载链接。服务默认采用亿方云企业 JWT 模式认证，支持公有云和第三方私有化部署。
+亿方云 OpenAPI 的 MCP Server。当前版本定位为 **OpenAPI-first 的 Cloud Authority Server**：
+
+- 默认暴露只读 authority 能力
+- 写操作与管理员操作按环境变量显式开启
+- 默认不暴露 `download_url`
+- 支持把原件下载到本地临时目录并计算 `sha256`
 
 ## 核心特性
 
 | 特性 | 说明 |
 |---|---|
 | 企业 JWT 默认认证 | 使用 `grant_type=jwt_simple` 换取企业 token 和用户 token |
+| OpenAPI-first | 以亿方云官方 OpenAPI 路径为主，不做脱离官方能力面的私有协议 |
+| 分层能力面 | `只读 authority` + `受控 mutation/admin` |
+| Authority 工具 | folder/file info、versions、ancestors、scope assert、snapshot、download+hash |
+| 本地下载落地 | 下载文件到 `YFY_TEMP_DIR`，返回 `temp_path + sha256 + size_bytes` |
+| 安全默认值 | `download_url` 默认不注册，mutation/admin 默认不注册 |
 | 私有化部署适配 | 支持 `https://host/openapi` 和 `https://host/openapi/api` 两类地址配置 |
-| 部门云盘访问 | 支持部门树、部门成员、部门首层目录、文件夹子项 |
-| 搜索能力 | 支持个人空间、协作空间、部门空间、指定文件夹范围搜索 |
-| 下载链接 | 只返回亿方云预签名下载 URL，不下载文件内容 |
-| 安全优先 | 第一版只读，不包含上传、删除、移动、协作权限修改等写操作 |
-| 输出裁剪 | 默认返回适合智能体使用的关键字段，避免把完整 API 响应塞满上下文 |
+| 统一响应 | 所有工具统一返回 `ok/data/meta/warnings/raw?` 结构 |
+| 限流元数据 | 返回 `request_id`、`source_api_version`、`X-Rate-Limit-*` 摘要 |
 
-## 第一版能力边界
+## 主要能力
 
-第一版定位为“只读云盘访问 MCP”。它适合用于查询资料、定位部门目录、搜索文件、获取文件元信息和下载链接。
+### 核心能力
 
-暂不实现以下写操作：上传文件、上传新版本、移动文件、重命名、删除、清空回收站、恢复回收站、协作权限管理。原因是这些能力会改变真实云盘状态，后续如果要开放，应单独增加危险操作开关和二次确认机制。
+这部分默认开启，适合做文件定位、范围校验、版本核对和原件锁定：
 
-## 工具列表
+- `yfy_get_folder_info`
+- `yfy_get_file_info`
+- `yfy_get_file_info_full`
+- `yfy_get_file_versions`
+- `yfy_get_file_version_info`
+- `yfy_get_folder_ancestors`
+- `yfy_get_file_ancestors`
+- `yfy_assert_file_in_scope`
+- `yfy_download_file_to_temp`
+- `yfy_download_and_hash`
+- `yfy_verify_file_current_version`
+- `yfy_lock_current_original`
 
-| Tool | 能力 | Token |
-|---|---|---|
-| `yfy_auth_test` | 验证企业 JWT、用户 JWT、基础接口 | 企业 + 用户 |
-| `yfy_get_user_info` | 获取用户基础信息 | 用户 |
-| `yfy_get_department_info` | 获取部门详情 | 企业 |
-| `yfy_list_department_children` | 获取子部门 | 企业 |
-| `yfy_list_department_users` | 获取部门成员 | 企业 |
-| `yfy_list_personal_items` | 获取个人空间首层文件和文件夹 | 用户 |
-| `yfy_list_department_folders` | 获取部门首层文件夹 | 用户 |
-| `yfy_list_folder_children` | 获取文件夹下一级文件和文件夹 | 用户 |
-| `yfy_search_items` | 搜索文件或文件夹，支持部门和文件夹范围 | 用户 |
-| `yfy_get_file_info` | 获取文件详情 | 用户 |
-| `yfy_get_download_url` | 获取文件预签名下载链接，不下载文件内容 | 用户 |
+### 扩展只读能力
+
+这部分默认也会开启，适合做目录快照、批量回源、路径解析、协作与组织信息查询：
+
+- `yfy_build_scope_snapshot`
+- `yfy_list_folder_tree`
+- `yfy_batch_get_file_info`
+- `yfy_resolve_path`
+- `yfy_search_items`
+- `yfy_search_items_advanced`
+- `yfy_get_share_links`
+- `yfy_get_comments`
+- `yfy_list_collab_items`
+- `yfy_get_folder_collabs`
+- `yfy_list_groups`
+- `yfy_get_group_users`
+- `yfy_get_user_by_query`
+
+### 可选写入与管理员能力
+
+这部分默认关闭。只有在显式开启对应环境变量后，才会注册：
+
+- `yfy_create_folder`
+- `yfy_update_file`
+- `yfy_update_folder`
+- `yfy_move_item`
+- `yfy_copy_item`
+- `yfy_delete_item`
+- `yfy_restore_item`
+- `yfy_upload_file`
+- `yfy_upload_file_by_path`
+- `yfy_upload_new_version`
+- `yfy_manage_collab`
+- `yfy_admin_departments`
+- `yfy_admin_groups`
+- `yfy_admin_users`
+- `yfy_admin_logs`
+- `yfy_admin_sync`
+
+### 底层能力说明
+
+为了支撑上面的工具，服务内部已经实现：
+
+- 统一 `GET/POST JSON` 请求内核
+- token 缓存和提前刷新
+- 429/5xx 自动退避
+- 本地 temp 下载与 `sha256` 计算
+- 预签名上传地址后的本地文件投递
+
+## 安全默认值
+
+| 环境变量 | 默认值 | 说明 |
+|---|---:|---|
+| `YFY_ALLOW_DOWNLOAD_URL` | `disabled` | 关闭后不注册 `yfy_get_download_url` |
+| `YFY_ENABLE_MUTATION_TOOLS` | `disabled` | 关闭后不注册任何写工具 |
+| `YFY_ENABLE_ADMIN_TOOLS` | `disabled` | 关闭后不注册任何 admin 工具 |
+| `YFY_ENABLE_RAW_RESPONSE` | `disabled` | 关闭后工具不回传原始响应体 |
+| `YFY_MAX_DOWNLOAD_BYTES` | `268435456` | 默认最大下载 256 MiB |
 
 ## 快速开始
 
@@ -43,7 +106,7 @@ npm install
 npm run build
 ```
 
-配置环境变量。公有云地址默认指向 `https://open.fangcloud.com`，通常只需要配置凭证和企业/用户 ID：
+最小公有云配置：
 
 ```bash
 YFY_CLIENT_ID=your-client-id
@@ -52,11 +115,14 @@ YFY_ENTERPRISE_ID=115
 YFY_DEFAULT_USER_ID=530
 ```
 
-私有化部署再显式覆盖地址：
+私有化部署再覆盖地址：
 
 ```bash
 YFY_OPENAPI_BASE_URL=https://qiyeyun.example.com/openapi
 YFY_OAUTH_BASE_URL=https://qiyeyun.example.com/openoauth
+
+# 如果部署直接暴露 /openapi/api，可改用：
+# YFY_API_BASE_URL=https://qiyeyun.example.com/openapi/api
 ```
 
 启动 stdio MCP：
@@ -86,92 +152,63 @@ npm start
 
 ## 权限模型
 
-亿方云 OpenAPI 存在两个权限平面。
+亿方云 OpenAPI 仍然有两个权限平面：
 
 | 权限平面 | Token | 适用接口 |
 |---|---|---|
-| 企业管理 | 企业 token | 部门详情、子部门、部门成员 |
-| 云盘访问 | 用户 token | 个人空间、部门目录、搜索、文件详情、下载链接 |
+| 企业管理 | 企业 token | 部门、管理员、同步、日志 |
+| 云盘访问 | 用户 token | 文件夹、文件、搜索、版本、下载、协作 |
 
-即使某个账号是云盘管理员，也不要假设企业 token 能直接访问文件接口。文件访问工具默认使用 `YFY_DEFAULT_USER_ID`。如果希望默认以管理员身份访问文件，可配置 `YFY_ADMIN_USER_ID` 和 `YFY_FILE_ACCESS_USER_STRATEGY=admin`。
-
-如果 MCP 客户端把未填写的可选 ID 传成空字符串，服务会按“未传”处理并继续走默认用户策略。数字 `0` 会被当成真实 ID，不会被转换成默认用户。
+即使某个账号是云盘管理员，也不要假设企业 token 能直接访问文件接口。文件访问工具默认使用 `YFY_DEFAULT_USER_ID`，或根据 `YFY_FILE_ACCESS_USER_STRATEGY` 走 `admin/explicit` 策略。
 
 ## 典型调用链
 
-查找某部门下的资料目录：
+### 锁定当前原件
 
 ```text
-yfy_list_department_children(department_id=0)
-  -> 找到目标一级部门
-yfy_list_department_children(department_id=<一级部门ID>)
-  -> 找到目标子部门
-yfy_list_department_folders(department_id=<子部门ID>)
-  -> 找到部门云盘首层目录
-yfy_list_folder_children(folder_id=<目录ID>)
-  -> 查看目录下文件和文件夹
+yfy_assert_file_in_scope(file_id, root_folder_id)
+  -> 证明文件属于授权根目录
+yfy_lock_current_original(file_id, root_folder_id)
+  -> 返回 metadata + temp_path + sha256
 ```
 
-搜索部门文件：
+### 构建目录快照
 
 ```text
-yfy_search_items(
-  query_words="营业执照",
-  type="file",
-  query_filter="file_name",
-  department_id="480"
-)
+yfy_build_scope_snapshot(root_folder_id, max_depth=3, max_items=1000)
+  -> 返回 root_folder + folders[] + files[] + stats
 ```
 
-获取文件下载链接：
+### 受控上传新版本
 
 ```text
-yfy_get_file_info(file_id=<文件ID>)
-yfy_get_download_url(file_id=<文件ID>)
+设置 YFY_ENABLE_MUTATION_TOOLS=enabled
+yfy_upload_new_version(file_id, local_path="/path/to/file")
+  -> OpenAPI 申请 presign_url
+  -> 本地字节上传
+  -> 返回 current_file
+```
+
+## 开发命令
+
+```bash
+npm run build
+npm test
+npm run dev
 ```
 
 ## 详细文档
 
 | 文档 | 内容 |
 |---|---|
-| [配置说明](docs/configuration.md) | 环境变量、私有化部署地址、管理员策略 |
-| [工具参考](docs/tools.md) | 11 个 MCP 工具的参数、返回、示例 |
+| [配置说明](docs/configuration.md) | 环境变量、能力开关、私有化部署地址、运行保护参数 |
+| [工具参考](docs/tools.md) | 当前工具分组、推荐使用方式、默认暴露策略 |
+| [OpenAPI 覆盖矩阵](docs/openapi-coverage.md) | 当前 MCP 对官方 OpenAPI 的覆盖范围、部分覆盖项与明确不在范围内的域 |
 | [部署指南](docs/deployment.md) | 本地运行、MCP 客户端接入、GitHub 安装建议 |
-| [架构与安全](docs/architecture-security.md) | 认证流程、权限边界、安全设计、已知限制 |
-
-## 开发命令
-
-```bash
-npm install
-npm run build
-npm run dev
-```
-
-## npm 自动发布
-
-仓库内置 GitHub Actions 发布流程：`.github/workflows/publish.yml`。
-
-触发方式是推送 `v*` tag：
-
-```bash
-npm version patch
-git push
-git push --tags
-```
-
-Action 会自动执行 `npm ci`、`npm run build`、`npm pack --dry-run` 和 `npm publish`。发布前需要在 GitHub 仓库 Actions Secrets 中配置 `NPM_TOKEN`。
-
-发布后可全局安装或通过 npx 使用：
-
-```bash
-npm install -g yifangyun-mcp-server
-yifangyun-mcp-server
-
-npx -y yifangyun-mcp-server
-```
+| [架构与安全](docs/architecture-security.md) | 架构分层、认证流程、安全默认值、下载与写操作边界 |
 
 ## 版本状态
 
-当前版本：`0.1.2`。
+当前包版本：`0.1.2`。
 
-该版本已完成真实私有化部署接口验证：企业 token、用户 token、根部门、子部门、部门目录、文件夹子项、搜索、文件详情、下载链接均可用。
+这次实现把仓库从“只读目录检索 + 下载链接返回”升级成了“authority 优先、OpenAPI-first、写能力显式开关”的 MCP Server。

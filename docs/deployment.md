@@ -208,7 +208,9 @@ dist/tools/registerTools.js
 
 ### 2. 验证 MCP 工具列表
 
-用 MCP Inspector 或 MCP 客户端加载服务后，应能看到 11 个工具：
+当前服务不是固定“11 个工具”了，而是按能力开关暴露不同工具面。
+
+默认只读模式下，应至少看到：
 
 ```text
 yfy_auth_test
@@ -221,7 +223,36 @@ yfy_list_department_folders
 yfy_list_folder_children
 yfy_search_items
 yfy_get_file_info
-yfy_get_download_url
+yfy_get_file_info_full
+yfy_get_folder_info
+yfy_get_file_versions
+yfy_get_file_version_info
+yfy_get_folder_ancestors
+yfy_get_file_ancestors
+yfy_assert_file_in_scope
+yfy_build_scope_snapshot
+yfy_list_folder_tree
+yfy_batch_get_file_info
+yfy_resolve_path
+yfy_get_share_links
+yfy_get_comments
+yfy_list_collab_items
+yfy_get_folder_collabs
+yfy_list_groups
+yfy_get_group_users
+yfy_get_user_by_query
+yfy_download_file_to_temp
+yfy_download_and_hash
+yfy_verify_file_current_version
+yfy_lock_current_original
+```
+
+只有在显式开启时，才会额外注册：
+
+```text
+YFY_ALLOW_DOWNLOAD_URL=enabled       -> yfy_get_download_url
+YFY_ENABLE_MUTATION_TOOLS=enabled    -> create/update/move/copy/delete/restore/upload/collab tools
+YFY_ENABLE_ADMIN_TOOLS=enabled       -> admin department/group/user/log/sync tools
 ```
 
 ### 3. 验证认证
@@ -297,7 +328,8 @@ stdio MCP 不能向 stdout 打普通日志，因为 stdout 用于 MCP 协议通�
 | `yfy_auth_test` 失败 | OAuth 地址或凭证错误 | 检查 `YFY_OAUTH_BASE_URL`、`client_id`、`client_secret` |
 | 部门能查但文件不能查 | 默认用户没有文件权限 | 换 `user_id` 或启用管理员策略 |
 | 私有化部署返回 404 | OpenAPI 路径拼接错误 | 在 `YFY_OPENAPI_BASE_URL` 与 `YFY_API_BASE_URL` 两种写法中选择正确一种 |
-| 下载链接为空 | 文件不存在、无权限或安全开关关闭 | 先查 `yfy_get_file_info`，再查 `YFY_ALLOW_DOWNLOAD_URL` |
+| 没有 `yfy_get_download_url` | 安全默认值关闭了敏感下载 URL 工具 | 显式设置 `YFY_ALLOW_DOWNLOAD_URL=enabled` |
+| 下载原件失败 | 文件不存在、无权限、超过 `YFY_MAX_DOWNLOAD_BYTES` 或 temp 目录不可写 | 先查 `yfy_get_file_info_full`，再查下载上限和 temp 目录 |
 | 提示响应不是合法 JSON | 请求命中登录页、HTML 网关错误页或代理拦截页 | 查看返回详情里的 `endpoint`、`content_type` 和 `response_preview` |
 | 空 `user_id` 触发校验 | 客户端把未填写的可选参数传成空字符串 | 升级到当前版本后空字符串按未传处理；不要用 `0` 表示默认用户 |
 

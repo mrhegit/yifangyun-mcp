@@ -1,15 +1,31 @@
 # 工具参考
 
-本文档详细说明第一版暴露的 11 个 MCP 工具。所有工具均为只读工具，不会上传、移动、删除或修改亿方云中的数据。
+本文档描述当前 `yifangyun-mcp-server` 的工具分组、默认暴露策略和推荐使用方式。
+
+如果你关心“当前到底覆盖了哪些官方 OpenAPI、哪些是部分覆盖、哪些明确不在范围内”，请同时阅读 [OpenAPI 覆盖矩阵](openapi-coverage.md)。
 
 ## 返回格式
 
-所有工具都返回统一结构：
+所有工具统一返回：
 
 ```json
 {
   "ok": true,
-  "data": {}
+  "data": {},
+  "meta": {
+    "endpoint": "/api/v2/...",
+    "fetched_at_iso": "2026-07-07T10:00:00.000Z",
+    "fetched_at_unix": 1780000000,
+    "source_api_version": "v2",
+    "status_code": 200,
+    "request_id": "optional",
+    "rate_limit": {
+      "limit": 100,
+      "remaining": 97,
+      "reset_seconds": 12
+    }
+  },
+  "warnings": []
 }
 ```
 
@@ -21,18 +37,17 @@
   "error": {
     "message": "错误说明",
     "retryable": false,
-    "status_code": 403
+    "status_code": 403,
+    "details": {}
   }
 }
 ```
-
-服务会同时返回 MCP `structuredContent` 和文本 JSON，方便不同 MCP 客户端消费。
 
 ## 通用参数
 
 ### `user_id`
 
-`user_id` 用于指定文件访问身份。文件、搜索、下载相关工具都支持该参数。
+用于指定文件访问身份。文件、搜索、下载、协作、群组等用户态工具都支持该参数。
 
 未传时按 `YFY_FILE_ACCESS_USER_STRATEGY` 决定默认用户。
 
@@ -40,288 +55,132 @@
 
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
-| `page_id` | `0` | 亿方云接口使用的页码，从 0 开始 |
+| `page_id` | `0` | 亿方云接口页码，从 0 开始 |
 | `page_capacity` | `50` | 请求页容量，会受 `YFY_MAX_PAGE_CAPACITY` 限制 |
 
-分页返回通常包含：
+## 默认只读工具
+
+### 基础与组织
+
+| Tool | 说明 |
+|---|---|
+| `yfy_auth_test` | 验证企业 JWT、用户 JWT、基础接口 |
+| `yfy_get_user_info` | 获取当前用户基础信息 |
+| `yfy_get_department_info` | 获取部门详情 |
+| `yfy_list_department_children` | 获取子部门 |
+| `yfy_list_department_users` | 获取部门成员 |
+
+### 文件与搜索基线
+
+| Tool | 说明 |
+|---|---|
+| `yfy_list_personal_items` | 个人空间首层文件/文件夹 |
+| `yfy_list_department_folders` | 部门首层文件夹 |
+| `yfy_list_folder_children` | 文件夹单层 children |
+| `yfy_search_items` | 官方搜索包装 |
+| `yfy_search_items_advanced` | 同一官方搜索端点的增强包装 |
+| `yfy_get_file_info` | 文件元信息 |
+| `yfy_get_file_info_full` | richer file metadata |
+| `yfy_get_folder_info` | 文件夹元信息 |
+
+### Authority 工具
+
+| Tool | 说明 |
+|---|---|
+| `yfy_get_file_versions` | 获取文件版本列表 |
+| `yfy_get_file_version_info` | 获取指定版本信息 |
+| `yfy_get_folder_ancestors` | 获取文件夹祖先链 |
+| `yfy_get_file_ancestors` | 获取文件祖先链 |
+| `yfy_assert_file_in_scope` | 断言文件是否属于某 root folder |
+| `yfy_build_scope_snapshot` | 构建 flat snapshot |
+| `yfy_list_folder_tree` | 扁平化递归目录树 |
+| `yfy_batch_get_file_info` | 批量获取文件详情 |
+| `yfy_resolve_path` | 通过目录遍历解析 path |
+| `yfy_verify_file_current_version` | 校验当前元数据是否与预期一致 |
+| `yfy_lock_current_original` | scope proof + metadata + temp_path + sha256 |
+
+### 协作与分享
+
+| Tool | 说明 |
+|---|---|
+| `yfy_get_share_links` | 文件/文件夹分享链接列表 |
+| `yfy_get_comments` | 文件评论列表 |
+| `yfy_list_collab_items` | 与我协作的文件夹 |
+| `yfy_get_folder_collabs` | 文件夹协作成员 |
+| `yfy_list_groups` | 公司可见群组 |
+| `yfy_get_group_users` | 群组成员 |
+| `yfy_get_user_by_query` | 企业用户搜索 |
+
+### 本地原件落地
+
+| Tool | 说明 |
+|---|---|
+| `yfy_download_file_to_temp` | 下载到本地 temp 目录 |
+| `yfy_download_and_hash` | 下载并返回 `sha256 + size_bytes + temp_path` |
+
+## 受控敏感工具
+
+### 下载链接工具
+
+仅当 `YFY_ALLOW_DOWNLOAD_URL=enabled` 时注册：
+
+| Tool | 说明 |
+|---|---|
+| `yfy_get_download_url` | 返回预签名 `download_url` |
+
+## 受控 Mutation 工具
+
+仅当 `YFY_ENABLE_MUTATION_TOOLS=enabled` 时注册：
+
+| Tool | 说明 |
+|---|---|
+| `yfy_create_folder` | 创建文件夹 |
+| `yfy_update_file` | 更新文件名称/描述 |
+| `yfy_update_folder` | 更新文件夹名称/描述 |
+| `yfy_move_item` | 移动文件/文件夹 |
+| `yfy_copy_item` | 复制文件/文件夹 |
+| `yfy_delete_item` | 删除到回收站或彻底删除 |
+| `yfy_restore_item` | 从回收站恢复 |
+| `yfy_upload_file` | 本地文件上传到指定 folder |
+| `yfy_upload_file_by_path` | 本地文件上传到指定 path |
+| `yfy_upload_new_version` | 上传新版本 |
+| `yfy_manage_collab` | 协作 invite/update/delete/remove |
+
+## 受控 Admin 工具
+
+仅当 `YFY_ENABLE_ADMIN_TOOLS=enabled` 时注册：
+
+| Tool | 说明 |
+|---|---|
+| `yfy_admin_departments` | admin 部门相关 action wrapper |
+| `yfy_admin_groups` | admin 群组相关 action wrapper |
+| `yfy_admin_users` | admin 用户相关 action wrapper |
+| `yfy_admin_logs` | admin 日志相关 action wrapper |
+| `yfy_admin_sync` | 平台同步与 mapping wrapper |
+
+## 推荐使用顺序
 
-```json
-{
-  "page_id": 0,
-  "page_capacity": 50,
-  "page_count": 3,
-  "total_count": 120,
-  "has_more": true,
-  "next_page_id": 1
-}
-```
-
-## `yfy_auth_test`
-
-验证企业 token、用户 token、根部门接口和用户信息接口是否可用。
-
-参数：
-
-| 参数 | 必填 | 说明 |
-|---|---|---|
-| `user_id` | 否 | 要测试的用户 ID，默认使用 `YFY_DEFAULT_USER_ID` |
-
-示例：
-
-```json
-{
-  "user_id": 530
-}
-```
-
-适用场景：部署后第一步验证配置是否正确。
-
-## `yfy_get_user_info`
-
-获取用户基础信息。
-
-参数：
-
-| 参数 | 必填 | 说明 |
-|---|---|---|
-| `user_id` | 否 | 用户 ID，默认使用配置策略 |
-
-示例：
-
-```json
-{}
-```
-
-## `yfy_get_department_info`
-
-获取部门详情。使用企业 token。
-
-参数：
-
-| 参数 | 必填 | 说明 |
-|---|---|---|
-| `department_id` | 否 | 部门 ID，默认 `0`，根部门是否可用取决于部署 |
-
-示例：
-
-```json
-{
-  "department_id": 0
-}
-```
-
-## `yfy_list_department_children`
-
-列出某部门下的子部门。使用企业 token。
-
-参数：
-
-| 参数 | 必填 | 说明 |
-|---|---|---|
-| `department_id` | 否 | 父部门 ID，默认 `0` |
-| `permission_filter` | 否 | 是否启用权限过滤，取决于部署支持 |
-
-示例：
-
-```json
-{
-  "department_id": 478
-}
-```
-
-典型用途：先从根部门定位业务部门，再继续查子部门。
-
-## `yfy_list_department_users`
-
-列出部门成员。使用企业 token。
-
-参数：
-
-| 参数 | 必填 | 说明 |
-|---|---|---|
-| `department_id` | 是 | 部门 ID |
-| `page_id` | 否 | 页码，默认 `0` |
-| `include_contact` | 否 | 是否返回邮箱、手机号等联系字段，默认不返回 |
-
-示例：
-
-```json
-{
-  "department_id": 480,
-  "include_contact": false
-}
-```
-
-## `yfy_list_personal_items`
-
-列出用户个人空间首层文件和文件夹。使用用户 token。
-
-参数：
-
-| 参数 | 必填 | 说明 |
-|---|---|---|
-| `user_id` | 否 | 用户 ID |
-| `page_id` | 否 | 页码 |
-| `page_capacity` | 否 | 页容量 |
-
-示例：
-
-```json
-{
-  "page_id": 0,
-  "page_capacity": 50
-}
-```
-
-## `yfy_list_department_folders`
-
-列出部门云盘首层文件夹。使用用户 token，因为文件访问权限依赖用户身份。
-
-参数：
-
-| 参数 | 必填 | 说明 |
-|---|---|---|
-| `department_id` | 是 | 部门 ID |
-| `user_id` | 否 | 文件访问用户 ID |
-| `page_id` | 否 | 页码 |
-| `page_capacity` | 否 | 页容量 |
-
-示例：
-
-```json
-{
-  "department_id": 480,
-  "page_id": 0,
-  "page_capacity": 100
-}
-```
-
-## `yfy_list_folder_children`
-
-列出文件夹下一级文件和文件夹。不会递归。
-
-参数：
-
-| 参数 | 必填 | 说明 |
-|---|---|---|
-| `folder_id` | 是 | 文件夹 ID |
-| `type` | 否 | `file`、`folder`、`all`，默认 `all` |
-| `user_id` | 否 | 文件访问用户 ID |
-| `page_id` | 否 | 页码 |
-| `page_capacity` | 否 | 页容量 |
-
-示例：
-
-```json
-{
-  "folder_id": 501000715605,
-  "type": "all",
-  "page_capacity": 100
-}
-```
-
-## `yfy_search_items`
-
-搜索文件或文件夹。支持全局、个人空间、协作空间、部门空间和指定文件夹范围。
-
-参数：
-
-| 参数 | 必填 | 说明 |
-|---|---|---|
-| `query_words` | 是 | 搜索关键词 |
-| `type` | 否 | `file`、`folder`、`all` |
-| `query_filter` | 否 | `file_name`、`content`、`creator`、`tag`、`all` |
-| `department_id` | 否 | `0` 个人空间，`-1` 与我协作，部门 ID 表示部门空间 |
-| `search_in_folder` | 否 | 限定父文件夹 ID |
-| `sort_by` | 否 | `name`、`date`、`size`、`score` |
-| `sort_direction` | 否 | `asc`、`desc` |
-| `precise_search` | 否 | 是否精确搜索 |
-| `fields` | 否 | 透传亿方云字段参数 |
-| `user_id` | 否 | 文件访问用户 ID |
-| `page_id` | 否 | 页码 |
-| `page_capacity` | 否 | 页容量 |
-
-部门内按文件名搜索：
-
-```json
-{
-  "query_words": "营业执照",
-  "type": "file",
-  "query_filter": "file_name",
-  "department_id": "480",
-  "page_id": 0
-}
-```
-
-指定文件夹内搜索：
-
-```json
-{
-  "query_words": "合同",
-  "type": "file",
-  "query_filter": "file_name",
-  "search_in_folder": 501000835604
-}
-```
-
-## `yfy_get_file_info`
-
-获取文件详情。
-
-参数：
-
-| 参数 | 必填 | 说明 |
-|---|---|---|
-| `file_id` | 是 | 文件 ID |
-| `external_enterprise_id` | 否 | 外协企业 ID，外协文件需要时传入 |
-| `user_id` | 否 | 文件访问用户 ID |
-
-示例：
-
-```json
-{
-  "file_id": 501001202974
-}
-```
-
-## `yfy_get_download_url`
-
-获取文件预签名下载链接。服务不会下载文件内容。
-
-参数：
-
-| 参数 | 必填 | 说明 |
-|---|---|---|
-| `file_id` | 是 | 文件 ID |
-| `version` | 否 | 文件版本，未传时使用当前版本 |
-| `external_enterprise_id` | 否 | 外协企业 ID |
-| `user_id` | 否 | 文件访问用户 ID |
-
-示例：
-
-```json
-{
-  "file_id": 501001202974
-}
-```
-
-安全提示：下载 URL 是临时访问凭证，不应写入日志或公开分享。
-
-## 推荐工作流
-
-查询某部门资料库：
+### 找文件并锁原件
 
 ```text
-1. yfy_list_department_children(department_id=0)
-2. yfy_list_department_children(department_id=<一级部门ID>)
-3. yfy_list_department_folders(department_id=<目标部门ID>)
-4. yfy_list_folder_children(folder_id=<资料库目录ID>)
+1. yfy_search_items / yfy_resolve_path
+2. yfy_get_file_info_full
+3. yfy_assert_file_in_scope
+4. yfy_lock_current_original
 ```
 
-搜索并下载文件：
+### 做目录快照
 
 ```text
-1. yfy_search_items(query_words="关键词", department_id="部门ID")
-2. yfy_get_file_info(file_id=<文件ID>)
-3. yfy_get_download_url(file_id=<文件ID>)
+1. yfy_get_folder_info
+2. yfy_build_scope_snapshot
+3. yfy_batch_get_file_info (按需回源)
+```
+
+### 做受控上传
+
+```text
+1. 开启 YFY_ENABLE_MUTATION_TOOLS=enabled
+2. yfy_upload_file / yfy_upload_new_version
+3. yfy_get_file_info_full 或 yfy_get_file_versions 校验结果
 ```

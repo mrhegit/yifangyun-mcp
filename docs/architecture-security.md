@@ -1,6 +1,6 @@
 # 架构与安全
 
-本文档说明 `yifangyun-mcp-server` 的架构设计、认证流程、权限边界、安全策略和已知限制。
+本文档说明 `yifangyun-mcp-server` 当前的架构设计、安全默认值与边界策略。
 
 ## 架构总览
 
@@ -16,25 +16,31 @@ yifangyun-mcp-server
   |
   |-- src/config.ts
   |     |-- 读取环境变量
-  |     |-- 校验 URL、ID、策略
+  |     |-- 校验 URL、ID、能力开关、运行保护参数
   |
   |-- src/client.ts
   |     |-- 生成 JWT assertion
-  |     |-- 换取 enterprise/user token
-  |     |-- token 缓存和提前刷新
-  |     |-- HTTP 请求、超时、错误归一化
+  |     |-- enterprise/user token 缓存和提前刷新
+  |     |-- GET/POST JSON 请求
+  |     |-- 429/5xx 退避
+  |     |-- 下载到 temp 并计算 sha256
+  |     |-- 本地文件上传到 presign_url
   |
   |-- src/tools/registerTools.ts
-        |-- 注册 11 个只读 MCP 工具
-        |-- 裁剪输出字段
-        |-- 标注 readOnlyHint
+        |-- 注册默认只读 authority 工具
+        |-- 按开关注册 mutation/admin 工具
+        |-- 输出裁剪、workflow 组合、统一返回 envelope
 ```
 
-核心原则：MCP 工具层只负责表达“智能体可用能力”，认证、HTTP 请求、错误处理和脱敏全部下沉到统一客户端。
+核心原则：
+
+1. **OpenAPI-first**：优先封装官方公开路径
+2. **默认最小暴露**：敏感下载 URL、mutation、admin 默认不注册
+3. **authority 优先**：优先支持 `metadata + ancestry + versions + download+hash`
 
 ## 认证流程
 
-亿方云企业 JWT 模式流程：
+亿方云企业 JWT 模式：
 
 ```text
 client_id + client_secret
@@ -48,30 +54,8 @@ JWT assertion payload
 POST /oauth/token?grant_type=jwt_simple&assertion=...
   |
   v
-access_token
+enterprise / user access_token
 ```
-
-assertion payload 结构：
-
-```json
-{
-  "yifangyun_sub_type": "user",
-  "sub": 530,
-  "exp": 1710000060,
-  "iat": 1710000000,
-  "jti": "随机唯一值"
-}
-```
-
-| 字段 | 说明 |
-|---|---|
-| `yifangyun_sub_type` | `enterprise` 或 `user` |
-| `sub` | 企业 ID 或用户 ID |
-| `exp` | assertion 过期时间，当前实现为 60 秒后 |
-| `iat` | 签发时间 |
-| `jti` | 随机唯一值，降低重放风险 |
-
-## Token 缓存
 
 服务按以下维度缓存 token：
 
@@ -80,137 +64,109 @@ enterprise:<enterprise_id>
 user:<user_id>
 ```
 
-如果 token 未到提前刷新窗口，直接复用缓存。提前刷新窗口由 `YFY_TOKEN_REFRESH_SKEW_SECONDS` 控制，默认 300 秒。
-
 ## 权限边界
-
-企业 token 和用户 token 不能混用。
 
 | 能力 | Token | 原因 |
 |---|---|---|
-| 部门详情 | 企业 token | 组织管理平面 |
-| 子部门 | 企业 token | 组织管理平面 |
-| 部门成员 | 企业 token | 组织管理平面 |
-| 个人空间 | 用户 token | 云盘访问平面 |
-| 部门文件夹 | 用户 token | 部门文件可见性取决于用户权限 |
-| 文件搜索 | 用户 token | 搜索结果取决于用户可访问范围 |
-| 文件详情 | 用户 token | 文件可见性取决于用户权限 |
-| 下载链接 | 用户 token | 下载权限取决于用户权限 |
+| 部门、管理员、同步、日志 | 企业 token | 组织管理平面 |
+| 文件夹、文件、搜索、版本、下载、协作 | 用户 token | 云盘访问平面 |
 
 管理员账号只是一个拥有更大云盘权限的用户账号，不等同于企业 token。
 
+## 安全默认值
+
+| 开关 | 默认值 | 影响 |
+|---|---:|---|
+| `YFY_ALLOW_DOWNLOAD_URL` | `disabled` | 不注册 `yfy_get_download_url` |
+| `YFY_ENABLE_MUTATION_TOOLS` | `disabled` | 不注册写工具 |
+| `YFY_ENABLE_ADMIN_TOOLS` | `disabled` | 不注册 admin 工具 |
+| `YFY_ENABLE_RAW_RESPONSE` | `disabled` | 不把原始响应体透给调用方 |
+
+## 下载安全策略
+
+当前优先推荐：
+
+- `yfy_download_file_to_temp`
+- `yfy_download_and_hash`
+- `yfy_lock_current_original`
+
+原因：
+
+1. `download_url` 本身是敏感的短期访问凭据
+2. 对证据链来说，`temp_path + sha256 + size_bytes + metadata` 更有价值
+3. 服务端可以在不暴露 URL 的前提下完成下载与哈希
+
+下载保护包括：
+
+- `YFY_MAX_DOWNLOAD_BYTES` 大小限制
+- `YFY_TEMP_DIR` 本地落地目录
+- `YFY_TEMP_FILE_TTL_SECONDS` 过期清理
+- 对 `download_url` / `presign_url` 的日志脱敏
+
+## 写操作策略
+
+写操作通过官方 OpenAPI 路径完成，但默认不注册。包括：
+
+- create / update / move / copy / delete / restore
+- upload / upload_by_path / upload_new_version
+- collab mutations
+- admin department/group/user/log/sync wrappers
+
+开启前建议：
+
+```text
+YFY_ENABLE_MUTATION_TOOLS=enabled
+YFY_ENABLE_ADMIN_TOOLS=enabled
+```
+
+## 上传策略
+
+上传采用官方推荐的两段式流程：
+
+```text
+1. 调 OpenAPI 获取 presign_url
+2. 使用本地文件内容上传到该 presign_url
+```
+
+当前实现优先尝试：
+
+1. `PUT` 原始二进制
+2. 若失败，再回退到 `POST multipart/form-data`
+
+这样做是为了兼容官方文档中“获取 presign_url 后再上传”的契约，同时尽量适配不同部署网关。
+
 ## 输出裁剪策略
 
-亿方云接口可能返回大量字段，例如邮箱、手机号、文件路径、协作者、权限对象、下载 URL。MCP 默认裁剪为智能体任务常用字段。
+默认输出会优先保留：
 
-文件/文件夹默认返回：
+- id / parent / path_chain / ancestor_folder_ids
+- created_at / modified_at 的 unix + ISO 双字段
+- ownership / modified_by
+- size / sha1 / file_version_key
+- workflow 所需的关键结构
 
-```json
-{
-  "id": 501000715605,
-  "name": "投标公共资料库",
-  "type": "folder",
-  "size": 50969339596,
-  "modified_at": 1780391287,
-  "parent_folder_id": 501000000000
-}
-```
+默认不回传完整原始响应体，除非显式开启 `YFY_ENABLE_RAW_RESPONSE=enabled`。
 
-部门默认返回：
+## 限流与错误处理
 
-```json
-{
-  "id": 480,
-  "name": "投标",
-  "parent_id": 478,
-  "director": {
-    "id": 623,
-    "name": "负责人姓名",
-    "login": "login@example.com"
-  }
-}
-```
+客户端统一处理：
 
-部门成员默认不返回邮箱和手机号。只有 `yfy_list_department_users` 显式传 `include_contact=true` 时才会尝试返回联系字段。
+- 请求超时
+- 401 / 403 / 404 语义化错误
+- 429 / 5xx 自动退避
+- 统一返回 `request_id` 和 `rate_limit` 元数据（若服务端提供）
 
-## 错误处理
+## 已知边界
 
-服务将亿方云错误归一化为：
-
-```json
-{
-  "ok": false,
-  "error": {
-    "message": "Permission denied. Use a user_id that has access to the requested cloud-drive resource.",
-    "retryable": false,
-    "status_code": 403
-  }
-}
-```
-
-错误信息会尽量给出下一步建议，例如检查凭证、切换 `user_id`、确认文件 ID。
-
-## 脱敏策略
-
-服务会对以下内容进行脱敏：
-
-```text
-Bearer token
-access_token
-refresh_token
-client_secret
-download_url 字段中的敏感值
-URL 中 sign/token/access_token/authorization 参数
-```
-
-注意：`yfy_get_download_url` 的业务目标就是返回下载 URL，因此它会把下载链接返回给 MCP 调用方；但服务不会主动打印到日志，也不会下载文件内容。
-
-## 为什么第一版只读
-
-MCP 工具可能被智能体自动组合调用。如果第一版开放上传、移动、删除等写操作，会带来三个问题：
-
-| 风险 | 说明 |
+| 边界 | 说明 |
 |---|---|
-| 数据破坏 | 删除、移动、重命名可能影响真实生产云盘 |
-| 权限扩散 | 协作管理可能改变文件可见范围 |
-| 审计困难 | Agent 多步调用时不容易追踪业务意图 |
+| transport | 当前仍是本地 `stdio` server，不是远程 HTTP server |
+| OpenAPI 依赖 | 以官方公开 OpenAPI 为准；私有化部署返回字段可能有轻微差异 |
+| 上传兼容性 | presign_url 二段上传已实现，但不同存储网关的细节仍建议实测 |
+| temp 文件 | 下载原件会落本地临时目录，运维需关注磁盘配额 |
 
-因此第一版只做只读访问。后续如果要开放写操作，建议增加：
+## 后续建议
 
-```text
-YFY_ALLOW_WRITE_TOOLS=disabled
-二次确认参数 confirm=true
-操作审计日志
-危险操作工具单独命名
-```
-
-## 性能和复杂度
-
-| 操作 | 时间复杂度 | 空间复杂度 |
-|---|---|---|
-| 获取详情 | O(1) | O(1) |
-| 获取下载链接 | O(1) | O(1) |
-| 单页列表 | O(k) | O(k) |
-| 搜索 | O(k)，检索由亿方云服务端承担 | O(k) |
-
-`k` 是当前页返回条数。第一版不做递归扫描，因此不会一次性加载整个部门目录树。
-
-## 已知限制
-
-| 限制 | 说明 |
-|---|---|
-| stdio only | 当前只实现本地 stdio transport，没有远程 HTTP transport |
-| 无递归扫描 | 目录遍历需要客户端多次调用 `yfy_list_folder_children` |
-| 无写工具 | 不支持上传、移动、删除等状态变更操作 |
-| 下载 URL 敏感 | 调用方拿到 URL 后需要自行控制保密和有效期 |
-| 依赖亿方云权限 | MCP 无法绕过亿方云用户权限，默认用户无权时需要换 `user_id` |
-
-## 后续演进建议
-
-| 能力 | 建议 |
-|---|---|
-| 递归列目录 | 增加 `max_depth`、`max_items`、超时和截断提示 |
-| Streamable HTTP | 支持远程部署、多客户端共享 |
-| 审计日志 | 记录工具名、用户 ID、资源 ID、耗时，不记录 token 和下载 URL |
-| 写操作 | 单独版本开放，并默认关闭 |
-| 细粒度字段选择 | 允许调用方选择返回字段，进一步降低上下文占用 |
+1. 若要远程共享部署，下一步优先补 `Streamable HTTP` transport
+2. 若要更强审计，增加独立 audit sink，而不是只依赖 MCP 客户端日志
+3. 若要进一步追求 OpenAPI 完整覆盖，可按当前 action-wrapper 模式继续扩展 share-link 与 review 相关接口
