@@ -32,6 +32,23 @@ const FolderChildTypeSchema = z.enum(["file", "folder", "all"]);
 const ItemTypeSchema = z.enum(["file", "folder"]);
 const AccessibleByTypeSchema = z.enum(["user", "group", "department", "user_list", "group_list", "department_list"]);
 const CollabRoleSchema = z.enum(["coowner", "editor", "online_collaborator", "viewer_uploader", "viewer", "previewer_uploader", "previewer", "uploader", "reset"]);
+const IdentifierTypeSchema = z.enum(["simple_phone_or_email", "user_ticket"]);
+const UserRoleSchema = z.object({
+  user_id: IdSchema.describe("User id."),
+  role: CollabRoleSchema.describe("Collaboration role for this user.")
+});
+const AccessibleBySchema = z.object({
+  type: AccessibleByTypeSchema.describe("Invite target type: single id or id list."),
+  id: OptionalIdSchema.describe("Single target id for user/group/department targets."),
+  ids: z.array(IdSchema).min(1).max(100).optional().describe("Target id list for *_list target types."),
+  role: CollabRoleSchema.describe("Collaboration role to grant.")
+});
+const AdminBooleanSettingsShape = {
+  hide_phone: z.boolean().optional().describe("Whether to hide phone numbers."),
+  disable_share: z.boolean().optional().describe("Whether to disable sharing."),
+  enable_watermark: z.boolean().optional().describe("Whether to enable preview watermark."),
+  collab_auto_accepted: z.boolean().optional().describe("Whether collaboration invitations are accepted automatically.")
+};
 
 type ToolResponse = {
   content: Array<{ type: "text"; text: string }>;
@@ -611,6 +628,75 @@ async function mapWithConcurrency<T, R>(values: T[], limit: number, worker: (val
   return results;
 }
 
+function addDefined(target: JsonObject, key: string, value: unknown): void {
+  if (value !== undefined && value !== "") {
+    target[key] = value as JsonValue;
+  }
+}
+
+function addOptionalBodyId(target: JsonObject, key: string, value: IdLike | "" | undefined): void {
+  const resolved = normalizeOptionalId(value);
+  if (resolved !== undefined) {
+    target[key] = asNumberOrString(resolved);
+  }
+}
+
+function requireText(value: unknown, fieldName: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new YifangyunError(`${fieldName} is required for this action.`);
+  }
+  return value;
+}
+
+function buildAdminDepartmentBody(params: Record<string, unknown>, requireName: boolean): JsonObject {
+  const body: JsonObject = {};
+  if (requireName) {
+    body.name = requireText(params.name, "name");
+  } else if (typeof params.name === "string") {
+    body.name = params.name;
+  }
+  addOptionalBodyId(body, "parent_id", params.parent_id as IdLike | "" | undefined);
+  addOptionalBodyId(body, "director_id", params.director_id as IdLike | "" | undefined);
+  addDefined(body, "special_users", params.special_users);
+  addDefined(body, "space_total", params.space_total);
+  addDefined(body, "hide_phone", params.hide_phone);
+  addDefined(body, "disable_share", params.disable_share);
+  addDefined(body, "enable_watermark", params.enable_watermark);
+  addDefined(body, "create_common_folder", params.create_common_folder);
+  addDefined(body, "collab_auto_accepted", params.collab_auto_accepted);
+  addDefined(body, "file_managers", params.file_managers);
+  addDefined(body, "permission_type", params.permission_type);
+  return body;
+}
+
+function buildAdminGroupBody(params: Record<string, unknown>, requireName: boolean): JsonObject {
+  const body: JsonObject = {};
+  if (requireName) {
+    body.name = requireText(params.name, "name");
+  } else if (typeof params.name === "string") {
+    body.name = params.name;
+  }
+  addOptionalBodyId(body, "admin_user_id", params.admin_user_id as IdLike | "" | undefined);
+  addDefined(body, "description", params.description);
+  addDefined(body, "visible", params.visible);
+  addDefined(body, "collab_auto_accepted", params.collab_auto_accepted);
+  return body;
+}
+
+function buildAdminUserBody(params: Record<string, unknown>, create: boolean): JsonObject {
+  const body: JsonObject = {};
+  addDefined(body, create ? "full_name" : "name", create ? params.full_name : params.name);
+  addDefined(body, "phone", params.phone);
+  addDefined(body, "email", params.email);
+  addOptionalBodyId(body, "storage_id", params.storage_id as IdLike | "" | undefined);
+  addDefined(body, "space_total", params.space_total);
+  addDefined(body, "hide_phone", params.hide_phone);
+  addDefined(body, "disable_download", params.disable_download);
+  addDefined(body, "force_active", params.force_active);
+  addDefined(body, "password", params.password);
+  return body;
+}
+
 export function registerTools(server: McpServer, client: YifangyunClient, config: AppConfig): void {
   const registerReadTool = (
     name: string,
@@ -671,33 +757,11 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
   const getFileVersionInfo = async (fileId: IdLike, versionId: IdLike, userId?: IdLike): Promise<ApiJsonResponse> =>
     client.getAsUser(`/v2/file/${idToPath(fileId)}/version/${idToPath(versionId)}/info`, userId);
 
-  const requireId = (value: IdLike | "" | undefined, fieldName: string): IdLike => {
-    const resolved = normalizeOptionalId(value);
-    if (resolved === undefined) {
-      throw new YifangyunError(`${fieldName} is required for this action.`);
-    }
-    return resolved;
-  };
-
-  const requireNonEmptyString = (value: unknown, fieldName: string): string => {
-    if (typeof value !== "string" || value.trim().length === 0) {
-      throw new YifangyunError(`${fieldName} is required for this action.`);
-    }
-    return value;
-  };
-
   const requireJsonObject = (value: unknown, fieldName: string): JsonObject => {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
       throw new YifangyunError(`${fieldName} must be a JSON object for this action.`);
     }
     return value as JsonObject;
-  };
-
-  const requireNonEmptyArray = (value: unknown, fieldName: string): JsonArray => {
-    if (!Array.isArray(value) || value.length === 0) {
-      throw new YifangyunError(`${fieldName} must contain at least one item for this action.`);
-    }
-    return value as JsonArray;
   };
 
   const collectFolderAncestors = async (folderId: IdLike, userId?: IdLike): Promise<{ chain: JsonObject[]; folder: JsonObject; meta: ApiResponseMeta }> => {
@@ -1852,238 +1916,635 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     );
 
     registerMutationTool(
-      "yfy_manage_collab",
+      "yfy_invite_collab",
       {
-        title: "Manage Yifangyun Collaboration",
-        description: "Manage collaboration through the official collab endpoints: invite, invite_batch, info, update, delete, remove.",
+        title: "Invite Yifangyun Collaboration",
+        description: "Invite one user, group, or department target to collaborate on a folder.",
         inputSchema: {
-          action: z.enum(["invite", "invite_batch", "info", "update", "delete", "remove"]),
-          collab_id: OptionalIdSchema,
-          folder_id: OptionalIdSchema,
-          accessible_by: JsonRecordSchema.optional(),
-          accessible_by_list: z.array(JsonRecordSchema).optional(),
-          invitation_message: z.string().max(140).optional(),
-          role: CollabRoleSchema.optional(),
-          collab_ids: z.array(IdSchema).optional(),
+          folder_id: IdSchema.describe("Folder id to collaborate on."),
+          accessible_by: AccessibleBySchema.describe("Invite target and role."),
+          invitation_message: z.string().max(140).optional().describe("Optional invitation message."),
           ...OptionalUserShape
         }
       },
-      async (params) => {
-        const userId = normalizeOptionalId(params.user_id as IdLike | "" | undefined);
-        let response: ApiJsonResponse;
-        switch (params.action) {
-          case "invite":
-            response = await client.postAsUser("/v2/collab/invite", userId, {
-              folder_id: asNumberOrString(requireId(params.folder_id as IdLike | "" | undefined, "folder_id")),
-              accessible_by: requireJsonObject(params.accessible_by, "accessible_by"),
-              ...(typeof params.invitation_message === "string" ? { invitation_message: params.invitation_message } : {})
-            });
-            break;
-          case "invite_batch":
-            response = await client.postAsUser("/v2/collab/invite_batch", userId, {
-              folder_id: asNumberOrString(requireId(params.folder_id as IdLike | "" | undefined, "folder_id")),
-              accessible_by: requireNonEmptyArray(params.accessible_by_list, "accessible_by_list"),
-              ...(typeof params.invitation_message === "string" ? { invitation_message: params.invitation_message } : {})
-            });
-            break;
-          case "info":
-            response = await client.getAsUser(`/v2/collab/${idToPath(requireId(params.collab_id as IdLike | "" | undefined, "collab_id"))}/info`, userId);
-            break;
-          case "update":
-            response = await client.postAsUser(`/v2/collab/${idToPath(requireId(params.collab_id as IdLike | "" | undefined, "collab_id"))}/update`, userId, { role: requireNonEmptyString(params.role, "role") });
-            break;
-          case "delete":
-            response = await client.postAsUser(`/v2/collab/${idToPath(requireId(params.collab_id as IdLike | "" | undefined, "collab_id"))}/delete`, userId, {});
-            break;
-          default:
-            response = await client.postAsUser("/v2/collab/remove", userId, {
-              folder_id: asNumberOrString(requireId(params.folder_id as IdLike | "" | undefined, "folder_id")),
-              collab_ids: requireNonEmptyArray(params.collab_ids, "collab_ids")
-            });
-            break;
-        }
-        return ok(isObject(response.data) && response.data.item ? compactCollab(response.data) : response.data, metaToJson(response.meta), { config, raw: response.data });
+      async ({ folder_id, accessible_by, invitation_message, user_id }) => {
+        const response = await client.postAsUser("/v2/collab/invite", normalizeOptionalId(user_id as IdLike | "" | undefined), {
+          folder_id: asNumberOrString(folder_id as IdLike),
+          accessible_by: accessible_by as JsonObject,
+          ...(typeof invitation_message === "string" ? { invitation_message } : {})
+        });
+        return ok(compactCollab(response.data), metaToJson(response.meta), { config, raw: response.data });
       }
     );
+
+    registerMutationTool(
+      "yfy_invite_collabs_batch",
+      {
+        title: "Batch Invite Yifangyun Collaborations",
+        description: "Invite multiple collaboration targets to a folder in one official batch call.",
+        inputSchema: {
+          folder_id: IdSchema.describe("Folder id to collaborate on."),
+          accessible_by_list: z.array(AccessibleBySchema).min(1).max(100).describe("Invite targets and roles."),
+          invitation_message: z.string().max(140).optional().describe("Optional invitation message."),
+          ...OptionalUserShape
+        }
+      },
+      async ({ folder_id, accessible_by_list, invitation_message, user_id }) => {
+        const response = await client.postAsUser("/v2/collab/invite_batch", normalizeOptionalId(user_id as IdLike | "" | undefined), {
+          folder_id: asNumberOrString(folder_id as IdLike),
+          accessible_by: accessible_by_list as JsonArray,
+          ...(typeof invitation_message === "string" ? { invitation_message } : {})
+        });
+        return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerReadTool(
+      "yfy_get_collab_info",
+      {
+        title: "Get Yifangyun Collaboration Info",
+        description: "Get one collaboration record by collab id.",
+        inputSchema: { collab_id: IdSchema.describe("Collaboration id."), ...OptionalUserShape }
+      },
+      async ({ collab_id, user_id }) => {
+        const response = await client.getAsUser(`/v2/collab/${idToPath(collab_id as IdLike)}/info`, normalizeOptionalId(user_id as IdLike | "" | undefined));
+        return ok(compactCollab(response.data), metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerMutationTool(
+      "yfy_update_collab_role",
+      {
+        title: "Update Yifangyun Collaboration Role",
+        description: "Update one collaboration role by collab id.",
+        inputSchema: { collab_id: IdSchema.describe("Collaboration id."), role: CollabRoleSchema.describe("New role."), ...OptionalUserShape }
+      },
+      async ({ collab_id, role, user_id }) => {
+        const response = await client.postAsUser(`/v2/collab/${idToPath(collab_id as IdLike)}/update`, normalizeOptionalId(user_id as IdLike | "" | undefined), { role: role as string });
+        return ok(compactCollab(response.data), metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerMutationTool(
+      "yfy_delete_collab",
+      {
+        title: "Delete Yifangyun Collaboration",
+        description: "Delete one collaboration record by collab id.",
+        inputSchema: { collab_id: IdSchema.describe("Collaboration id."), ...OptionalUserShape }
+      },
+      async ({ collab_id, user_id }) => {
+        const response = await client.postAsUser(`/v2/collab/${idToPath(collab_id as IdLike)}/delete`, normalizeOptionalId(user_id as IdLike | "" | undefined), {});
+        return ok(isObject(response.data) ? response.data : { success: true }, metaToJson(response.meta), { config, raw: response.data });
+      },
+      true
+    );
+
+    registerMutationTool(
+      "yfy_remove_collabs",
+      {
+        title: "Remove Yifangyun Folder Collaborations",
+        description: "Remove one or more collaboration ids from a folder.",
+        inputSchema: {
+          folder_id: IdSchema.describe("Folder id."),
+          collab_ids: z.array(IdSchema).min(1).max(100).describe("Collaboration ids to remove."),
+          ...OptionalUserShape
+        }
+      },
+      async ({ folder_id, collab_ids, user_id }) => {
+        const response = await client.postAsUser("/v2/collab/remove", normalizeOptionalId(user_id as IdLike | "" | undefined), {
+          folder_id: asNumberOrString(folder_id as IdLike),
+          collab_ids: collab_ids as JsonArray
+        });
+        return ok(isObject(response.data) ? response.data : { success: true }, metaToJson(response.meta), { config, raw: response.data });
+      },
+      true
+    );
+
   }
 
   if (config.enableAdminTools) {
-    registerMutationTool(
-      "yfy_admin_departments",
+    registerReadTool(
+      "yfy_admin_get_department_info",
       {
-        title: "Yifangyun Admin Departments",
-        description: "Official admin department wrapper: info, children, users, space_list, create, update, delete, add_user, remove_user, update_space.",
-        inputSchema: { action: z.enum(["info", "children", "users", "space_list", "create", "update", "delete", "add_user", "remove_user", "update_space"]), department_id: OptionalIdSchema, page_id: z.number().int().min(0).default(0), permission_filter: z.boolean().optional(), body: JsonRecordSchema.optional() }
+        title: "Admin Get Yifangyun Department Info",
+        description: "Get admin-visible department metadata using the enterprise token.",
+        inputSchema: { department_id: IdSchema.describe("Department id.") }
       },
-      async (params) => {
-        let response: ApiJsonResponse;
-        const departmentId = normalizeOptionalId(params.department_id as IdLike | "" | undefined);
-        switch (params.action) {
-          case "info":
-            response = await client.getEnterprise(`/v2/admin/department/${idToPath(requireId(departmentId, "department_id"))}/info`);
-            break;
-          case "children":
-            response = await client.getEnterprise(`/v2/admin/department/${idToPath(requireId(departmentId, "department_id"))}/children`, { permission_filter: params.permission_filter as boolean | undefined });
-            break;
-          case "users":
-            response = await client.getEnterprise(`/v2/admin/department/${idToPath(requireId(departmentId, "department_id"))}/users`, { page_id: params.page_id as number });
-            break;
-          case "space_list":
-            response = await client.getEnterprise("/v2/admin/department/space_list");
-            break;
-          case "create":
-            response = await client.postEnterprise("/v2/admin/department/create", requireJsonObject(params.body, "body"));
-            break;
-          case "update":
-            response = await client.postEnterprise(`/v2/admin/department/${idToPath(requireId(departmentId, "department_id"))}/update`, requireJsonObject(params.body, "body"));
-            break;
-          case "delete":
-            response = await client.postEnterprise(`/v2/admin/department/${idToPath(requireId(departmentId, "department_id"))}/delete`, requireJsonObject(params.body, "body"));
-            break;
-          case "add_user":
-            response = await client.postEnterprise(`/v2/admin/department/${idToPath(requireId(departmentId, "department_id"))}/add_user`, requireJsonObject(params.body, "body"));
-            break;
-          case "remove_user":
-            response = await client.postEnterprise(`/v2/admin/department/${idToPath(requireId(departmentId, "department_id"))}/remove_user`, requireJsonObject(params.body, "body"));
-            break;
-          default:
-            response = await client.postEnterprise(`/v2/admin/department/${idToPath(requireId(departmentId, "department_id"))}/update_space`, requireJsonObject(params.body, "body"));
-            break;
-        }
+      async ({ department_id }) => {
+        const response = await client.getEnterprise(`/v2/admin/department/${idToPath(department_id as IdLike)}/info`);
+        return ok(compactDepartment(response.data), metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerReadTool(
+      "yfy_admin_list_department_children",
+      {
+        title: "Admin List Yifangyun Department Children",
+        description: "List child departments using the enterprise token.",
+        inputSchema: { department_id: IdSchema.default(0).describe("Parent department id."), permission_filter: z.boolean().optional().describe("Whether to filter by permission when supported.") }
+      },
+      async ({ department_id, permission_filter }) => {
+        const response = await client.getEnterprise(`/v2/admin/department/${idToPath(department_id as IdLike)}/children`, { permission_filter: permission_filter as boolean | undefined });
+        return ok(compactChildren(response.data), metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerReadTool(
+      "yfy_admin_list_department_users",
+      {
+        title: "Admin List Yifangyun Department Users",
+        description: "List users in a department using the enterprise token.",
+        inputSchema: { department_id: IdSchema.describe("Department id."), query_words: z.string().max(200).optional().describe("Optional user search text."), page_id: z.number().int().min(0).default(0).describe("Zero-based page number."), include_contact: z.boolean().default(false).describe("Whether to include email and phone when returned.") }
+      },
+      async ({ department_id, query_words, page_id, include_contact }) => {
+        const response = await client.getEnterprise(`/v2/admin/department/${idToPath(department_id as IdLike)}/users`, { query_words: query_words as string | undefined, page_id: page_id as number });
+        return ok(compactUserList(response.data, include_contact as boolean), metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerReadTool(
+      "yfy_admin_list_department_spaces",
+      {
+        title: "Admin List Yifangyun Department Spaces",
+        description: "List department space usage using the enterprise token.",
+        inputSchema: { operator_id: IdSchema.describe("Operator user id required by the official API.") }
+      },
+      async ({ operator_id }) => {
+        const response = await client.getEnterprise("/v2/admin/department/space_list", { operator_id: String(operator_id as IdLike) });
         return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
       }
     );
 
     registerMutationTool(
-      "yfy_admin_groups",
+      "yfy_admin_create_department",
       {
-        title: "Yifangyun Admin Groups",
-        description: "Official admin group wrapper: list, info, users, create, update, delete, add_user, remove_user.",
-        inputSchema: { action: z.enum(["list", "info", "users", "create", "update", "delete", "add_user", "remove_user"]), group_id: OptionalIdSchema, body: JsonRecordSchema.optional() }
+        title: "Admin Create Yifangyun Department",
+        description: "Create a department using the enterprise token.",
+        inputSchema: {
+          name: z.string().min(1).max(30).describe("Department name."),
+          parent_id: IdSchema.describe("Parent department id."),
+          director_id: OptionalIdSchema.describe("Optional department director user id."),
+          special_users: z.array(UserRoleSchema).optional().describe("Optional special member roles."),
+          space_total: z.number().int().min(1).optional().describe("Department quota in GB."),
+          create_common_folder: z.boolean().optional().describe("Whether to create a common folder."),
+          ...AdminBooleanSettingsShape
+        }
       },
       async (params) => {
-        let response: ApiJsonResponse;
-        const groupId = normalizeOptionalId(params.group_id as IdLike | "" | undefined);
-        switch (params.action) {
-          case "list":
-            response = await client.getEnterprise("/v2/admin/group/list");
-            break;
-          case "info":
-            response = await client.getEnterprise(`/v2/admin/group/${idToPath(requireId(groupId, "group_id"))}/info`);
-            break;
-          case "users":
-            response = await client.getEnterprise(`/v2/admin/group/${idToPath(requireId(groupId, "group_id"))}/users`);
-            break;
-          case "create":
-            response = await client.postEnterprise("/v2/admin/group/create", requireJsonObject(params.body, "body"));
-            break;
-          case "update":
-            response = await client.postEnterprise(`/v2/admin/group/${idToPath(requireId(groupId, "group_id"))}/update`, requireJsonObject(params.body, "body"));
-            break;
-          case "delete":
-            response = await client.postEnterprise(`/v2/admin/group/${idToPath(requireId(groupId, "group_id"))}/delete`, requireJsonObject(params.body, "body"));
-            break;
-          case "add_user":
-            response = await client.postEnterprise(`/v2/admin/group/${idToPath(requireId(groupId, "group_id"))}/add_user`, requireJsonObject(params.body, "body"));
-            break;
-          default:
-            response = await client.postEnterprise(`/v2/admin/group/${idToPath(requireId(groupId, "group_id"))}/remove_user`, requireJsonObject(params.body, "body"));
-            break;
+        const body = buildAdminDepartmentBody(params, true);
+        body.parent_id = asNumberOrString(params.parent_id as IdLike);
+        const response = await client.postEnterprise("/v2/admin/department/create", body);
+        return ok(compactDepartment(response.data), metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerMutationTool(
+      "yfy_admin_update_department",
+      {
+        title: "Admin Update Yifangyun Department",
+        description: "Update department metadata and settings using the enterprise token.",
+        inputSchema: {
+          department_id: IdSchema.describe("Department id."),
+          name: z.string().min(1).max(30).describe("Department name."),
+          parent_id: OptionalIdSchema.describe("Optional new parent department id."),
+          director_id: OptionalIdSchema.describe("Optional department director user id; -1 may clear director when supported."),
+          special_users: z.array(UserRoleSchema).optional().describe("Optional special member roles."),
+          space_total: z.number().int().min(1).optional().describe("Department quota in GB."),
+          file_managers: z.array(IdSchema).optional().describe("Optional file manager user ids."),
+          permission_type: z.string().optional().describe("Optional department permission type."),
+          ...AdminBooleanSettingsShape
         }
+      },
+      async (params) => {
+        const response = await client.postEnterprise(`/v2/admin/department/${idToPath(params.department_id as IdLike)}/update`, buildAdminDepartmentBody(params, true));
+        return ok(compactDepartment(response.data), metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerMutationTool(
+      "yfy_admin_delete_department",
+      {
+        title: "Admin Delete Yifangyun Department",
+        description: "Delete a department using the enterprise token.",
+        inputSchema: { department_id: IdSchema.describe("Department id to delete.") }
+      },
+      async ({ department_id }) => {
+        const response = await client.postEnterprise(`/v2/admin/department/${idToPath(department_id as IdLike)}/delete`, {});
+        return ok(isObject(response.data) ? response.data : { success: true }, metaToJson(response.meta), { config, raw: response.data });
+      },
+      true
+    );
+
+    registerMutationTool(
+      "yfy_admin_add_department_user",
+      {
+        title: "Admin Add Yifangyun Department User",
+        description: "Add one user to a department using the enterprise token.",
+        inputSchema: { department_id: IdSchema.describe("Department id."), user_id: IdSchema.describe("User id to add.") }
+      },
+      async ({ department_id, user_id }) => {
+        const response = await client.postEnterprise(`/v2/admin/department/${idToPath(department_id as IdLike)}/add_user`, { user_id: asNumberOrString(user_id as IdLike) });
+        return ok(isObject(response.data) ? response.data : { success: true }, metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerMutationTool(
+      "yfy_admin_remove_department_user",
+      {
+        title: "Admin Remove Yifangyun Department User",
+        description: "Remove one user from a department using the enterprise token.",
+        inputSchema: { department_id: IdSchema.describe("Department id."), user_id: IdSchema.describe("User id to remove.") }
+      },
+      async ({ department_id, user_id }) => {
+        const response = await client.postEnterprise(`/v2/admin/department/${idToPath(department_id as IdLike)}/remove_user`, { user_id: asNumberOrString(user_id as IdLike) });
+        return ok(isObject(response.data) ? response.data : { success: true }, metaToJson(response.meta), { config, raw: response.data });
+      },
+      true
+    );
+
+    registerMutationTool(
+      "yfy_admin_update_department_space",
+      {
+        title: "Admin Update Yifangyun Department Space",
+        description: "Update department quota using the enterprise token.",
+        inputSchema: { department_id: IdSchema.describe("Department id."), operator_id: IdSchema.describe("Operator user id."), space_total: z.number().int().min(1).describe("Department quota in GB.") }
+      },
+      async ({ department_id, operator_id, space_total }) => {
+        const response = await client.postEnterprise(`/v2/admin/department/${idToPath(department_id as IdLike)}/update_space`, { operatorId: asNumberOrString(operator_id as IdLike), spaceTotal: space_total as number });
+        return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerReadTool(
+      "yfy_admin_list_groups",
+      {
+        title: "Admin List Yifangyun Groups",
+        description: "List company-visible groups using the enterprise token.",
+        inputSchema: { query_words: z.string().max(200).optional().describe("Optional group search text."), page_id: z.number().int().min(0).default(0).describe("Zero-based page number.") }
+      },
+      async ({ query_words, page_id }) => {
+        const response = await client.getEnterprise("/v2/admin/group/list", { query_words: query_words as string | undefined, page_id: page_id as number });
+        return ok(compactGroupList(response.data), metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerReadTool(
+      "yfy_admin_get_group_info",
+      {
+        title: "Admin Get Yifangyun Group Info",
+        description: "Get admin-visible group metadata using the enterprise token.",
+        inputSchema: { group_id: IdSchema.describe("Group id.") }
+      },
+      async ({ group_id }) => {
+        const response = await client.getEnterprise(`/v2/admin/group/${idToPath(group_id as IdLike)}/info`);
+        return ok(compactGroup(response.data), metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerReadTool(
+      "yfy_admin_list_group_users",
+      {
+        title: "Admin List Yifangyun Group Users",
+        description: "List group members using the enterprise token.",
+        inputSchema: { group_id: IdSchema.describe("Group id."), query_words: z.string().max(200).optional().describe("Optional user search text."), page_id: z.number().int().min(0).default(0).describe("Zero-based page number."), include_contact: z.boolean().default(false).describe("Whether to include email and phone when returned.") }
+      },
+      async ({ group_id, query_words, page_id, include_contact }) => {
+        const response = await client.getEnterprise(`/v2/admin/group/${idToPath(group_id as IdLike)}/users`, { query_words: query_words as string | undefined, page_id: page_id as number });
+        return ok(compactUserList(response.data, include_contact as boolean), metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerMutationTool(
+      "yfy_admin_create_group",
+      {
+        title: "Admin Create Yifangyun Group",
+        description: "Create a group using the enterprise token.",
+        inputSchema: {
+          name: z.string().min(1).max(30).describe("Group name."),
+          admin_user_id: OptionalIdSchema.describe("Optional group admin user id."),
+          description: z.string().max(500).optional().describe("Optional group description."),
+          visible: z.boolean().optional().describe("Whether the group is visible."),
+          collab_auto_accepted: z.boolean().optional().describe("Whether collaboration invitations are accepted automatically.")
+        }
+      },
+      async (params) => {
+        const response = await client.postEnterprise("/v2/admin/group/create", buildAdminGroupBody(params, true));
+        return ok(compactGroup(response.data), metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerMutationTool(
+      "yfy_admin_update_group",
+      {
+        title: "Admin Update Yifangyun Group",
+        description: "Update group metadata and visibility using the enterprise token.",
+        inputSchema: {
+          group_id: IdSchema.describe("Group id."),
+          name: z.string().min(1).max(30).optional().describe("Optional group name."),
+          admin_user_id: OptionalIdSchema.describe("Optional group admin user id; -1 may clear admin when supported."),
+          description: z.string().max(500).optional().describe("Optional group description."),
+          visible: z.boolean().optional().describe("Whether the group is visible."),
+          collab_auto_accepted: z.boolean().optional().describe("Whether collaboration invitations are accepted automatically.")
+        }
+      },
+      async (params) => {
+        const response = await client.postEnterprise(`/v2/admin/group/${idToPath(params.group_id as IdLike)}/update`, buildAdminGroupBody(params, false));
+        return ok(compactGroup(response.data), metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerMutationTool(
+      "yfy_admin_delete_group",
+      {
+        title: "Admin Delete Yifangyun Group",
+        description: "Delete a group using the enterprise token.",
+        inputSchema: { group_id: IdSchema.describe("Group id to delete.") }
+      },
+      async ({ group_id }) => {
+        const response = await client.postEnterprise(`/v2/admin/group/${idToPath(group_id as IdLike)}/delete`, {});
+        return ok(isObject(response.data) ? response.data : { success: true }, metaToJson(response.meta), { config, raw: response.data });
+      },
+      true
+    );
+
+    registerMutationTool(
+      "yfy_admin_add_group_user",
+      {
+        title: "Admin Add Yifangyun Group User",
+        description: "Add one user to a group using the enterprise token.",
+        inputSchema: { group_id: IdSchema.describe("Group id."), user_id: IdSchema.describe("User id to add.") }
+      },
+      async ({ group_id, user_id }) => {
+        const response = await client.postEnterprise(`/v2/admin/group/${idToPath(group_id as IdLike)}/add_user`, { user_id: asNumberOrString(user_id as IdLike) });
+        return ok(isObject(response.data) ? response.data : { success: true }, metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerMutationTool(
+      "yfy_admin_remove_group_user",
+      {
+        title: "Admin Remove Yifangyun Group User",
+        description: "Remove one user from a group using the enterprise token.",
+        inputSchema: { group_id: IdSchema.describe("Group id."), user_id: IdSchema.describe("User id to remove.") }
+      },
+      async ({ group_id, user_id }) => {
+        const response = await client.postEnterprise(`/v2/admin/group/${idToPath(group_id as IdLike)}/remove_user`, { user_id: asNumberOrString(user_id as IdLike) });
+        return ok(isObject(response.data) ? response.data : { success: true }, metaToJson(response.meta), { config, raw: response.data });
+      },
+      true
+    );
+
+    registerReadTool(
+      "yfy_admin_get_user_info",
+      {
+        title: "Admin Get Yifangyun User Info",
+        description: "Get admin-visible user metadata by Yifangyun user id.",
+        inputSchema: { user_id: IdSchema.describe("Yifangyun user id."), last_login_flag: z.boolean().optional().describe("Whether to include last login information.") }
+      },
+      async ({ user_id, last_login_flag }) => {
+        const response = await client.getEnterprise(`/v2/admin/user/${idToPath(user_id as IdLike)}/info`, { last_login_flag: last_login_flag as boolean | undefined });
+        return ok(compactUser(response.data, true) ?? asJsonObject(response.data), metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerReadTool(
+      "yfy_admin_lookup_user",
+      {
+        title: "Admin Lookup Yifangyun User",
+        description: "Lookup a user by phone/email or third-party ticket using the enterprise token.",
+        inputSchema: { identifier: z.string().min(1).describe("Phone/email or third-party user ticket."), identifier_type: IdentifierTypeSchema.describe("Identifier type."), platform_id: IdSchema.describe("Third-party platform id; private deployments commonly use 2.") }
+      },
+      async ({ identifier, identifier_type, platform_id }) => {
+        const response = await client.getEnterprise("/v2/admin/user/get_user_info", { identifier: identifier as string, type: identifier_type as string, platform_id: String(platform_id as IdLike) });
         return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
       }
     );
 
     registerMutationTool(
-      "yfy_admin_users",
+      "yfy_admin_create_user",
       {
-        title: "Yifangyun Admin Users",
-        description: "Official admin user wrapper: info, get_user_info, create, update, delete, login_url, login_params.",
-        inputSchema: { action: z.enum(["info", "get_user_info", "create", "update", "delete", "login_url", "login_params"]), user_id: OptionalIdSchema, identifier: z.string().optional(), identifier_type: z.string().optional(), platform_id: OptionalIdSchema, last_login_flag: z.boolean().optional(), body: JsonRecordSchema.optional() }
+        title: "Admin Create Yifangyun User",
+        description: "Create a user using the enterprise token.",
+        inputSchema: {
+          full_name: z.string().min(1).max(30).optional().describe("User full name."),
+          phone: z.string().optional().describe("User phone."),
+          email: z.string().email().optional().describe("User email."),
+          storage_id: OptionalIdSchema.describe("Optional storage id."),
+          space_total: z.number().int().optional().describe("User quota in GB; -1 means unlimited when supported."),
+          hide_phone: z.boolean().optional().describe("Whether to hide phone number."),
+          disable_download: z.boolean().optional().describe("Whether to disable download."),
+          force_active: z.boolean().optional().describe("Whether to force activation."),
+          password: z.string().min(6).max(32).optional().describe("Password required when force_active is true.")
+        }
       },
       async (params) => {
-        let response: ApiJsonResponse;
-        const userId = normalizeOptionalId(params.user_id as IdLike | "" | undefined);
-        switch (params.action) {
-          case "info":
-            response = await client.getEnterprise(`/v2/admin/user/${idToPath(requireId(userId, "user_id"))}/info`, { last_login_flag: params.last_login_flag as boolean | undefined });
-            break;
-          case "get_user_info":
-            response = await client.getEnterprise("/v2/admin/user/get_user_info", { identifier: requireNonEmptyString(params.identifier, "identifier"), type: requireNonEmptyString(params.identifier_type, "identifier_type"), platform_id: String(requireId(params.platform_id as IdLike | "" | undefined, "platform_id")) });
-            break;
-          case "create":
-            response = await client.postEnterprise("/v2/admin/user/create", requireJsonObject(params.body, "body"));
-            break;
-          case "update":
-            response = await client.postEnterprise(`/v2/admin/user/${idToPath(requireId(userId, "user_id"))}/update`, requireJsonObject(params.body, "body"));
-            break;
-          case "delete":
-            response = await client.postEnterprise(`/v2/admin/user/${idToPath(requireId(userId, "user_id"))}/delete`, requireJsonObject(params.body, "body"));
-            break;
-          case "login_url":
-            response = await client.getEnterprise("/v2/admin/user/get_login_url", { identifier: requireNonEmptyString(params.identifier, "identifier"), type: requireNonEmptyString(params.identifier_type, "identifier_type"), platform_id: String(requireId(params.platform_id as IdLike | "" | undefined, "platform_id")) });
-            break;
-          default:
-            response = await client.getEnterprise("/v2/admin/user/get_login_params", { identifier: requireNonEmptyString(params.identifier, "identifier"), type: requireNonEmptyString(params.identifier_type, "identifier_type"), platform_id: String(requireId(params.platform_id as IdLike | "" | undefined, "platform_id")) });
-            break;
-        }
+        const response = await client.postEnterprise("/v2/admin/user/create", buildAdminUserBody(params, true));
         return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
       }
     );
 
     registerMutationTool(
-      "yfy_admin_logs",
+      "yfy_admin_update_user",
       {
-        title: "Yifangyun Admin Logs",
-        description: "Official admin log wrapper: action_type_info, log_info, log_list, log_list_paginated.",
-        inputSchema: { action: z.enum(["action_type_info", "log_info", "log_list", "log_list_paginated"]), body: JsonRecordSchema.optional() }
+        title: "Admin Update Yifangyun User",
+        description: "Update user profile/quota settings using the enterprise token.",
+        inputSchema: {
+          user_id: IdSchema.describe("Yifangyun user id."),
+          name: z.string().min(1).max(30).optional().describe("Optional user display name."),
+          storage_id: OptionalIdSchema.describe("Optional storage id."),
+          space_total: z.number().int().optional().describe("User quota in GB; -1 means unlimited when supported."),
+          hide_phone: z.boolean().optional().describe("Whether to hide phone number."),
+          disable_download: z.boolean().optional().describe("Whether to disable download.")
+        }
       },
       async (params) => {
-        const endpoint = params.action === "action_type_info"
-          ? "/v2/admin/log/action_type_info"
-          : params.action === "log_info"
-            ? "/v2/admin/log/log_info"
-            : params.action === "log_list"
-              ? "/v2/admin/log/log_list"
-              : "/v2/admin/log/log_list_by_pagination";
-        const response = await client.postEnterprise(endpoint, requireJsonObject(params.body, "body"));
+        const response = await client.postEnterprise(`/v2/admin/user/${idToPath(params.user_id as IdLike)}/update`, buildAdminUserBody(params, false));
         return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
       }
     );
 
     registerMutationTool(
-      "yfy_admin_sync",
+      "yfy_admin_delete_user",
       {
-        title: "Yifangyun Admin Sync",
-        description: "Official admin platform sync wrapper: mapping_user/group/department and sync_users/groups/departments.",
-        inputSchema: { action: z.enum(["mapping_user", "mapping_group", "mapping_department", "sync_users", "sync_groups", "sync_departments"]), platform_id: IdSchema, query_id: z.string().optional(), yfy_id: OptionalIdSchema, body: JsonRecordSchema.optional() }
+        title: "Admin Delete Yifangyun User",
+        description: "Delete a user and transfer their files to another user.",
+        inputSchema: { user_id: IdSchema.describe("User id to delete."), transfer_to_user_id: IdSchema.describe("User id that receives deleted user's files.") }
       },
-      async (params) => {
-        const platformId = requireId(params.platform_id as IdLike | "" | undefined, "platform_id");
-        let response: ApiJsonResponse;
-        switch (params.action) {
-          case "mapping_user":
-            response = await client.getEnterprise(`/v2/admin/platform/${idToPath(platformId)}/mapping_user`, { user_id: requireNonEmptyString(params.query_id, "query_id"), yfy_user_id: String(requireId(params.yfy_id as IdLike | "" | undefined, "yfy_id")) });
-            break;
-          case "mapping_group":
-            response = await client.getEnterprise(`/v2/admin/platform/${idToPath(platformId)}/mapping_group`, { group_id: requireNonEmptyString(params.query_id, "query_id"), yfy_group_id: String(requireId(params.yfy_id as IdLike | "" | undefined, "yfy_id")) });
-            break;
-          case "mapping_department":
-            response = await client.getEnterprise(`/v2/admin/platform/${idToPath(platformId)}/mapping_department`, { department_id: requireNonEmptyString(params.query_id, "query_id"), yfy_department_id: String(requireId(params.yfy_id as IdLike | "" | undefined, "yfy_id")) });
-            break;
-          case "sync_users":
-            response = await client.postEnterprise(`/v2/admin/platform/${idToPath(platformId)}/sync_users`, requireJsonObject(params.body, "body"));
-            break;
-          case "sync_groups":
-            response = await client.postEnterprise(`/v2/admin/platform/${idToPath(platformId)}/sync_groups`, requireJsonObject(params.body, "body"));
-            break;
-          default:
-            response = await client.postEnterprise(`/v2/admin/platform/${idToPath(platformId)}/sync_departments`, requireJsonObject(params.body, "body"));
-            break;
-        }
+      async ({ user_id, transfer_to_user_id }) => {
+        const response = await client.postEnterprise(`/v2/admin/user/${idToPath(user_id as IdLike)}/delete`, { user_receive_items: asNumberOrString(transfer_to_user_id as IdLike) });
+        return ok(isObject(response.data) ? response.data : { success: true }, metaToJson(response.meta), { config, raw: response.data });
+      },
+      true
+    );
+
+    registerReadTool(
+      "yfy_admin_get_user_login_url",
+      {
+        title: "Admin Get Yifangyun User Login URL",
+        description: "Get a short-lived login URL for a user identifier. Treat the returned URL as sensitive.",
+        inputSchema: { identifier: z.string().min(1).describe("Phone/email or third-party user ticket."), identifier_type: IdentifierTypeSchema.describe("Identifier type."), platform_id: IdSchema.describe("Third-party platform id; private deployments commonly use 2.") }
+      },
+      async ({ identifier, identifier_type, platform_id }) => {
+        const response = await client.getEnterprise("/v2/admin/user/get_login_url", { identifier: identifier as string, type: identifier_type as string, platform_id: String(platform_id as IdLike) });
         return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
       }
     );
+
+    registerReadTool(
+      "yfy_admin_get_user_login_params",
+      {
+        title: "Admin Get Yifangyun User Login Params",
+        description: "Get short-lived login parameters for a user identifier. Treat returned auth material as sensitive.",
+        inputSchema: { identifier: z.string().min(1).describe("Phone/email or third-party user ticket."), identifier_type: IdentifierTypeSchema.describe("Identifier type."), platform_id: IdSchema.describe("Third-party platform id; private deployments commonly use 2.") }
+      },
+      async ({ identifier, identifier_type, platform_id }) => {
+        const response = await client.getEnterprise("/v2/admin/user/get_login_params", { identifier: identifier as string, type: identifier_type as string, platform_id: String(platform_id as IdLike) });
+        return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerReadTool(
+      "yfy_admin_get_log_action_types",
+      {
+        title: "Admin Get Yifangyun Log Action Types",
+        description: "Get log action type names. Use is_all=true for the full catalog or pass action_types for selected ids.",
+        inputSchema: { is_all: z.boolean().default(true).describe("Whether to return all action types."), action_types: z.array(z.number().int().nonnegative()).optional().describe("Optional action type ids to resolve.") }
+      },
+      async ({ is_all, action_types }) => {
+        const response = await client.postEnterprise("/v2/admin/log/action_type_info", { is_all: is_all as boolean, ...(Array.isArray(action_types) ? { action_types: action_types as JsonArray } : {}) });
+        return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerReadTool(
+      "yfy_admin_get_log_info",
+      {
+        title: "Admin Get Yifangyun Log Info",
+        description: "Query detailed logs with official LogInfoBean filters.",
+        inputSchema: { body: JsonRecordSchema.describe("Official LogInfoBean filter body, including start_date and end_date.") }
+      },
+      async ({ body }) => {
+        const response = await client.postEnterprise("/v2/admin/log/log_info", requireJsonObject(body, "body"));
+        return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerReadTool(
+      "yfy_admin_list_logs",
+      {
+        title: "Admin List Yifangyun Logs",
+        description: "List logs by date range using the official log_list endpoint.",
+        inputSchema: {
+          start_date: z.string().min(10).max(10).describe("Start date in yyyy-MM-dd format, not earlier than 90 days ago."),
+          end_date: z.string().min(10).max(10).describe("End date in yyyy-MM-dd format, not later than today."),
+          page_id: z.number().int().min(1).default(1).describe("Official API page number, starting at 1."),
+          page_capacity: z.number().int().min(1).max(500).default(25).describe("Page size, max 500.")
+        }
+      },
+      async ({ start_date, end_date, page_id, page_capacity }) => {
+        const response = await client.postEnterprise("/v2/admin/log/log_list", { start_date: start_date as string, end_date: end_date as string, page_id: page_id as number, page_capacity: page_capacity as number });
+        return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerReadTool(
+      "yfy_admin_list_logs_paginated",
+      {
+        title: "Admin List Yifangyun Logs Paginated",
+        description: "Page through logs for one date using the official log_list_by_pagination endpoint.",
+        inputSchema: {
+          date: z.string().min(10).max(10).describe("Date in yyyy-MM-dd format."),
+          pagination: z.number().int().min(1).default(1).describe("Pagination cursor/page value expected by the official API."),
+          page_capacity: z.number().int().min(1).max(500).default(25).describe("Page size, max 500.")
+        }
+      },
+      async ({ date, pagination, page_capacity }) => {
+        const response = await client.postEnterprise("/v2/admin/log/log_list_by_pagination", { date: date as string, pagination: pagination as number, page_capacity: page_capacity as number });
+        return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerReadTool(
+      "yfy_admin_map_platform_user",
+      {
+        title: "Admin Map Yifangyun Platform User",
+        description: "Get mapping between a third-party user id and a Yifangyun user id.",
+        inputSchema: { platform_id: IdSchema.describe("Third-party platform id; private deployments commonly use 2."), query_user_id: z.string().min(1).describe("Third-party user id."), yfy_user_id: IdSchema.describe("Yifangyun user id.") }
+      },
+      async ({ platform_id, query_user_id, yfy_user_id }) => {
+        const response = await client.getEnterprise(`/v2/admin/platform/${idToPath(platform_id as IdLike)}/mapping_user`, { user_id: query_user_id as string, yfy_user_id: String(yfy_user_id as IdLike) });
+        return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerReadTool(
+      "yfy_admin_map_platform_group",
+      {
+        title: "Admin Map Yifangyun Platform Group",
+        description: "Get mapping between a third-party group id and a Yifangyun group id.",
+        inputSchema: { platform_id: IdSchema.describe("Third-party platform id; private deployments commonly use 2."), query_group_id: z.string().min(1).describe("Third-party group id."), yfy_group_id: IdSchema.describe("Yifangyun group id.") }
+      },
+      async ({ platform_id, query_group_id, yfy_group_id }) => {
+        const response = await client.getEnterprise(`/v2/admin/platform/${idToPath(platform_id as IdLike)}/mapping_group`, { group_id: query_group_id as string, yfy_group_id: String(yfy_group_id as IdLike) });
+        return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerReadTool(
+      "yfy_admin_map_platform_department",
+      {
+        title: "Admin Map Yifangyun Platform Department",
+        description: "Get mapping between a third-party department id and a Yifangyun department id.",
+        inputSchema: { platform_id: IdSchema.describe("Third-party platform id; private deployments commonly use 2."), query_department_id: z.string().min(1).describe("Third-party department id."), yfy_department_id: IdSchema.describe("Yifangyun department id.") }
+      },
+      async ({ platform_id, query_department_id, yfy_department_id }) => {
+        const response = await client.getEnterprise(`/v2/admin/platform/${idToPath(platform_id as IdLike)}/mapping_department`, { department_id: query_department_id as string, yfy_department_id: String(yfy_department_id as IdLike) });
+        return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
+      }
+    );
+
+    registerMutationTool(
+      "yfy_admin_sync_platform_users",
+      {
+        title: "Admin Sync Yifangyun Platform Users",
+        description: "Synchronize third-party platform users. Body must match official SyncUserBean.",
+        inputSchema: { platform_id: IdSchema.describe("Third-party platform id; private deployments commonly use 2."), body: JsonRecordSchema.describe("Official SyncUserBean body with users array.") }
+      },
+      async ({ platform_id, body }) => {
+        const response = await client.postEnterprise(`/v2/admin/platform/${idToPath(platform_id as IdLike)}/sync_users`, requireJsonObject(body, "body"));
+        return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
+      },
+      true
+    );
+
+    registerMutationTool(
+      "yfy_admin_sync_platform_groups",
+      {
+        title: "Admin Sync Yifangyun Platform Groups",
+        description: "Synchronize third-party platform groups. Body must match official SyncGroupBean.",
+        inputSchema: { platform_id: IdSchema.describe("Third-party platform id; private deployments commonly use 2."), body: JsonRecordSchema.describe("Official SyncGroupBean body with groups array.") }
+      },
+      async ({ platform_id, body }) => {
+        const response = await client.postEnterprise(`/v2/admin/platform/${idToPath(platform_id as IdLike)}/sync_groups`, requireJsonObject(body, "body"));
+        return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
+      },
+      true
+    );
+
+    registerMutationTool(
+      "yfy_admin_sync_platform_departments",
+      {
+        title: "Admin Sync Yifangyun Platform Departments",
+        description: "Synchronize third-party platform departments. Body must match official SyncDepartmentBean.",
+        inputSchema: { platform_id: IdSchema.describe("Third-party platform id; private deployments commonly use 2."), body: JsonRecordSchema.describe("Official SyncDepartmentBean body with departments array.") }
+      },
+      async ({ platform_id, body }) => {
+        const response = await client.postEnterprise(`/v2/admin/platform/${idToPath(platform_id as IdLike)}/sync_departments`, requireJsonObject(body, "body"));
+        return ok(response.data, metaToJson(response.meta), { config, raw: response.data });
+      },
+      true
+    );
+
   }
 }
 

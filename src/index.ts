@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadConfig } from "./config.js";
 import { YifangyunClient } from "./client.js";
+import { registerGuidance, SERVER_INSTRUCTIONS } from "./guidance.js";
 import { registerTools } from "./tools/registerTools.js";
 
 async function main(): Promise<void> {
@@ -11,9 +12,12 @@ async function main(): Promise<void> {
   const client = new YifangyunClient(config);
   const server = new McpServer({
     name: "yifangyun-mcp-server",
-    version: "0.2.0"
+    version: "0.2.1"
+  }, {
+    instructions: SERVER_INSTRUCTIONS
   });
 
+  registerGuidance(server, config);
   registerTools(server, client, config);
 
   const transport = new StdioServerTransport();

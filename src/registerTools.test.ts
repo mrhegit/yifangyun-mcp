@@ -83,14 +83,87 @@ function getTool(server: FakeServer, name: string): RegisteredTool {
   return tool;
 }
 
+const compatibilityWrapperTools = [
+  "yfy_manage_collab",
+  "yfy_admin_departments",
+  "yfy_admin_groups",
+  "yfy_admin_users",
+  "yfy_admin_logs",
+  "yfy_admin_sync"
+] as const;
+
+const mutationAtomicTools = [
+  "yfy_create_folder",
+  "yfy_update_file",
+  "yfy_update_folder",
+  "yfy_move_item",
+  "yfy_copy_item",
+  "yfy_delete_item",
+  "yfy_restore_item",
+  "yfy_upload_file",
+  "yfy_upload_file_by_path",
+  "yfy_upload_new_version",
+  "yfy_invite_collab",
+  "yfy_invite_collabs_batch",
+  "yfy_get_collab_info",
+  "yfy_update_collab_role",
+  "yfy_delete_collab",
+  "yfy_remove_collabs"
+] as const;
+
+const adminAtomicTools = [
+  "yfy_admin_get_department_info",
+  "yfy_admin_list_department_children",
+  "yfy_admin_list_department_users",
+  "yfy_admin_list_department_spaces",
+  "yfy_admin_create_department",
+  "yfy_admin_update_department",
+  "yfy_admin_delete_department",
+  "yfy_admin_add_department_user",
+  "yfy_admin_remove_department_user",
+  "yfy_admin_update_department_space",
+  "yfy_admin_list_groups",
+  "yfy_admin_get_group_info",
+  "yfy_admin_list_group_users",
+  "yfy_admin_create_group",
+  "yfy_admin_update_group",
+  "yfy_admin_delete_group",
+  "yfy_admin_add_group_user",
+  "yfy_admin_remove_group_user",
+  "yfy_admin_get_user_info",
+  "yfy_admin_lookup_user",
+  "yfy_admin_create_user",
+  "yfy_admin_update_user",
+  "yfy_admin_delete_user",
+  "yfy_admin_get_user_login_url",
+  "yfy_admin_get_user_login_params",
+  "yfy_admin_get_log_action_types",
+  "yfy_admin_get_log_info",
+  "yfy_admin_list_logs",
+  "yfy_admin_list_logs_paginated",
+  "yfy_admin_map_platform_user",
+  "yfy_admin_map_platform_group",
+  "yfy_admin_map_platform_department",
+  "yfy_admin_sync_platform_users",
+  "yfy_admin_sync_platform_groups",
+  "yfy_admin_sync_platform_departments"
+] as const;
+
 test("registerTools honors capability gates and mutation annotations", () => {
   const defaultServer = new FakeServer();
   registerTools(defaultServer as unknown as McpServer, makeClient(), makeConfig());
 
   assert.ok(defaultServer.tools.has("yfy_lock_current_original"));
   assert.ok(!defaultServer.tools.has("yfy_get_download_url"));
-  assert.ok(!defaultServer.tools.has("yfy_create_folder"));
-  assert.ok(!defaultServer.tools.has("yfy_admin_users"));
+  for (const toolName of mutationAtomicTools) {
+    assert.ok(!defaultServer.tools.has(toolName), `Expected ${toolName} to be gated by mutation flag`);
+  }
+  for (const toolName of adminAtomicTools) {
+    assert.ok(!defaultServer.tools.has(toolName), `Expected ${toolName} to be gated by admin flag`);
+  }
+  for (const toolName of compatibilityWrapperTools) {
+    assert.ok(!defaultServer.tools.has(toolName), `Expected compatibility wrapper ${toolName} to stay removed`);
+  }
 
   const fullServer = new FakeServer();
   registerTools(
@@ -100,10 +173,23 @@ test("registerTools honors capability gates and mutation annotations", () => {
   );
 
   assert.ok(fullServer.tools.has("yfy_get_download_url"));
-  assert.ok(fullServer.tools.has("yfy_create_folder"));
-  assert.ok(fullServer.tools.has("yfy_admin_users"));
+  for (const toolName of mutationAtomicTools) {
+    assert.ok(fullServer.tools.has(toolName), `Expected mutation atomic tool ${toolName} to be registered`);
+  }
+  for (const toolName of adminAtomicTools) {
+    assert.ok(fullServer.tools.has(toolName), `Expected admin atomic tool ${toolName} to be registered`);
+  }
+  for (const toolName of compatibilityWrapperTools) {
+    assert.ok(!fullServer.tools.has(toolName), `Expected compatibility wrapper ${toolName} to stay removed`);
+  }
   const createFolder = getTool(fullServer, "yfy_create_folder");
   assert.equal((createFolder.definition.annotations as { idempotentHint: boolean }).idempotentHint, false);
+  const deleteCollab = getTool(fullServer, "yfy_delete_collab");
+  assert.equal((deleteCollab.definition.annotations as { destructiveHint: boolean }).destructiveHint, true);
+  const adminListGroups = getTool(fullServer, "yfy_admin_list_groups");
+  assert.equal((adminListGroups.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, true);
+  const adminSyncUsers = getTool(fullServer, "yfy_admin_sync_platform_users");
+  assert.equal((adminSyncUsers.definition.annotations as { destructiveHint: boolean }).destructiveHint, true);
 });
 
 test("yfy_lock_current_original fails fast when file is outside the requested scope", async () => {
@@ -279,40 +365,118 @@ test("yfy_resolve_path paginates root and child listings", async () => {
   assert.equal((data.resolved_item as { name: string }).name, "file.txt");
 });
 
-test("yfy_manage_collab invite fails fast when accessible_by is missing", async () => {
-  let postCalls = 0;
+test("yfy_invite_collab builds the official invite body", async () => {
   const server = new FakeServer();
   const client = makeClient({
-    postAsUser: async () => {
-      postCalls += 1;
-      throw new Error("postAsUser should not be called");
+    postAsUser: async (pathname: string, userId: IdLike | undefined, body: Record<string, unknown>) => {
+      assert.equal(pathname, "/v2/collab/invite");
+      assert.equal(userId, 530);
+      assert.deepEqual(body, {
+        folder_id: 7,
+        accessible_by: { type: "user", id: 42, role: "viewer" },
+        invitation_message: "hello"
+      });
+      return makeResponse(pathname, { id: 9, role: "viewer", accepted: false });
     }
   });
 
   registerTools(server as unknown as McpServer, client, makeConfig({ enableMutationTools: true }));
-  const tool = getTool(server, "yfy_manage_collab");
-  const result = await tool.handler({ action: "invite", folder_id: 1 });
+  const tool = getTool(server, "yfy_invite_collab");
+  const result = await tool.handler({ folder_id: 7, accessible_by: { type: "user", id: 42, role: "viewer" }, invitation_message: "hello", user_id: 530 });
 
-  assert.equal(result.isError, true);
-  assert.equal((result.structuredContent as { ok: boolean }).ok, false);
-  assert.equal(postCalls, 0);
+  assert.equal((result.structuredContent as { ok: boolean }).ok, true);
 });
 
-test("yfy_admin_departments create fails fast when body is missing", async () => {
-  let postCalls = 0;
+test("yfy_admin_create_department builds a typed department body", async () => {
   const server = new FakeServer();
   const client = makeClient({
-    postEnterprise: async () => {
-      postCalls += 1;
-      throw new Error("postEnterprise should not be called");
+    postEnterprise: async (pathname: string, body: Record<string, unknown>) => {
+      assert.equal(pathname, "/v2/admin/department/create");
+      assert.deepEqual(body, {
+        name: "Sales",
+        parent_id: 0,
+        director_id: 88,
+        space_total: 20,
+        hide_phone: true
+      });
+      return makeResponse(pathname, { id: 12, name: "Sales", parent_id: 0 });
     }
   });
 
   registerTools(server as unknown as McpServer, client, makeConfig({ enableAdminTools: true }));
-  const tool = getTool(server, "yfy_admin_departments");
-  const result = await tool.handler({ action: "create" });
+  const tool = getTool(server, "yfy_admin_create_department");
+  const result = await tool.handler({ name: "Sales", parent_id: 0, director_id: 88, space_total: 20, hide_phone: true });
 
-  assert.equal(result.isError, true);
-  assert.equal((result.structuredContent as { ok: boolean }).ok, false);
-  assert.equal(postCalls, 0);
+  assert.equal((result.structuredContent as { ok: boolean }).ok, true);
+});
+
+test("yfy_admin_lookup_user uses explicit identifier parameters", async () => {
+  const server = new FakeServer();
+  const client = makeClient({
+    getEnterprise: async (pathname: string, params?: Record<string, unknown>) => {
+      assert.equal(pathname, "/v2/admin/user/get_user_info");
+      assert.deepEqual(params, {
+        identifier: "dev@example.com",
+        type: "simple_phone_or_email",
+        platform_id: "2"
+      });
+      return makeResponse(pathname, { id: 55, name: "Dev" });
+    }
+  });
+
+  registerTools(server as unknown as McpServer, client, makeConfig({ enableAdminTools: true }));
+  const tool = getTool(server, "yfy_admin_lookup_user");
+  const result = await tool.handler({ identifier: "dev@example.com", identifier_type: "simple_phone_or_email", platform_id: 2 });
+
+  assert.equal((result.structuredContent as { ok: boolean }).ok, true);
+});
+
+test("admin group, log, delete-user, and platform-sync atomic tools build official requests", async () => {
+  const server = new FakeServer();
+  const seen: string[] = [];
+  const client = makeClient({
+    getEnterprise: async (pathname: string, params?: Record<string, unknown>) => {
+      seen.push(pathname);
+      if (pathname === "/v2/admin/group/list") {
+        assert.deepEqual(params, { query_words: "ops", page_id: 2 });
+        return makeResponse(pathname, { groups: [{ id: 1, name: "Ops" }] });
+      }
+      throw new Error(`Unexpected getEnterprise path: ${pathname}`);
+    },
+    postEnterprise: async (pathname: string, body: Record<string, unknown>) => {
+      seen.push(pathname);
+      if (pathname === "/v2/admin/group/3/update") {
+        assert.deepEqual(body, { name: "Ops2", visible: true });
+        return makeResponse(pathname, { id: 3, name: "Ops2" });
+      }
+      if (pathname === "/v2/admin/user/9/delete") {
+        assert.deepEqual(body, { user_receive_items: 10 });
+        return makeResponse(pathname, { success: true });
+      }
+      if (pathname === "/v2/admin/log/log_list") {
+        assert.deepEqual(body, { start_date: "2026-07-01", end_date: "2026-07-08", page_id: 1, page_capacity: 25 });
+        return makeResponse(pathname, { user_activities: [], total_count: 0 });
+      }
+      if (pathname === "/v2/admin/platform/2/sync_groups") {
+        assert.deepEqual(body, { groups: [{ id: "g1", admin_id: "u1", name: "G1", status: 1 }] });
+        return makeResponse(pathname, { success: true });
+      }
+      throw new Error(`Unexpected postEnterprise path: ${pathname}`);
+    }
+  });
+
+  registerTools(server as unknown as McpServer, client, makeConfig({ enableAdminTools: true }));
+  await getTool(server, "yfy_admin_list_groups").handler({ query_words: "ops", page_id: 2 });
+  await getTool(server, "yfy_admin_update_group").handler({ group_id: 3, name: "Ops2", visible: true });
+  await getTool(server, "yfy_admin_delete_user").handler({ user_id: 9, transfer_to_user_id: 10 });
+  await getTool(server, "yfy_admin_list_logs").handler({ start_date: "2026-07-01", end_date: "2026-07-08" });
+  await getTool(server, "yfy_admin_sync_platform_groups").handler({ platform_id: 2, body: { groups: [{ id: "g1", admin_id: "u1", name: "G1", status: 1 }] } });
+
+  assert.deepEqual(seen, [
+    "/v2/admin/group/list",
+    "/v2/admin/group/3/update",
+    "/v2/admin/user/9/delete",
+    "/v2/admin/log/log_list",
+    "/v2/admin/platform/2/sync_groups"
+  ]);
 });
