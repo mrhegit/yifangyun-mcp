@@ -1,3 +1,5 @@
+import os from "node:os";
+import path from "node:path";
 import type { AppConfig, FileAccessUserStrategy, IdLike } from "./types.js";
 
 const PUBLIC_BASE_URL = "https://open.fangcloud.com";
@@ -31,6 +33,18 @@ function parsePositiveInt(name: string, defaultValue: number): number {
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) {
     throw new Error(`${name} must be a positive integer.`);
+  }
+  return value;
+}
+
+function parseNonNegativeInt(name: string, defaultValue: number): number {
+  const raw = optionalEnv(name);
+  if (!raw) {
+    return defaultValue;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer.`);
   }
   return value;
 }
@@ -95,18 +109,26 @@ export function loadConfig(): AppConfig {
 
   return {
     apiBaseUrl: normalizeApiBaseUrl(),
+    allowDownloadUrl: parseEnabled("YFY_ALLOW_DOWNLOAD_URL", false),
+    adminUserId,
     oauthBaseUrl: validateUrl("YFY_OAUTH_BASE_URL", trimTrailingSlash(optionalEnv("YFY_OAUTH_BASE_URL") ?? PUBLIC_BASE_URL)),
     clientId: requireEnv("YFY_CLIENT_ID"),
     clientSecret: requireEnv("YFY_CLIENT_SECRET"),
     enterpriseId: parseId("YFY_ENTERPRISE_ID", requireEnv("YFY_ENTERPRISE_ID")),
     defaultUserId: parseId("YFY_DEFAULT_USER_ID", requireEnv("YFY_DEFAULT_USER_ID")),
-    adminUserId,
+    enableAdminTools: parseEnabled("YFY_ENABLE_ADMIN_TOOLS", false),
+    enableMutationTools: parseEnabled("YFY_ENABLE_MUTATION_TOOLS", false),
+    enableRawResponse: parseEnabled("YFY_ENABLE_RAW_RESPONSE", false),
     fileAccessUserStrategy,
-    requestTimeoutMs: parsePositiveInt("YFY_REQUEST_TIMEOUT_MS", 30000),
-    tokenRefreshSkewSeconds: parsePositiveInt("YFY_TOKEN_REFRESH_SKEW_SECONDS", 300),
+    logLevel: optionalEnv("YFY_LOG_LEVEL") ?? "info",
+    maxDownloadBytes: parsePositiveInt("YFY_MAX_DOWNLOAD_BYTES", 268435456),
     maxPageCapacity: parsePositiveInt("YFY_MAX_PAGE_CAPACITY", 500),
-    allowDownloadUrl: parseEnabled("YFY_ALLOW_DOWNLOAD_URL", true),
-    logLevel: optionalEnv("YFY_LOG_LEVEL") ?? "info"
+    requestTimeoutMs: parsePositiveInt("YFY_REQUEST_TIMEOUT_MS", 30000),
+    retryBaseDelayMs: parsePositiveInt("YFY_RETRY_BASE_DELAY_MS", 500),
+    retryMaxAttempts: parsePositiveInt("YFY_RETRY_MAX_ATTEMPTS", 3),
+    tempDir: path.resolve(optionalEnv("YFY_TEMP_DIR") ?? path.join(os.tmpdir(), "yifangyun-mcp")),
+    tempFileTtlSeconds: parseNonNegativeInt("YFY_TEMP_FILE_TTL_SECONDS", 86400),
+    tokenRefreshSkewSeconds: parsePositiveInt("YFY_TOKEN_REFRESH_SKEW_SECONDS", 300),
   };
 }
 
@@ -119,7 +141,15 @@ export function getConfigSummary(config: AppConfig): Record<string, string | num
     admin_user_configured: config.adminUserId !== undefined,
     file_access_user_strategy: config.fileAccessUserStrategy,
     request_timeout_ms: config.requestTimeoutMs,
+    retry_max_attempts: config.retryMaxAttempts,
+    retry_base_delay_ms: config.retryBaseDelayMs,
     max_page_capacity: config.maxPageCapacity,
-    allow_download_url: config.allowDownloadUrl
+    max_download_bytes: config.maxDownloadBytes,
+    temp_dir: config.tempDir,
+    temp_file_ttl_seconds: config.tempFileTtlSeconds,
+    allow_download_url: config.allowDownloadUrl,
+    enable_mutation_tools: config.enableMutationTools,
+    enable_admin_tools: config.enableAdminTools,
+    enable_raw_response: config.enableRawResponse
   };
 }

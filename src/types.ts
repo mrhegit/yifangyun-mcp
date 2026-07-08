@@ -9,20 +9,66 @@ export type TokenSubjectType = "enterprise" | "user";
 
 export type FileAccessUserStrategy = "default" | "admin" | "explicit";
 
+export interface RateLimitMeta {
+  limit?: number;
+  remaining?: number;
+  resetSeconds?: number;
+}
+
+export interface ApiResponseMeta {
+  endpoint: string;
+  fetchedAtIso: string;
+  fetchedAtUnix: number;
+  requestId?: string;
+  sourceApiVersion: string;
+  statusCode: number;
+  rateLimit?: RateLimitMeta;
+}
+
+export interface ApiJsonResponse {
+  data: JsonValue;
+  meta: ApiResponseMeta;
+}
+
+export interface DownloadedFile {
+  contentType?: string;
+  fileName: string;
+  meta: ApiResponseMeta;
+  sha256: string;
+  sizeBytes: number;
+  tempPath: string;
+}
+
+export interface UploadDeliveryResult {
+  deliveryMethod: string;
+  fileName: string;
+  localPath: string;
+  remoteStatusCode: number;
+  sizeBytes: number;
+}
+
 export interface AppConfig {
   apiBaseUrl: string;
+  allowDownloadUrl: boolean;
+  adminUserId?: IdLike;
   oauthBaseUrl: string;
   clientId: string;
   clientSecret: string;
   enterpriseId: IdLike;
   defaultUserId: IdLike;
-  adminUserId?: IdLike;
+  enableAdminTools: boolean;
+  enableMutationTools: boolean;
+  enableRawResponse: boolean;
   fileAccessUserStrategy: FileAccessUserStrategy;
-  requestTimeoutMs: number;
-  tokenRefreshSkewSeconds: number;
-  maxPageCapacity: number;
-  allowDownloadUrl: boolean;
   logLevel: string;
+  maxDownloadBytes: number;
+  maxPageCapacity: number;
+  requestTimeoutMs: number;
+  retryBaseDelayMs: number;
+  retryMaxAttempts: number;
+  tempDir: string;
+  tempFileTtlSeconds: number;
+  tokenRefreshSkewSeconds: number;
 }
 
 export interface TokenResponse {
@@ -39,7 +85,10 @@ export interface TokenRecord {
 }
 
 export interface ToolOutput extends Record<string, unknown> {
+  meta?: JsonObject;
   ok: boolean;
   data?: JsonValue;
   error?: JsonObject;
+  raw?: JsonValue;
+  warnings?: string[];
 }

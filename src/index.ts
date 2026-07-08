@@ -11,7 +11,7 @@ async function main(): Promise<void> {
   const client = new YifangyunClient(config);
   const server = new McpServer({
     name: "yifangyun-mcp-server",
-    version: "0.1.0"
+    version: "0.1.2"
   });
 
   registerTools(server, client, config);
