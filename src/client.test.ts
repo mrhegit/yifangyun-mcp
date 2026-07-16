@@ -48,3 +48,73 @@ test("resolveFileAccessUser follows default, admin, and explicit strategies", ()
   const explicitClient = new YifangyunClient(makeConfig("explicit"));
   assert.throws(() => explicitClient.resolveFileAccessUser(), (error: unknown) => error instanceof YifangyunError);
 });
+
+test("non-idempotent POST requests are not automatically retried", async () => {
+  const originalFetch = globalThis.fetch;
+  let apiCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/oauth/token")) {
+      return new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), { status: 200 });
+    }
+    apiCalls += 1;
+    return new Response(JSON.stringify({ errors: [{ code: "server_error", msg: "failed" }] }), { status: 500 });
+  };
+  try {
+    const client = new YifangyunClient({ ...makeConfig(), retryMaxAttempts: 3 });
+    await assert.rejects(() => client.postAsUser("/v2/folder/create", undefined, { name: "x", parent_id: 1 }), (error: unknown) => error instanceof YifangyunError && error.code === "YFY_PROVIDER_SERVER_ERROR");
+    assert.equal(apiCalls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("safe GET requests retry transient provider failures", async () => {
+  const originalFetch = globalThis.fetch;
+  let apiCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/oauth/token")) {
+      return new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), { status: 200 });
+    }
+    apiCalls += 1;
+    return apiCalls === 1
+      ? new Response(JSON.stringify({ errors: [{ code: "busy", msg: "busy" }] }), { status: 503 })
+      : new Response(JSON.stringify({ id: 1, name: "ok" }), { status: 200 });
+  };
+  try {
+    const client = new YifangyunClient({ ...makeConfig(), retryBaseDelayMs: 1, retryMaxAttempts: 2 });
+    const result = await client.getAsUser("/v2/file/1/info_v2");
+    assert.equal((result.data as { name: string }).name, "ok");
+    assert.equal(apiCalls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("concurrent token requests share one in-flight OAuth exchange", async () => {
+  const originalFetch = globalThis.fetch;
+  let tokenCalls = 0;
+  globalThis.fetch = async () => {
+    tokenCalls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    return new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), { status: 200 });
+  };
+  try {
+    const client = new YifangyunClient(makeConfig());
+    const [left, right] = await Promise.all([client.getUserToken(530), client.getUserToken(530)]);
+    assert.equal(left, "token");
+    assert.equal(right, "token");
+    assert.equal(tokenCalls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transfer URLs resolving to private addresses are rejected by default", async () => {
+  const client = new YifangyunClient(makeConfig());
+  await assert.rejects(
+    () => client.downloadFromUrlToTemp("https://127.0.0.1/file", { fileNameHint: "file.bin" }),
+    (error: unknown) => error instanceof YifangyunError && error.code === "YFY_TRANSFER_URL_PRIVATE_ADDRESS"
+  );
+});

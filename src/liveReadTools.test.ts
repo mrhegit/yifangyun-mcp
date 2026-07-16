@@ -1,14 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { loadConfig } from "./config.js";
 import { YifangyunClient } from "./client.js";
 import { registerTools } from "./tools/registerTools.js";
+import { registerWorkflowTools } from "./tools/registerWorkflowTools.js";
 
 type RegisteredTool = {
-  handler: (args: Record<string, unknown>) => Promise<{ structuredContent?: Record<string, unknown>; isError?: boolean }>;
+  handler: (args: Record<string, unknown>, extra?: Record<string, unknown>) => Promise<{ structuredContent?: Record<string, unknown>; isError?: boolean }>;
 };
 
 class FakeServer {
@@ -17,6 +19,8 @@ class FakeServer {
   registerTool(name: string, _definition: Record<string, unknown>, handler: RegisteredTool["handler"]): void {
     this.tools.set(name, { handler });
   }
+
+  registerResource(): void {}
 }
 
 function loadDotEnv(filePath: string): void {
@@ -58,7 +62,7 @@ function resultData(result: { structuredContent?: Record<string, unknown>; isErr
 }
 
 async function required(server: FakeServer, name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
-  const result = await tool(server, name).handler(args);
+  const result = await tool(server, name).handler(args, { signal: new AbortController().signal, sendNotification: async () => undefined });
   return resultData(result, name);
 }
 
@@ -88,9 +92,12 @@ test("live read-only tools work against configured Yifangyun environment", { ski
   process.env.YFY_ENABLE_RAW_RESPONSE = "disabled";
 
   const config = loadConfig();
+  const scanDir = fs.mkdtempSync(path.join(os.tmpdir(), "yfy-live-scan-"));
+  config.scanDir = scanDir;
   const client = new YifangyunClient(config);
   const server = new FakeServer();
   registerTools(server as unknown as McpServer, client, config);
+  registerWorkflowTools(server as unknown as McpServer, client, config);
 
   await required(server, "yfy_auth_test");
   await required(server, "yfy_get_user_info");
@@ -162,4 +169,31 @@ test("live read-only tools work against configured Yifangyun environment", { ski
     await optional(server, "yfy_admin_get_log_action_types", { is_all: false, action_types: [1] });
     await optional(server, "yfy_admin_list_groups", { page_id: 0 });
   }
+
+  const liveScopeRoot = process.env.YFY_LIVE_SCOPE_ROOT_FOLDER_ID;
+  if (liveScopeRoot) {
+    await required(server, "yfy_validate_authority_root", { root_folder_id: liveScopeRoot });
+    const started = await required(server, "yfy_start_scope_scan", {
+      root_folder_id: liveScopeRoot,
+      queries: ["验收证书"],
+      match_fields: ["name", "path"],
+      max_depth: 5,
+      max_items: 10000,
+      page_capacity: 100,
+      include_files: true,
+      include_folders: true,
+      case_sensitive: false
+    });
+    const advanced = await required(server, "yfy_advance_scope_scan", {
+      scan_id: started.scan_id,
+      expected_revision: started.revision,
+      max_pages: 2,
+      max_wall_ms: 10000
+    });
+    assert.ok(Number(advanced.page_receipt_count ?? 0) >= 1);
+    if (advanced.status === "running" || advanced.status === "paused_retryable") {
+      await required(server, "yfy_cancel_scope_scan", { scan_id: started.scan_id, expected_revision: advanced.revision });
+    }
+  }
+  fs.rmSync(scanDir, { recursive: true, force: true });
 });

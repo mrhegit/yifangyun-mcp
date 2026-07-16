@@ -32,8 +32,10 @@ export interface ApiJsonResponse {
 
 export interface DownloadedFile {
   contentType?: string;
+  detectedContentType?: string;
   fileName: string;
   meta: ApiResponseMeta;
+  sha1: string;
   sha256: string;
   sizeBytes: number;
   tempPath: string;
@@ -69,6 +71,23 @@ export interface AppConfig {
   tempDir: string;
   tempFileTtlSeconds: number;
   tokenRefreshSkewSeconds: number;
+  allowPrivateTransferUrls?: boolean;
+  authorityRootFolderId?: IdLike;
+  downloadIdleTimeoutMs?: number;
+  downloadWallTimeoutMs?: number;
+  httpAllowedHosts?: string[];
+  httpAllowedOrigins?: string[];
+  httpBearerToken?: string;
+  httpHost?: string;
+  httpPort?: number;
+  maxConcurrentProviderRequests?: number;
+  maxConcurrentRequestsPerIdentity?: number;
+  maxRetryDelayMs?: number;
+  maxScanBytes?: number;
+  maxTempBytes?: number;
+  scanDir?: string;
+  scanTtlSeconds?: number;
+  transport?: "stdio" | "http";
 }
 
 export interface TokenResponse {
@@ -87,6 +106,9 @@ export interface TokenRecord {
 export interface ToolOutput extends Record<string, unknown> {
   meta?: JsonObject;
   ok: boolean;
+  outcome?: string;
+  request_succeeded?: boolean;
+  server_version?: string;
   data?: JsonValue;
   error?: JsonObject;
   raw?: JsonValue;

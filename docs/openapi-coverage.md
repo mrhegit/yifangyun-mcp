@@ -1,5 +1,7 @@
 # OpenAPI 覆盖矩阵
 
+> `yfy_start_scope_scan`、`yfy_advance_scope_scan`、`yfy_search_scope_snapshot` 和 `yfy_validate_authority_root` 是跨端点 workflow，不代表新增私有 Provider API。它们只组合本矩阵中已有的官方 folder/file/department 只读端点，并将 checkpoint、receipt 和 artifact 保存在 MCP 服务本地。
+
 本文档用于回答两个问题：
 
 1. 当前 MCP 已经覆盖了哪些亿方云官方 OpenAPI 能力

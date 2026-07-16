@@ -11,6 +11,9 @@
 ```json
 {
   "ok": true,
+  "request_succeeded": true,
+  "outcome": "success",
+  "server_version": "0.4.0",
   "data": {},
   "meta": {
     "endpoint": "/api/v2/...",
@@ -60,6 +63,20 @@
 
 ## 默认只读工具
 
+### Durable Discovery Workflow
+
+| Tool | 说明 |
+|---|---|
+| `yfy_start_scope_scan` | 初始化或复用 identity-scoped 持久化扫描 |
+| `yfy_advance_scope_scan` | 按页数和 wall time 预算推进，使用 revision 做 CAS |
+| `yfy_get_scope_scan` | 查询状态、frontier、完整性和 observation window |
+| `yfy_cancel_scope_scan` | 显式取消 durable scan |
+| `yfy_search_scope_snapshot` | 对已落盘 page artifacts 做多关键词搜索 |
+| `yfy_list_scope_scan_matches` | 使用 scan policy 中保存的 query set 列出命中 |
+| `yfy_list_scope_snapshot_items` | 通过 offset/limit 分页读取 snapshot items |
+
+`pagination_complete=true` 只表示该访问身份在 observation window 内完成了策略范围内的分页观察。`safe_to_claim_absence=true` 仍限定为 `within_observed_accessible_scope`，不代表 Provider 提供强一致快照隔离。
+
 ### 基础与组织
 
 | Tool | 说明 |
@@ -95,6 +112,8 @@
 | `yfy_get_folder_ancestors` | 获取文件夹祖先链 |
 | `yfy_get_file_ancestors` | 获取文件祖先链 |
 | `yfy_assert_file_in_scope` | 断言文件是否属于某 root folder |
+| `yfy_get_file_scope_membership` | 查询文件 scope membership，允许返回 `in_scope=false` |
+| `yfy_validate_authority_root` | 组合 folder、department chain 和可达性校验 |
 | `yfy_build_scope_snapshot` | 构建 flat snapshot |
 | `yfy_list_folder_tree` | 扁平化递归目录树 |
 | `yfy_batch_get_file_info` | 批量获取文件详情 |

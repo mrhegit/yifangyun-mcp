@@ -33,6 +33,18 @@ npm start
 
 stdio MCP 服务启动后会等待 MCP 客户端通过标准输入输出通信。直接在终端运行时不会出现交互式菜单，这是正常现象。
 
+## Streamable HTTP
+
+```bash
+YFY_TRANSPORT=http
+YFY_HTTP_HOST=127.0.0.1
+YFY_HTTP_PORT=3000
+YFY_HTTP_BEARER_TOKEN=replace-with-a-long-random-secret
+npm start
+```
+
+端点为 `http://127.0.0.1:3000/mcp`。另提供受同一鉴权保护的 `/health` 和 `/metrics`。非 localhost 监听必须同时配置 Bearer token、`YFY_HTTP_ALLOWED_HOSTS` 和 `YFY_HTTP_ALLOWED_ORIGINS`，否则服务拒绝启动。
+
 ## MCP 客户端接入
 
 配置示例：
@@ -232,6 +244,15 @@ yfy_get_file_version_info
 yfy_get_folder_ancestors
 yfy_get_file_ancestors
 yfy_assert_file_in_scope
+yfy_get_file_scope_membership
+yfy_validate_authority_root
+yfy_start_scope_scan
+yfy_advance_scope_scan
+yfy_get_scope_scan
+yfy_cancel_scope_scan
+yfy_search_scope_snapshot
+yfy_list_scope_scan_matches
+yfy_list_scope_snapshot_items
 yfy_build_scope_snapshot
 yfy_list_folder_tree
 yfy_batch_get_file_info

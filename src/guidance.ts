@@ -9,7 +9,8 @@ export const SERVER_INSTRUCTIONS = [
   "Prefer read-only discovery, metadata, scope proof, then download/hash workflows.",
   "Pass user_id only when the caller specifies an access identity; otherwise use the configured default strategy.",
   "Mutation/admin tools are gated by environment variables and may be absent.",
-  "For new automation prefer atomic tools and explicit scope-bounded workflows, and prefer temp_path+sha256 over exposing download_url."
+  "For new automation prefer atomic tools and explicit scope-bounded workflows, and prefer temp_path+sha256 over exposing download_url.",
+  "Use durable scope scans for large folders; official indexed search is hint-only and cannot prove absence."
 ].join(" ");
 
 function asIdText(value: string | number | undefined): string {
@@ -36,7 +37,8 @@ export function registerGuidance(server: McpServer, config: AppConfig): void {
       "",
       "Use yfy_resolve_path when you know the exact relative path under a personal, department, or folder root.",
       "Use yfy_search_items for official indexed search across accessible spaces, and pass search_in_folder when you want server-side search within a known folder scope.",
-      "Use yfy_search_items_recursive when you already know root_folder_id and need bounded descendant name search via children pagination instead of relying on server-side search semantics.",
+      "Use yfy_start_scope_scan, yfy_advance_scope_scan and yfy_search_scope_snapshot for large or resumable descendant searches.",
+      "Treat yfy_search_items and yfy_search_items_advanced as hint-only official index searches.",
       "Download URL exposure is disabled by default; use temp download tools for evidence workflows.",
       "Mutation tools are registered only when YFY_ENABLE_MUTATION_TOOLS is enabled.",
       "Admin tools are registered only when YFY_ENABLE_ADMIN_TOOLS is enabled.",
@@ -58,15 +60,16 @@ export function registerGuidance(server: McpServer, config: AppConfig): void {
       "# Workflows",
       "",
       "## Find and lock original",
-      "1. Exact path -> yfy_resolve_path; known folder scope + official indexed search -> yfy_search_items(search_in_folder=...); bounded descendant name search -> yfy_search_items_recursive; otherwise -> yfy_search_items",
+      "1. Exact path -> yfy_resolve_path; candidate discovery -> yfy_search_items_advanced; exhaustive bounded scope -> yfy_start_scope_scan + repeated yfy_advance_scope_scan + yfy_search_scope_snapshot",
       "2. yfy_get_file_info_full",
       "3. yfy_assert_file_in_scope",
       "4. yfy_lock_current_original",
       "",
       "## Snapshot a folder",
       "1. yfy_get_folder_info",
-      "2. yfy_build_scope_snapshot",
-      "3. yfy_batch_get_file_info when richer metadata is needed",
+      "2. yfy_start_scope_scan",
+      "3. Repeat yfy_advance_scope_scan with expected_revision until complete or partial",
+      "4. Read yfy_get_scope_scan or the manifest resource; use yfy_batch_get_file_info only for selected candidates",
       "",
       "## Safe upload/new version",
       "1. Confirm mutation tools are registered",
@@ -114,7 +117,7 @@ export function registerGuidance(server: McpServer, config: AppConfig): void {
             `Find the Yifangyun file matching: ${file_hint}.`,
             `Use root_folder_id=${root_folder_id} to prove scope before downloading.`,
             `Use user_id=${asIdText(user_id)} and external_enterprise_id=${asIdText(external_enterprise_id)} when applicable.`,
-            "Recommended tools: if file_hint is an exact relative path use yfy_resolve_path; if you want official indexed search inside the authorized folder scope use yfy_search_items with search_in_folder=root_folder_id; if you need bounded descendant name search independent of server-side search semantics use yfy_search_items_recursive; then yfy_get_file_info_full, yfy_assert_file_in_scope, yfy_lock_current_original.",
+            "Recommended tools: use yfy_resolve_path for an exact relative path; use yfy_search_items_advanced only for candidate discovery; use durable scope scan tools when absence or pagination completeness matters; then yfy_get_file_info_full, yfy_assert_file_in_scope, yfy_lock_current_original.",
             "Return the file id, path/ancestor proof, sha256, size_bytes, and temp_path."
           ].join("\n")
         }
@@ -130,7 +133,7 @@ export function registerGuidance(server: McpServer, config: AppConfig): void {
       argsSchema: {
         root_folder_id: IdArg.describe("Folder id to snapshot."),
         max_depth: z.number().int().min(0).max(20).default(3).describe("Maximum recursion depth."),
-        max_items: z.number().int().min(1).max(20000).default(1000).describe("Maximum returned descendants."),
+        max_items: z.number().int().min(1).max(1000000).default(50000).describe("Maximum descendants observed by the durable scan."),
         user_id: IdArg.optional().describe("Optional file-access user id.")
       }
     },
@@ -142,8 +145,8 @@ export function registerGuidance(server: McpServer, config: AppConfig): void {
           text: [
             `Build a bounded Yifangyun folder snapshot for root_folder_id=${root_folder_id}.`,
             `Use max_depth=${max_depth}, max_items=${max_items}, user_id=${asIdText(user_id)}.`,
-            "Recommended tools: yfy_get_folder_info, yfy_build_scope_snapshot, then yfy_batch_get_file_info only for files that need richer metadata.",
-            "Report whether the result is truncated and include next recommended pagination/scope step."
+            "Recommended tools: yfy_validate_authority_root, yfy_start_scope_scan, repeated yfy_advance_scope_scan, then yfy_get_scope_scan.",
+            "Report pagination_complete, safe_to_claim_absence, incomplete_reasons and the artifact URI."
           ].join("\n")
         }
       }]

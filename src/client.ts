@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
+import dns from "node:dns";
 import fs from "node:fs";
 import { promises as fsp } from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -18,6 +20,7 @@ import type {
   TokenSubjectType,
   UploadDeliveryResult
 } from "./types.js";
+import { metrics } from "./observability.js";
 
 interface ApiTokenRequest {
   subjectType: TokenSubjectType;
@@ -29,40 +32,75 @@ interface RequestJsonOptions {
   method: "GET" | "POST";
   params?: Record<string, string | number | boolean | undefined>;
   retry?: boolean;
+  signal?: AbortSignal;
   token: string;
 }
 
 interface RawRequestResult {
+  abort: (reason?: unknown) => void;
+  cleanup: () => void;
   meta: ApiResponseMeta;
   response: Response;
+  signal: AbortSignal;
 }
 
 interface DownloadOptions {
   fileNameHint: string;
+  namespace?: string;
   retry?: boolean;
 }
 
 export class YifangyunError extends Error {
+  readonly code: string;
   readonly details?: JsonObject;
+  readonly phase?: string;
   readonly retryAfterMs?: number;
   readonly retryable: boolean;
+  readonly scanId?: string;
   readonly statusCode?: number;
+  readonly suggestedAction?: string;
 
   constructor(
     message: string,
     options: {
       details?: JsonObject;
+      code?: string;
+      phase?: string;
       retryAfterMs?: number;
       retryable?: boolean;
+      scanId?: string;
       statusCode?: number;
+      suggestedAction?: string;
     } = {}
   ) {
     super(message);
     this.name = "YifangyunError";
+    this.code = options.code ?? "YFY_UNEXPECTED_ERROR";
     this.details = options.details;
+    this.phase = options.phase;
     this.retryAfterMs = options.retryAfterMs;
     this.retryable = options.retryable ?? false;
+    this.scanId = options.scanId;
     this.statusCode = options.statusCode;
+    this.suggestedAction = options.suggestedAction;
+  }
+}
+
+class Semaphore {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(private readonly limit: number) {}
+
+  async acquire(): Promise<() => void> {
+    if (this.active >= this.limit) {
+      await new Promise<void>((resolve) => this.waiters.push(resolve));
+    }
+    this.active += 1;
+    return () => {
+      this.active -= 1;
+      this.waiters.shift()?.();
+    };
   }
 }
 
@@ -162,13 +200,58 @@ function sanitizeFileName(value: string): string {
   return value.replace(/[\\/:*?"<>|]+/g, "_").replace(/\s+/g, " ").trim() || "download.bin";
 }
 
+function isPrivateAddress(value: string): boolean {
+  const version = net.isIP(value);
+  if (version === 4) {
+    const parts = value.split(".").map(Number);
+    return parts[0] === 10
+      || parts[0] === 127
+      || (parts[0] === 169 && parts[1] === 254)
+      || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)
+      || (parts[0] === 192 && parts[1] === 168)
+      || parts[0] === 0;
+  }
+  if (version === 6) {
+    const normalized = value.toLowerCase();
+    return normalized === "::1"
+      || normalized === "::"
+      || normalized.startsWith("fc")
+      || normalized.startsWith("fd")
+      || normalized.startsWith("fe8")
+      || normalized.startsWith("fe9")
+      || normalized.startsWith("fea")
+      || normalized.startsWith("feb");
+  }
+  return false;
+}
+
+function detectContentType(buffer: Buffer): string | undefined {
+  if (buffer.subarray(0, 5).toString("ascii") === "%PDF-") {
+    return "application/pdf";
+  }
+  if (buffer.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) {
+    return "application/zip";
+  }
+  if (buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return "image/png";
+  }
+  if (buffer.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) {
+    return "image/jpeg";
+  }
+  return undefined;
+}
+
 function parseContentDispositionFileName(value: string | null): string | undefined {
   if (!value) {
     return undefined;
   }
   const utf8Match = value.match(/filename\*=UTF-8''([^;]+)/i);
   if (utf8Match) {
-    return decodeURIComponent(utf8Match[1]);
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      return utf8Match[1];
+    }
   }
   const quotedMatch = value.match(/filename="([^"]+)"/i);
   if (quotedMatch) {
@@ -189,9 +272,17 @@ export function redactSensitiveText(text: string): string {
 }
 
 export class YifangyunClient {
+  private lastTempPruneAt = 0;
+  private readonly bucketSemaphores = new Map<string, Semaphore>();
+  private readonly requestSemaphore: Semaphore;
   private readonly tokenCache = new Map<string, TokenRecord>();
+  private readonly tokenInflight = new Map<string, Promise<TokenRecord>>();
 
-  constructor(private readonly config: AppConfig) {}
+  constructor(private readonly config: AppConfig) {
+    this.requestSemaphore = new Semaphore(Math.max(1, config.maxConcurrentProviderRequests ?? 4));
+    const cleanupTimer = setInterval(() => void this.pruneExpiredTempFiles(), 60000);
+    cleanupTimer.unref();
+  }
 
   async getEnterpriseToken(): Promise<string> {
     return this.getToken({ subjectType: "enterprise", subjectId: this.config.enterpriseId });
@@ -219,6 +310,15 @@ export class YifangyunClient {
     return this.config.defaultUserId;
   }
 
+  resolveAccessIdentityRef(userId?: IdLike, externalEnterpriseId?: IdLike): string {
+    const resolvedUserId = this.resolveFileAccessUser(userId);
+    return crypto
+      .createHmac("sha256", this.config.clientSecret)
+      .update([String(this.config.enterpriseId), String(resolvedUserId), String(externalEnterpriseId ?? ""), this.config.apiBaseUrl].join(":"))
+      .digest("hex")
+      .slice(0, 24);
+  }
+
   async getEnterprise(pathname: string, params: Record<string, string | number | boolean | undefined> = {}): Promise<ApiJsonResponse> {
     return this.apiJsonRequest(pathname, {
       method: "GET",
@@ -237,7 +337,7 @@ export class YifangyunClient {
       body,
       method: "POST",
       params,
-      retry: true,
+      retry: false,
       token: await this.getEnterpriseToken()
     });
   }
@@ -245,13 +345,15 @@ export class YifangyunClient {
   async getAsUser(
     pathname: string,
     userId?: IdLike,
-    params: Record<string, string | number | boolean | undefined> = {}
+    params: Record<string, string | number | boolean | undefined> = {},
+    signal?: AbortSignal
   ): Promise<ApiJsonResponse> {
     const resolvedUserId = this.resolveFileAccessUser(userId);
     return this.apiJsonRequest(pathname, {
       method: "GET",
       params,
       retry: true,
+      signal,
       token: await this.getUserToken(resolvedUserId)
     });
   }
@@ -267,31 +369,58 @@ export class YifangyunClient {
       body,
       method: "POST",
       params,
-      retry: true,
+      retry: false,
       token: await this.getUserToken(resolvedUserId)
     });
   }
 
   async downloadFromUrlToTemp(url: string, options: DownloadOptions): Promise<DownloadedFile> {
-    await this.ensureTempDir();
+    const downloadStartedAt = Date.now();
+    await this.validateTransferUrl(url);
     await this.pruneExpiredTempFiles();
-    const result = await this.rawRequest(url, { method: "GET" }, { retry: options.retry ?? true });
+    const targetDir = await this.ensureTempDir(options.namespace);
+    const result = await this.rawRequest(url, { method: "GET" }, {
+      retry: options.retry ?? true,
+      timeoutMs: this.config.downloadWallTimeoutMs ?? 300000
+    });
     const contentLength = Number(result.response.headers.get("content-length") ?? "0");
     if (contentLength > 0 && contentLength > this.config.maxDownloadBytes) {
+      await result.response.body?.cancel().catch(() => undefined);
+      result.cleanup();
       throw new YifangyunError("Download exceeds YFY_MAX_DOWNLOAD_BYTES.", {
+        code: "YFY_DOWNLOAD_TOO_LARGE",
         details: { content_length: contentLength, max_download_bytes: this.config.maxDownloadBytes }
       });
+    }
+    try {
+      await this.ensureTempCapacity(contentLength > 0 ? contentLength : 0);
+    } catch (error) {
+      await result.response.body?.cancel().catch(() => undefined);
+      result.cleanup();
+      throw error;
     }
 
     const suggestedName =
       parseContentDispositionFileName(result.response.headers.get("content-disposition")) ?? sanitizeFileName(options.fileNameHint);
     const targetName = `${Date.now()}-${crypto.randomBytes(6).toString("hex")}-${sanitizeFileName(suggestedName)}`;
-    const tempPath = path.join(this.config.tempDir, targetName);
+    const tempPath = path.join(targetDir, targetName);
+    const sha1 = crypto.createHash("sha1");
     const hash = crypto.createHash("sha256");
+    const sniffChunks: Buffer[] = [];
+    let sniffedBytes = 0;
     let sizeBytes = 0;
-    const writable = fs.createWriteStream(tempPath);
+    const writable = fs.createWriteStream(tempPath, { mode: 0o600 });
+    const idleTimeoutMs = this.config.downloadIdleTimeoutMs ?? 30000;
+    let idleTimeout: NodeJS.Timeout | undefined;
+    const resetIdleTimeout = () => {
+      if (idleTimeout) {
+        clearTimeout(idleTimeout);
+      }
+      idleTimeout = setTimeout(() => result.abort(new Error("Download idle timeout.")), idleTimeoutMs);
+    };
     const transform = new Transform({
       transform: (chunk, _encoding, callback) => {
+        resetIdleTimeout();
         sizeBytes += chunk.length;
         if (sizeBytes > this.config.maxDownloadBytes) {
           callback(new YifangyunError("Download exceeds YFY_MAX_DOWNLOAD_BYTES while streaming.", {
@@ -300,6 +429,13 @@ export class YifangyunClient {
           return;
         }
         hash.update(chunk);
+        sha1.update(chunk);
+        if (sniffedBytes < 512) {
+          const buffer = Buffer.from(chunk);
+          const selected = buffer.subarray(0, 512 - sniffedBytes);
+          sniffChunks.push(selected);
+          sniffedBytes += selected.length;
+        }
         callback(null, chunk);
       }
     });
@@ -308,20 +444,34 @@ export class YifangyunClient {
       if (!result.response.body) {
         throw new YifangyunError("Download response did not include a response body.");
       }
-      await pipeline(Readable.fromWeb(result.response.body as globalThis.ReadableStream<Uint8Array>), transform, writable);
+      resetIdleTimeout();
+      await pipeline(Readable.fromWeb(result.response.body as globalThis.ReadableStream<Uint8Array>), transform, writable, { signal: result.signal });
     } catch (error) {
       await fsp.rm(tempPath, { force: true }).catch(() => undefined);
       if (error instanceof YifangyunError) {
         throw error;
       }
       const message = error instanceof Error ? error.message : String(error);
-      throw new YifangyunError(redactSensitiveText(`Failed to download file content: ${message}`), { retryable: true });
+      throw new YifangyunError(redactSensitiveText(`Failed to download file content: ${message}`), {
+        code: "YFY_DOWNLOAD_STREAM_FAILED",
+        phase: "download_stream",
+        retryable: true
+      });
+    } finally {
+      if (idleTimeout) {
+        clearTimeout(idleTimeout);
+      }
+      result.cleanup();
     }
 
+    metrics.increment("download_bytes_total", {}, sizeBytes);
+    metrics.observe("download_hash_latency_ms", Date.now() - downloadStartedAt);
     return {
       contentType: result.response.headers.get("content-type") ?? undefined,
+      detectedContentType: detectContentType(Buffer.concat(sniffChunks)),
       fileName: suggestedName,
       meta: result.meta,
+      sha1: sha1.digest("hex"),
       sha256: hash.digest("hex"),
       sizeBytes,
       tempPath
@@ -329,6 +479,7 @@ export class YifangyunClient {
   }
 
   async uploadLocalFileToPresignedUrl(presignUrl: string, localPath: string, fileName: string): Promise<UploadDeliveryResult> {
+    await this.validateTransferUrl(presignUrl);
     const stat = await fsp.stat(localPath);
     if (!stat.isFile()) {
       throw new YifangyunError("local_path must point to a file.", { details: { local_path: localPath } });
@@ -340,7 +491,7 @@ export class YifangyunClient {
       });
     }
 
-    let response = await fetch(presignUrl, {
+    let response = await this.fetchTransfer(presignUrl, {
       method: "PUT",
       headers: {
         "Content-Length": String(stat.size),
@@ -352,10 +503,19 @@ export class YifangyunClient {
 
     let deliveryMethod = "PUT_BINARY";
     if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      if (stat.size > 16 * 1024 * 1024) {
+        throw new YifangyunError("Binary upload failed and multipart fallback is disabled for files larger than 16 MiB.", {
+          code: "YFY_UPLOAD_FALLBACK_TOO_LARGE",
+          details: { file_size: stat.size, upload_method_attempted: "PUT_BINARY" },
+          phase: "upload_delivery",
+          suggestedAction: "Check the presigned upload contract instead of buffering the file in memory."
+        });
+      }
       const fileBuffer = await fsp.readFile(localPath);
       const form = new FormData();
       form.append("file", new Blob([fileBuffer]), fileName);
-      response = await fetch(presignUrl, {
+      response = await this.fetchTransfer(presignUrl, {
         method: "POST",
         body: form
       });
@@ -374,6 +534,7 @@ export class YifangyunClient {
         statusCode: response.status
       });
     }
+    await response.body?.cancel().catch(() => undefined);
 
     return {
       deliveryMethod,
@@ -392,9 +553,18 @@ export class YifangyunClient {
       return cached.accessToken;
     }
 
-    const token = await this.requestToken(request);
-    this.tokenCache.set(cacheKey, token);
-    return token.accessToken;
+    let inflight = this.tokenInflight.get(cacheKey);
+    if (!inflight) {
+      inflight = this.requestToken(request);
+      this.tokenInflight.set(cacheKey, inflight);
+    }
+    try {
+      const token = await inflight;
+      this.tokenCache.set(cacheKey, token);
+      return token.accessToken;
+    } finally {
+      this.tokenInflight.delete(cacheKey);
+    }
   }
 
   private async requestToken(request: ApiTokenRequest): Promise<TokenRecord> {
@@ -450,65 +620,112 @@ export class YifangyunClient {
         },
         ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {})
       },
-      options.retry ?? true
+      options.retry ?? true,
+      options.signal
     );
   }
 
-  private async jsonRequest(url: string, init: RequestInit, retry: boolean): Promise<ApiJsonResponse> {
-    const result = await this.rawRequest(url, init, { retry });
-    const text = await result.response.text();
-    let parsed: unknown;
+  private async jsonRequest(url: string, init: RequestInit, retry: boolean, signal?: AbortSignal): Promise<ApiJsonResponse> {
     try {
-      parsed = parseJson(text);
+      const result = await this.rawRequest(url, init, { retry, signal, timeoutMs: this.config.requestTimeoutMs });
+      try {
+        const text = await result.response.text();
+        let parsed: unknown;
+        try {
+          parsed = parseJson(text);
+        } catch (error) {
+          throw this.invalidJsonError(result.response, text, url, error);
+        }
+
+        const data = asJsonValue(parsed);
+        if (!result.response.ok) {
+          throw this.httpError(result.response, data, url);
+        }
+
+        return {
+          data,
+          meta: this.buildMeta(result.response, url, data)
+        };
+      } finally {
+        result.cleanup();
+      }
     } catch (error) {
-      throw this.invalidJsonError(result.response, text, url, error);
+      throw error;
     }
-
-    const data = asJsonValue(parsed);
-    if (!result.response.ok) {
-      throw this.httpError(result.response, data, url);
-    }
-
-    return {
-      data,
-      meta: this.buildMeta(result.response, url, data)
-    };
   }
 
-  private async rawRequest(url: string, init: RequestInit, options: { retry: boolean }): Promise<RawRequestResult> {
+  private async rawRequest(url: string, init: RequestInit, options: { retry: boolean; signal?: AbortSignal; timeoutMs?: number }): Promise<RawRequestResult> {
     let lastError: unknown;
     const attempts = options.retry ? Math.max(1, this.config.retryMaxAttempts) : 1;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const attemptStartedAt = Date.now();
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
+      const cancelFromCaller = () => controller.abort(options.signal?.reason);
+      options.signal?.addEventListener("abort", cancelFromCaller, { once: true });
+      if (options.signal?.aborted) {
+        cancelFromCaller();
+      }
+      const timeout = setTimeout(() => controller.abort(new Error("Request wall timeout.")), options.timeoutMs ?? this.config.requestTimeoutMs);
+      const release = await this.requestSemaphore.acquire();
+      const bucketKey = this.requestBucket(url, init);
+      let bucket = this.bucketSemaphores.get(bucketKey);
+      if (!bucket) {
+        bucket = new Semaphore(Math.max(1, this.config.maxConcurrentRequestsPerIdentity ?? 2));
+        this.bucketSemaphores.set(bucketKey, bucket);
+      }
+      const releaseBucket = await bucket.acquire();
+      let returned = false;
+      const cleanup = () => {
+        clearTimeout(timeout);
+        options.signal?.removeEventListener("abort", cancelFromCaller);
+        if (!returned) {
+          returned = true;
+          releaseBucket();
+          release();
+        }
+      };
       try {
         const response = await fetch(url, { ...init, signal: controller.signal });
+        metrics.observe("provider_request_latency_ms", Date.now() - attemptStartedAt, { endpoint: new URL(url).pathname, status: String(response.status) });
         if (!response.ok && (response.status === 429 || response.status >= 500) && attempt + 1 < attempts) {
+          metrics.increment("provider_retry_total", { reason: response.status === 429 ? "rate_limit" : "server_error" });
           const delayMs = this.calculateRetryDelay(response.headers, attempt);
+          await response.body?.cancel().catch(() => undefined);
+          cleanup();
           await sleep(delayMs);
           continue;
         }
         return {
+          abort: (reason?: unknown) => controller.abort(reason),
+          cleanup,
           meta: this.buildMeta(response, url),
-          response
+          response,
+          signal: controller.signal
         };
       } catch (error) {
+        metrics.observe("provider_request_latency_ms", Date.now() - attemptStartedAt, { endpoint: new URL(url).pathname, status: "network_error" });
+        cleanup();
         lastError = error;
-        if (!(error instanceof Error && error.name === "AbortError") && attempt + 1 < attempts) {
+        const aborted = controller.signal.aborted;
+        if (!aborted && attempt + 1 < attempts) {
+          metrics.increment("provider_retry_total", { reason: "network_error" });
           await sleep(this.config.retryBaseDelayMs * Math.pow(2, attempt));
           continue;
         }
-        if (error instanceof Error && error.name === "AbortError") {
-          throw new YifangyunError("Yifangyun request timed out.", { retryable: true });
+        if (aborted) {
+          const cancelled = options.signal?.aborted === true;
+          throw new YifangyunError(cancelled ? "Yifangyun request was cancelled." : "Yifangyun request timed out.", {
+            code: cancelled ? "YFY_REQUEST_CANCELLED" : "YFY_PROVIDER_TIMEOUT",
+            phase: "provider_request",
+            retryable: !cancelled
+          });
         }
         break;
-      } finally {
-        clearTimeout(timeout);
       }
     }
 
     const message = lastError instanceof Error ? lastError.message : String(lastError);
-    throw new YifangyunError(redactSensitiveText(`Yifangyun request failed: ${message}`), { retryable: true });
+    throw new YifangyunError(redactSensitiveText(`Yifangyun request failed: ${message}`), { code: "YFY_PROVIDER_NETWORK_ERROR", phase: "provider_request", retryable: true });
   }
 
   private buildMeta(response: Response, url: string, data?: JsonValue): ApiResponseMeta {
@@ -533,13 +750,24 @@ export class YifangyunClient {
   private calculateRetryDelay(headers: Headers, attempt: number): number {
     const retryAfter = headers.get("retry-after");
     if (retryAfter && Number.isFinite(Number(retryAfter))) {
-      return Math.max(1000, Number(retryAfter) * 1000);
+      return Math.min(this.config.maxRetryDelayMs ?? 30000, Math.max(1000, Number(retryAfter) * 1000));
+    }
+    if (retryAfter) {
+      const retryAt = Date.parse(retryAfter);
+      if (Number.isFinite(retryAt)) {
+        return Math.min(this.config.maxRetryDelayMs ?? 30000, Math.max(1000, retryAt - Date.now()));
+      }
     }
     const rateLimit = parseRateLimit(headers);
     if (rateLimit?.resetSeconds !== undefined) {
-      return Math.max(1000, rateLimit.resetSeconds * 1000);
+      const resetMs = rateLimit.resetSeconds > Math.floor(Date.now() / 1000)
+        ? rateLimit.resetSeconds * 1000 - Date.now()
+        : rateLimit.resetSeconds * 1000;
+      return Math.min(this.config.maxRetryDelayMs ?? 30000, Math.max(1000, resetMs));
     }
-    return this.config.retryBaseDelayMs * Math.pow(2, attempt);
+    const base = this.config.retryBaseDelayMs * Math.pow(2, attempt);
+    const jittered = base * (0.75 + Math.random() * 0.5);
+    return Math.min(this.config.maxRetryDelayMs ?? 30000, Math.round(jittered));
   }
 
   private httpError(response: Response, responseBody: JsonValue, url: string): YifangyunError {
@@ -583,8 +811,15 @@ export class YifangyunClient {
       message = "Resource not found. Check the department, folder, file, group, or user id.";
     }
 
+    const code = response.status === 401 ? "YFY_AUTHENTICATION_FAILED"
+      : response.status === 403 ? "YFY_PERMISSION_DENIED"
+        : response.status === 404 ? "YFY_RESOURCE_NOT_FOUND"
+          : response.status === 429 ? "YFY_RATE_LIMITED"
+            : response.status >= 500 ? "YFY_PROVIDER_SERVER_ERROR" : "YFY_PROVIDER_HTTP_ERROR";
     return new YifangyunError(redactSensitiveText(message), {
+      code,
       details,
+      phase: "provider_request",
       retryAfterMs: this.calculateRetryDelay(response.headers, 0),
       retryable,
       statusCode: response.status
@@ -595,6 +830,7 @@ export class YifangyunClient {
     const endpoint = new URL(url).pathname;
     const reason = error instanceof Error ? error.message : String(error);
     return new YifangyunError("Yifangyun response was not valid JSON. Check base URL, reverse proxy, and credentials.", {
+      code: "YFY_PROVIDER_INVALID_JSON",
       details: {
         content_type: response.headers.get("content-type") ?? "",
         endpoint,
@@ -602,32 +838,120 @@ export class YifangyunClient {
         response_preview: summarizeText(text),
         status_code: response.status
       },
+      phase: "provider_response_parse",
       retryable: response.status === 429 || response.status >= 500,
       statusCode: response.status
     });
   }
 
-  private async ensureTempDir(): Promise<void> {
-    await fsp.mkdir(this.config.tempDir, { recursive: true });
+  private async ensureTempDir(namespace?: string): Promise<string> {
+    await fsp.mkdir(this.config.tempDir, { recursive: true, mode: 0o700 });
+    await fsp.chmod(this.config.tempDir, 0o700).catch(() => undefined);
+    const safeNamespace = (namespace ?? "shared").replace(/[^a-zA-Z0-9_-]/g, "_");
+    const targetDir = path.join(this.config.tempDir, "artifacts", safeNamespace);
+    await fsp.mkdir(targetDir, { recursive: true, mode: 0o700 });
+    await fsp.chmod(targetDir, 0o700).catch(() => undefined);
+    return targetDir;
+  }
+
+  private async ensureTempCapacity(incomingBytes: number): Promise<void> {
+    const maxTempBytes = this.config.maxTempBytes ?? 1073741824;
+    const usedBytes = await this.directoryFileBytes(this.config.tempDir);
+    if (usedBytes + incomingBytes > maxTempBytes) {
+      throw new YifangyunError("Local temporary storage quota would be exceeded.", {
+        code: "YFY_LOCAL_STORAGE_INSUFFICIENT",
+        details: { incoming_bytes: incomingBytes, max_temp_bytes: maxTempBytes, used_bytes: usedBytes },
+        phase: "temp_storage"
+      });
+    }
+  }
+
+  private async validateTransferUrl(value: string): Promise<void> {
+    let parsed: URL;
+    try {
+      parsed = new URL(value);
+    } catch {
+      throw new YifangyunError("Provider transfer URL is invalid.", { code: "YFY_TRANSFER_URL_INVALID", phase: "transfer_url_validation" });
+    }
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+      throw new YifangyunError("Provider transfer URL must use HTTPS and must not contain userinfo.", {
+        code: "YFY_TRANSFER_URL_REJECTED",
+        phase: "transfer_url_validation"
+      });
+    }
+    if (this.config.allowPrivateTransferUrls) {
+      return;
+    }
+    const addresses = await dns.promises.lookup(parsed.hostname, { all: true }).catch(() => []);
+    if (parsed.hostname === "localhost" || addresses.some((entry) => isPrivateAddress(entry.address))) {
+      throw new YifangyunError("Provider transfer URL resolves to a private network address.", {
+        code: "YFY_TRANSFER_URL_PRIVATE_ADDRESS",
+        phase: "transfer_url_validation",
+        suggestedAction: "Set YFY_ALLOW_PRIVATE_TRANSFER_URLS=enabled only for a trusted private deployment."
+      });
+    }
   }
 
   private async pruneExpiredTempFiles(): Promise<void> {
+    if (Date.now() - this.lastTempPruneAt < 60000) {
+      return;
+    }
+    this.lastTempPruneAt = Date.now();
     if (this.config.tempFileTtlSeconds <= 0) {
       return;
     }
     const cutoffMs = Date.now() - this.config.tempFileTtlSeconds * 1000;
-    const entries = await fsp.readdir(this.config.tempDir, { withFileTypes: true }).catch(() => []);
-    await Promise.all(
-      entries.map(async (entry) => {
-        if (!entry.isFile()) {
-          return;
+    await this.pruneDirectory(this.config.tempDir, cutoffMs);
+  }
+
+  private async directoryFileBytes(directory: string): Promise<number> {
+    const entries = await fsp.readdir(directory, { withFileTypes: true }).catch(() => []);
+    let total = 0;
+    for (const entry of entries) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        total += await this.directoryFileBytes(entryPath);
+      } else if (entry.isFile()) {
+        total += (await fsp.stat(entryPath).catch(() => undefined))?.size ?? 0;
+      }
+    }
+    return total;
+  }
+
+  private async pruneDirectory(directory: string, cutoffMs: number): Promise<void> {
+    const entries = await fsp.readdir(directory, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await this.pruneDirectory(entryPath, cutoffMs);
+        const remaining = await fsp.readdir(entryPath).catch(() => []);
+        if (remaining.length === 0) {
+          await fsp.rmdir(entryPath).catch(() => undefined);
         }
-        const entryPath = path.join(this.config.tempDir, entry.name);
+      } else if (entry.isFile()) {
         const stat = await fsp.stat(entryPath).catch(() => undefined);
         if (stat && stat.mtimeMs < cutoffMs) {
           await fsp.rm(entryPath, { force: true }).catch(() => undefined);
         }
-      })
-    );
+      }
+    }
+  }
+
+  private async fetchTransfer(url: string, init: RequestInit): Promise<Response> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(new Error("Transfer wall timeout.")), this.config.downloadWallTimeoutMs ?? 300000);
+    try {
+      return await fetch(url, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private requestBucket(url: string, init: RequestInit): string {
+    const headers = new Headers(init.headers);
+    const authorization = headers.get("authorization") ?? "anonymous";
+    const identity = crypto.createHash("sha256").update(authorization).digest("hex").slice(0, 16);
+    const pathname = new URL(url).pathname.split("/").slice(0, 5).join("/");
+    return `${identity}:${pathname}`;
   }
 }

@@ -1,0 +1,42 @@
+<evaluation>
+  <qa_pair>
+    <question>校验根目录 501000715605，并沿部门空间向上确认“投标”的直属父部门。只回答父部门名称。</question>
+    <answer>经营管理部</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>读取目录 501000715605 的 metadata，再核对其部门空间。只回答部门空间 ID。</question>
+    <answer>480</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>读取目录 501000715605，并确认它在部门空间内是否直接位于空间根。只回答 parent_folder_id。</question>
+    <answer>0</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>组合验证经营管理部、投标和目标资料库路径。只回答目标资料库名称。</question>
+    <answer>投标公共资料库</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>读取目录 501000715605 的创建时间，将日期格式化为 YYYY/MM/DD。</question>
+    <answer>2025/10/10</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>读取目录 501000715605 的删除和回收站状态。只有两个状态都为否时回答 False，否则回答 True。</question>
+    <answer>False</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>在目录 501000715605 的直接子目录中定位“4、业绩合同明细表”。只回答 folder ID。</question>
+    <answer>501000835604</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>在目录 501000715605 的直接子目录中定位“1、公司资质及荣誉证书明细”。只回答 folder ID。</question>
+    <answer>501000756197</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>读取部门 480 和其父部门信息，确认部门 480 当前返回的 permission_type。只回答该字段原值。</question>
+    <answer>file_manager</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>需要证明某关键词在目录 501000715605 的可见子树中不存在。官方索引搜索不能完成该证明。只回答应首先调用的 durable workflow 工具名。</question>
+    <answer>yfy_start_scope_scan</answer>
+  </qa_pair>
+</evaluation>

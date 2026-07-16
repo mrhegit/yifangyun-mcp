@@ -20,7 +20,24 @@ const REQUIRED_KEYS = [
   "YFY_TEMP_DIR",
   "YFY_TEMP_FILE_TTL_SECONDS",
   "YFY_RETRY_MAX_ATTEMPTS",
-  "YFY_RETRY_BASE_DELAY_MS"
+  "YFY_RETRY_BASE_DELAY_MS",
+  "YFY_MAX_RETRY_DELAY_MS",
+  "YFY_MAX_CONCURRENT_PROVIDER_REQUESTS",
+  "YFY_MAX_CONCURRENT_REQUESTS_PER_IDENTITY",
+  "YFY_DOWNLOAD_IDLE_TIMEOUT_MS",
+  "YFY_DOWNLOAD_WALL_TIMEOUT_MS",
+  "YFY_MAX_TEMP_BYTES",
+  "YFY_SCAN_DIR",
+  "YFY_SCAN_TTL_SECONDS",
+  "YFY_MAX_SCAN_BYTES",
+  "YFY_AUTHORITY_ROOT_FOLDER_ID",
+  "YFY_ALLOW_PRIVATE_TRANSFER_URLS",
+  "YFY_TRANSPORT",
+  "YFY_HTTP_HOST",
+  "YFY_HTTP_PORT",
+  "YFY_HTTP_BEARER_TOKEN",
+  "YFY_HTTP_ALLOWED_HOSTS",
+  "YFY_HTTP_ALLOWED_ORIGINS"
 ];
 
 function setBaseEnv(): void {
@@ -43,6 +60,14 @@ test("loadConfig uses secure and disabled defaults for new capability flags", ()
   assert.equal(config.retryMaxAttempts, 3);
   assert.equal(config.retryBaseDelayMs, 500);
   assert.equal(config.maxDownloadBytes, 268435456);
+  assert.equal(config.maxTempBytes, 1073741824);
+  assert.equal(config.maxConcurrentProviderRequests, 4);
+  assert.equal(config.maxConcurrentRequestsPerIdentity, 2);
+  assert.equal(config.downloadIdleTimeoutMs, 30000);
+  assert.equal(config.downloadWallTimeoutMs, 300000);
+  assert.equal(config.scanTtlSeconds, 604800);
+  assert.equal(config.maxScanBytes, 2147483648);
+  assert.equal(config.transport, "stdio");
   assert.equal(config.tempFileTtlSeconds, 86400);
   assert.match(config.tempDir, /yifangyun-mcp/i);
 });

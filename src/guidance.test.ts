@@ -66,11 +66,11 @@ test("registerGuidance exposes minimal prompts and resources", async () => {
   assert.ok(overview);
   const resource = await overview.handler(new URL(overview.uri));
   assert.match(resource.contents[0].text, /mutation=enabled/);
-  assert.match(resource.contents[0].text, /yfy_search_items_recursive/);
+  assert.match(resource.contents[0].text, /yfy_start_scope_scan/);
 
   const prompt = server.prompts.get("yfy_find_and_lock_original");
   assert.ok(prompt);
   const result = prompt.handler({ file_hint: "contract.docx", root_folder_id: 9 });
   assert.match(result.messages[0].content.text, /yfy_lock_current_original/);
-  assert.match(result.messages[0].content.text, /yfy_search_items_recursive/);
+  assert.match(result.messages[0].content.text, /durable scope scan/i);
 });

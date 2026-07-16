@@ -73,6 +73,7 @@ function makeClient(overrides: Partial<Record<string, (...args: any[]) => unknow
     postAsUser: overrides.postAsUser ?? unexpected("postAsUser"),
     downloadFromUrlToTemp: overrides.downloadFromUrlToTemp ?? unexpected("downloadFromUrlToTemp"),
     uploadLocalFileToPresignedUrl: overrides.uploadLocalFileToPresignedUrl ?? unexpected("uploadLocalFileToPresignedUrl"),
+    resolveAccessIdentityRef: overrides.resolveAccessIdentityRef ?? (() => "identity"),
     resolveFileAccessUser: overrides.resolveFileAccessUser ?? ((userId?: IdLike) => userId ?? 530)
   } as unknown as YifangyunClient;
 }
@@ -224,6 +225,84 @@ test("yfy_lock_current_original fails fast when file is outside the requested sc
   assert.equal(result.isError, true);
   assert.equal((result.structuredContent as { ok: boolean }).ok, false);
   assert.equal(downloadCalls, 0);
+});
+
+test("yfy_lock_current_original rejects version drift across download", async () => {
+  let infoCalls = 0;
+  const server = new FakeServer();
+  const client = makeClient({
+    getAsUser: async (pathname: string) => {
+      if (pathname === "/v2/file/123/info_v2") {
+        infoCalls += 1;
+        const changed = infoCalls === 3;
+        return makeResponse(pathname, {
+          id: 123,
+          name: "evidence.pdf",
+          type: "file",
+          size: 10,
+          modified_at: changed ? 2 : 1,
+          file_version_key: changed ? "v2" : "v1",
+          parent_folder_id: 1,
+          path: [{ id: 1, type: "folder", name: "Root" }]
+        });
+      }
+      if (pathname === "/v2/file/123/versions") {
+        return makeResponse(pathname, { file_versions: [{ id: 7, file_id: 123, current: true, size: 10 }] });
+      }
+      if (pathname === "/v2/file/123/download_v2") {
+        return makeResponse(pathname, { download_url: "https://download.example/file" });
+      }
+      throw new Error(`Unexpected path: ${pathname}`);
+    },
+    downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", meta: makeMeta("/download"), sha1: "provider-sha1", sha256: "hash", sizeBytes: 10, tempPath: "C:/temp/nonexistent-evidence.pdf" })
+  });
+  registerTools(server as unknown as McpServer, client, makeConfig());
+  const result = await getTool(server, "yfy_lock_current_original").handler({ file_id: 123, root_folder_id: 1 });
+  assert.equal(result.isError, true);
+  assert.equal((result.structuredContent as { error: { code: string } }).error.code, "YFY_CURRENT_ORIGINAL_DRIFT");
+});
+
+test("scope membership is query-shaped while scope assertion fails on mismatch", async () => {
+  const server = new FakeServer();
+  const client = makeClient({
+    getAsUser: async (pathname: string) => makeResponse(pathname, {
+      id: 123,
+      name: "outside.docx",
+      type: "file",
+      parent_folder_id: 2,
+      path: [{ id: 1, type: "folder", name: "OtherRoot" }, { id: 2, type: "folder", name: "Folder" }]
+    })
+  });
+  registerTools(server as unknown as McpServer, client, makeConfig());
+
+  const membership = await getTool(server, "yfy_get_file_scope_membership").handler({ file_id: 123, root_folder_id: 999 });
+  assert.equal(membership.isError, undefined);
+  assert.equal((membership.structuredContent as { data: { in_scope: boolean } }).data.in_scope, false);
+
+  const assertion = await getTool(server, "yfy_assert_file_in_scope").handler({ file_id: 123, root_folder_id: 999 });
+  assert.equal(assertion.isError, true);
+  assert.equal((assertion.structuredContent as { error: { code: string } }).error.code, "YFY_SCOPE_ASSERTION_FAILED");
+});
+
+test("default item projection excludes owner login and contact fields", async () => {
+  const server = new FakeServer();
+  const client = makeClient({
+    getAsUser: async (pathname: string) => makeResponse(pathname, {
+      files: [{ id: 1, name: "file.docx", type: "file", owned_by: { id: 9, name: "Owner", login: "owner@example.com", email: "owner@example.com" } }],
+      folders: [],
+      page_id: 0,
+      page_capacity: 50,
+      page_count: 1,
+      total_count: 1
+    })
+  });
+  registerTools(server as unknown as McpServer, client, makeConfig());
+  const result = await getTool(server, "yfy_list_folder_children").handler({ folder_id: 1, type: "all", page_id: 0, page_capacity: 50, detail_level: "full" });
+  const file = (result.structuredContent as { data: { files: Array<Record<string, unknown>> } }).data.files[0];
+  const owner = file.owned_by as Record<string, unknown>;
+  assert.equal(owner.name, "Owner");
+  assert.ok(!Object.prototype.hasOwnProperty.call(owner, "login"));
+  assert.ok(!Object.prototype.hasOwnProperty.call(owner, "email"));
 });
 
 test("yfy_get_share_links redacts direct share credentials in structured output", async () => {

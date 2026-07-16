@@ -12,7 +12,7 @@ yifangyun-mcp-server
   |
   |-- src/index.ts
   |     |-- 创建 McpServer
-  |     |-- 使用 StdioServerTransport
+  |     |-- 使用 StdioServerTransport 或 StreamableHTTPServerTransport
   |
   |-- src/config.ts
   |     |-- 读取环境变量
@@ -22,7 +22,8 @@ yifangyun-mcp-server
   |     |-- 生成 JWT assertion
   |     |-- enterprise/user token 缓存和提前刷新
   |     |-- GET/POST JSON 请求
-  |     |-- 429/5xx 退避
+  |     |-- GET/list 的 429/5xx jitter 退避；非幂等 POST 不重试
+  |     |-- token singleflight 与 Provider 并发调度
   |     |-- 下载到 temp 并计算 sha256
   |     |-- 本地文件上传到 presign_url
   |
@@ -30,6 +31,14 @@ yifangyun-mcp-server
         |-- 注册默认只读 authority 工具
         |-- 按开关注册 mutation/admin 工具
         |-- 输出裁剪、workflow 组合、统一返回 envelope
+  |
+  |-- src/scan/
+  |     |-- durable scan state、frontier、revision/CAS
+  |     |-- 独立 page artifacts 与 receipts
+  |     |-- 恢复、取消、多关键词 snapshot search
+  |
+  |-- src/tools/registerWorkflowTools.ts
+        |-- authority root、durable discovery、batch scope assertion
 ```
 
 核心原则：
@@ -93,7 +102,7 @@ user:<user_id>
 原因：
 
 1. `download_url` 本身是敏感的短期访问凭据
-2. 对证据链来说，`temp_path + sha256 + size_bytes + metadata` 更有价值
+2. 对证据链来说，`temp_path + sha1 + sha256 + size_bytes + metadata` 更有价值
 3. 服务端可以在不暴露 URL 的前提下完成下载与哈希
 
 下载保护包括：
@@ -102,6 +111,8 @@ user:<user_id>
 - `YFY_TEMP_DIR` 本地落地目录
 - `YFY_TEMP_FILE_TTL_SECONDS` 过期清理
 - 对 `download_url` / `presign_url` 的日志脱敏
+- HTTPS/private-address URL 校验、idle/wall timeout、temp 总配额
+- 下载前后 metadata、version、path 和 scope 漂移复核
 
 ## 写操作策略
 
@@ -155,12 +166,19 @@ YFY_ENABLE_ADMIN_TOOLS=enabled
 - 401 / 403 / 404 语义化错误
 - 429 / 5xx 自动退避
 - 统一返回 `request_id` 和 `rate_limit` 元数据（若服务端提供）
+- 稳定的 `YFY_*` 错误码、phase、retryable 和 suggested_action
+
+## Durable Scope Scan
+
+每个 Provider page 会写入独立 artifact，再提交小型 state checkpoint。`expected_revision` 用于防止并发旧写覆盖新进度。扫描结果只声明 observation window 内、当前 access identity 可见范围中的完整性；目录漂移、权限变化、深度/数量上限和分页异常都会关闭 `safe_to_claim_absence`。
+
+当前文件型 store 面向单机 stdio 或单实例 HTTP。多实例部署应在保持 store 接口不变的前提下替换为 SQLite/PostgreSQL 等具备跨进程事务的实现。
 
 ## 已知边界
 
 | 边界 | 说明 |
 |---|---|
-| transport | 当前仍是本地 `stdio` server，不是远程 HTTP server |
+| transport | 默认 stdio；可显式启用受 Host/Origin/Bearer 保护的 Streamable HTTP |
 | OpenAPI 依赖 | 以官方公开 OpenAPI 为准；私有化部署返回字段可能有轻微差异 |
 | 上传兼容性 | presign_url 二段上传已实现，但不同存储网关的细节仍建议实测 |
 | temp 文件 | 下载原件会落本地临时目录，运维需关注磁盘配额 |

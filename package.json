@@ -1,6 +1,6 @@
 {
   "name": "yifangyun-mcp-server",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "MCP server for Yifangyun cloud drive access with enterprise JWT authentication.",
   "repository": {
     "type": "git",
@@ -24,6 +24,7 @@
     "README.md",
     "LICENSE",
     "docs",
+    "evaluations",
     ".env.example"
   ],
   "scripts": {
@@ -31,6 +32,7 @@
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "test": "node --test dist/*.test.js",
+    "test:perf": "node scripts/perf-test.mjs",
     "prepare": "npm run build"
   },
   "engines": {
@@ -38,9 +40,11 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "express": "^5.2.1",
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^24.10.1",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"

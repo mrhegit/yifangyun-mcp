@@ -1,12 +1,18 @@
 import path from "node:path";
+import { promises as fs } from "node:fs";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getConfigSummary } from "../config.js";
 import { redactSensitiveText, YifangyunClient, YifangyunError } from "../client.js";
 import type { ApiJsonResponse, ApiResponseMeta, AppConfig, IdLike, JsonArray, JsonObject, JsonPrimitive, JsonValue, ToolOutput } from "../types.js";
+import { SERVER_VERSION } from "../version.js";
+import { metrics } from "../observability.js";
 
 const ToolOutputSchema = z.object({
   ok: z.boolean(),
+  request_succeeded: z.boolean().optional(),
+  outcome: z.string().optional(),
+  server_version: z.string().optional(),
   data: z.unknown().optional(),
   error: z.unknown().optional(),
   meta: z.unknown().optional(),
@@ -28,6 +34,7 @@ const SortBySchema = z.enum(["name", "date", "size", "score"]);
 const SortDirectionSchema = z.enum(["asc", "desc"]);
 const SearchTypeSchema = z.enum(["file", "folder", "all"]);
 const RecursiveSearchMatchModeSchema = z.enum(["contains", "exact", "prefix", "suffix"]);
+const DetailLevelSchema = z.enum(["minimal", "standard", "full"]);
 const QueryFilterSchema = z.enum(["file_name", "content", "creator", "tag", "all"]);
 const FolderChildTypeSchema = z.enum(["file", "folder", "all"]);
 const ItemTypeSchema = z.enum(["file", "folder"]);
@@ -100,6 +107,10 @@ function normalizeOptionalId(value: IdLike | "" | undefined): IdLike | undefined
   return value === "" ? undefined : value;
 }
 
+function normalizeDetailLevel(value: unknown, fallback: "minimal" | "standard" | "full"): "minimal" | "standard" | "full" {
+  return value === "minimal" || value === "standard" || value === "full" ? value : fallback;
+}
+
 function idToPath(value: IdLike): string {
   return encodeURIComponent(String(value));
 }
@@ -148,7 +159,6 @@ function compactUser(value: JsonValue | undefined, includeContact = false): Json
   const output: JsonObject = {};
   addId(output, "id", value);
   addPrimitive(output, "name", value);
-  addPrimitive(output, "login", value);
   addId(output, "enterprise_id", value);
   if (booleanValue(value.active) !== undefined) {
     output.active = booleanValue(value.active) ?? false;
@@ -157,6 +167,7 @@ function compactUser(value: JsonValue | undefined, includeContact = false): Json
     output.active = booleanValue(value.is_active) ?? false;
   }
   if (includeContact) {
+    addPrimitive(output, "login", value);
     addPrimitive(output, "email", value);
     addPrimitive(output, "phone", value);
   }
@@ -283,6 +294,19 @@ function compactItemBasic(value: JsonValue | undefined): JsonObject {
   return output;
 }
 
+function compactItemWithDetail(value: JsonValue | undefined, detailLevel: "minimal" | "standard" | "full"): JsonObject {
+  if (detailLevel === "minimal") {
+    return compactItemBasic(value);
+  }
+  const output = compactItem(value);
+  if (detailLevel === "standard") {
+    delete output.owned_by;
+    delete output.modified_by;
+    delete output.deleted_by;
+  }
+  return output;
+}
+
 function compactScopedItemWithMode(item: JsonObject, includeFullMetadata: boolean): JsonObject {
   const output = includeFullMetadata ? { ...item } : compactItemBasic(item);
   addPrimitive(output, "depth", item);
@@ -399,7 +423,7 @@ function compactComment(value: JsonValue | undefined): JsonObject {
   addId(output, "id", value);
   addPrimitive(output, "content", value);
   addTimeFields(output, "created_at", value);
-  const user = compactUser(value.user, true);
+  const user = compactUser(value.user, false);
   if (user) {
     output.user = user;
   }
@@ -475,10 +499,25 @@ function pagingFrom(data: JsonObject): JsonObject {
   addPrimitive(output, "total_count", data);
   const pageId = numberValue(data.page_id);
   const pageCount = numberValue(data.page_count);
-  if (pageId !== undefined && pageCount !== undefined) {
-    output.has_more = pageId + 1 < pageCount;
-    if (pageId + 1 < pageCount) {
-      output.next_page_id = pageId + 1;
+  const pageCapacity = numberValue(data.page_capacity);
+  const totalCount = numberValue(data.total_count);
+  const explicitHasMore = booleanValue(data.has_more);
+  let hasMore: boolean | undefined;
+  if (explicitHasMore !== undefined) {
+    hasMore = explicitHasMore;
+    output.pagination_source = "provider_has_more";
+  } else if (pageId !== undefined && pageCount !== undefined) {
+    hasMore = pageId + 1 < pageCount;
+    output.pagination_source = "page_count";
+  } else if (pageId !== undefined && pageCapacity !== undefined && totalCount !== undefined) {
+    hasMore = (pageId + 1) * pageCapacity < totalCount;
+    output.pagination_source = "total_count";
+  }
+  output.pagination_metadata_complete = hasMore !== undefined;
+  if (hasMore !== undefined) {
+    output.has_more = hasMore;
+    if (hasMore) {
+      output.next_page_id = numberValue(data.next_page_id) ?? (pageId ?? 0) + 1;
     }
   }
   return output;
@@ -507,21 +546,33 @@ function compactItemList(data: JsonValue): JsonObject {
   return output;
 }
 
-function compactItemListWithMode(data: JsonValue, includeFullMetadata: boolean): JsonObject {
-  if (includeFullMetadata) {
-    return compactItemList(data);
-  }
+function compactItemListWithDetail(data: JsonValue, detailLevel: "minimal" | "standard" | "full"): JsonObject {
   if (!isObject(data)) {
     return { raw: data };
   }
   const output = pagingFrom(data);
-  const files = arrayValue(data.files).map((item) => compactItemBasic(item));
-  const folders = arrayValue(data.folders).map((item) => compactItemBasic(item));
+  const files = arrayValue(data.files).map((item) => compactItemWithDetail(item, detailLevel));
+  const folders = arrayValue(data.folders).map((item) => compactItemWithDetail(item, detailLevel));
   output.files = files;
   output.folders = folders;
   output.file_count = files.length;
   output.folder_count = folders.length;
+  if (isObject(data.space)) {
+    output.space = compactItem(data.space);
+  }
   return output;
+}
+
+function withSearchAuthority(data: JsonObject): JsonObject {
+  return {
+    ...data,
+    authority: {
+      level: "hint_only",
+      pagination_complete: false,
+      safe_to_claim_absence: false,
+      suggested_authority_tool: "yfy_start_scope_scan"
+    }
+  };
 }
 
 function compactVersionList(data: JsonValue): JsonObject {
@@ -605,10 +656,15 @@ function metaToJson(meta: ApiResponseMeta): JsonObject {
 }
 
 function workflowMeta(name: string, metas: ApiResponseMeta[]): JsonObject {
+  const first = metas[0];
+  const last = metas[metas.length - 1];
   return {
     workflow: name,
-    primary_request: metaToJson(metas[0]),
-    related_requests: metas.slice(1).map((meta) => metaToJson(meta))
+    request_count: metas.length,
+    ...(first ? { primary_request: metaToJson(first) } : {}),
+    ...(last && last !== first ? { final_request: metaToJson(last) } : {}),
+    related_requests_sample: metas.slice(1, 6).map((meta) => metaToJson(meta)),
+    related_requests_truncated: metas.length > 6
   };
 }
 
@@ -622,16 +678,34 @@ function compactUploadResult(value: { deliveryMethod: string; fileName: string; 
   };
 }
 
+function summarizeToolData(data: JsonValue): string {
+  if (!isObject(data)) {
+    return JSON.stringify(data);
+  }
+  const summary: JsonObject = {};
+  for (const [key, value] of Object.entries(data).slice(0, 20)) {
+    if (Array.isArray(value)) {
+      summary[`${key}_count`] = value.length;
+    } else if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      summary[key] = value;
+    }
+  }
+  return JSON.stringify(summary);
+}
+
 function ok(data: JsonValue, meta?: JsonObject, options: { raw?: JsonValue; warnings?: string[]; config?: AppConfig } = {}): ToolResponse {
   const output: ToolOutput = {
     ok: true,
+    request_succeeded: true,
+    outcome: "success",
+    server_version: SERVER_VERSION,
     data,
     ...(meta ? { meta } : {}),
     ...(options.warnings && options.warnings.length ? { warnings: options.warnings } : {}),
     ...(options.raw !== undefined && options.config?.enableRawResponse ? { raw: options.raw } : {})
   };
   return {
-    content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
+    content: [{ type: "text", text: `success${meta?.workflow ? `: ${String(meta.workflow)}` : ""}\n${summarizeToolData(data)}` }],
     structuredContent: output
   };
 }
@@ -641,20 +715,27 @@ function fail(error: unknown): ToolResponse {
   if (error instanceof YifangyunError) {
     payload = {
       ok: false,
+      request_succeeded: false,
+      outcome: "error",
+      server_version: SERVER_VERSION,
       error: {
+        code: error.code,
         message: redactSensitiveText(error.message),
+        ...(error.phase ? { phase: error.phase } : {}),
         retryable: error.retryable,
         ...(error.retryAfterMs !== undefined ? { retry_after_ms: error.retryAfterMs } : {}),
         ...(error.statusCode ? { status_code: error.statusCode } : {}),
-        ...(error.details ? { details: error.details } : {})
+        ...(error.details ? { details: error.details } : {}),
+        ...(error.scanId ? { scan_id: error.scanId } : {}),
+        ...(error.suggestedAction ? { suggested_action: error.suggestedAction } : {})
       }
     };
   } else {
     const message = error instanceof Error ? error.message : String(error);
-    payload = { ok: false, error: { message: redactSensitiveText(message), retryable: false } };
+    payload = { ok: false, request_succeeded: false, outcome: "error", server_version: SERVER_VERSION, error: { code: "YFY_UNEXPECTED_ERROR", message: redactSensitiveText(message), retryable: false } };
   }
   return {
-    content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+    content: [{ type: "text", text: `${String(payload.error?.code ?? "YFY_UNEXPECTED_ERROR")}: ${String(payload.error?.message ?? "Request failed")}` }],
     structuredContent: payload,
     isError: true
   };
@@ -860,14 +941,20 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
       throw new YifangyunError("Download API did not return download_url.", { details: { response_shape: ticket.data as JsonValue } });
     }
     const fileNameHint = stringValue(info.name) ?? `${String(fileId)}.bin`;
-    const downloaded = await client.downloadFromUrlToTemp(ticket.data.download_url, { fileNameHint, retry: true });
+    const downloaded = await client.downloadFromUrlToTemp(ticket.data.download_url, {
+      fileNameHint,
+      namespace: client.resolveAccessIdentityRef(userId, externalEnterpriseId),
+      retry: true
+    });
     const download: JsonObject = {
       file_id: String(fileId),
       file_name: downloaded.fileName,
       temp_path: downloaded.tempPath,
+      sha1: downloaded.sha1,
       sha256: downloaded.sha256,
       size_bytes: downloaded.sizeBytes,
-      ...(downloaded.contentType ? { content_type: downloaded.contentType } : {})
+      ...(downloaded.contentType ? { content_type: downloaded.contentType } : {}),
+      ...(downloaded.detectedContentType ? { detected_content_type: downloaded.detectedContentType } : {})
     };
     if (versionId !== undefined) {
       download.version_id = String(versionId);
@@ -883,7 +970,8 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     userId: IdLike | undefined,
     pageId: number,
     pageCapacity: number,
-    metas: ApiResponseMeta[]
+    metas: ApiResponseMeta[],
+    detailLevel: "minimal" | "standard" | "full"
   ): Promise<JsonObject> => {
     const response = await client.getAsUser(`/v2/folder/${idToPath(folderId)}/children`, userId, {
       type: "all",
@@ -891,13 +979,13 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
       page_capacity: clampPageCapacity(pageCapacity, config)
     });
     metas.push(response.meta);
-    return compactItemList(response.data);
+    return compactItemListWithDetail(response.data, detailLevel);
   };
 
   const walkFolderScope = async (
     rootFolderId: IdLike,
     userId: IdLike | undefined,
-    options: { maxDepth: number; maxItems: number; pageCapacity: number },
+    options: { detailLevel?: "minimal" | "standard" | "full"; maxDepth: number; maxItems: number; pageCapacity: number },
     visitor: {
       onFolder?: (folder: JsonObject, context: { depth: number; pathDisplay: string }) => Promise<{ descend?: boolean } | void> | { descend?: boolean } | void;
       onFile?: (file: JsonObject, context: { depth: number; pathDisplay: string }) => Promise<void> | void;
@@ -907,6 +995,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     const rootInfo = await getFolderInfo(rootFolderId, userId);
     metas.push(rootInfo.meta);
     const rootFolder = compactItem(rootInfo.data);
+    const seenFolderIds = new Set<string>([String(rootFolderId)]);
     let truncated = false;
     let visited = 0;
 
@@ -916,7 +1005,14 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
       }
       let pageId = 0;
       while (!truncated) {
-        const list = await listFolderChildrenPage(folderId, userId, pageId, options.pageCapacity, metas);
+        const list = await listFolderChildrenPage(folderId, userId, pageId, options.pageCapacity, metas, options.detailLevel ?? "minimal");
+        if (list.pagination_metadata_complete !== true) {
+          throw new YifangyunError("Folder children response did not include reliable pagination metadata.", {
+            code: "YFY_PAGINATION_METADATA_INCOMPLETE",
+            phase: "recursive_scan",
+            suggestedAction: "Use yfy_start_scope_scan so the incomplete page is recorded and resumable."
+          });
+        }
         const childFolders = arrayValue(list.folders).filter((value): value is JsonObject => isObject(value));
         const childFiles = arrayValue(list.files).filter((value): value is JsonObject => isObject(value));
 
@@ -930,7 +1026,14 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
           annotateScopedItem(folder, depth + 1, nextDisplay);
           const decision = await visitor.onFolder?.(folder, { depth: depth + 1, pathDisplay: nextDisplay });
           if ((decision?.descend ?? true) && !truncated) {
-            await walk(String(folder.id ?? "0"), depth + 1, nextDisplay);
+            const childFolderId = idString(folder.id);
+            if (!childFolderId) {
+              throw new YifangyunError("Folder listing returned a child without an id.", { code: "YFY_INVALID_FOLDER_ID", phase: "recursive_scan" });
+            }
+            if (!seenFolderIds.has(childFolderId)) {
+              seenFolderIds.add(childFolderId);
+              await walk(childFolderId, depth + 1, nextDisplay);
+            }
           }
           if (truncated) {
             break;
@@ -1028,7 +1131,8 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     const walked = await walkFolderScope(rootFolderId, userId, {
       maxDepth: options.maxDepth,
       maxItems: options.maxItems,
-      pageCapacity: options.pageCapacity
+      pageCapacity: options.pageCapacity,
+      detailLevel: options.includeFullMetadata ? "full" : "minimal"
     }, {
       onFolder: async (folder, context) => {
         if (options.type !== "file" && matchesScopedItemName(stringValue(folder.name), options.queryWords, options.matchMode, options.caseSensitive)) {
@@ -1093,6 +1197,9 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
       const response = await fetchPage(pageId);
       metas.push(response.meta);
       const list = compactItemList(response.data);
+      if (list.pagination_metadata_complete !== true) {
+        throw new YifangyunError("List response did not include reliable pagination metadata.", { code: "YFY_PAGINATION_METADATA_INCOMPLETE", phase: "list_pagination" });
+      }
       if (mode === "folders") {
         items.push(...arrayValue(list.folders).filter((value): value is JsonObject => isObject(value)));
       } else {
@@ -1169,7 +1276,11 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
       }
       matched.push(match);
       if (!isLast) {
-        currentFolderId = String(match.id ?? "0");
+        const matchedFolderId = idString(match.id);
+        if (!matchedFolderId) {
+          throw new YifangyunError("Path resolution matched a folder without an id.", { code: "YFY_INVALID_FOLDER_ID", phase: "resolve_path" });
+        }
+        currentFolderId = matchedFolderId;
         const folderId = currentFolderId;
         candidates = await listPagedItems(
           async (pageId) => client.getAsUser(`/v2/folder/${idToPath(folderId)}/children`, input.userId, {
@@ -1290,14 +1401,14 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     {
       title: "List Yifangyun Personal Items",
       description: "List first-level files and folders in a user's personal cloud-drive space.",
-      inputSchema: { ...OptionalUserShape, ...PageShape }
+      inputSchema: { detail_level: DetailLevelSchema.default("minimal"), ...OptionalUserShape, ...PageShape }
     },
-    async ({ user_id, page_id, page_capacity }) => {
+    async ({ detail_level, user_id, page_id, page_capacity }) => {
       const response = await client.getAsUser("/v2/folder/personal_items", normalizeOptionalId(user_id as IdLike | "" | undefined), {
         page_id: page_id as number,
         page_capacity: clampPageCapacity(page_capacity as number | undefined, config)
       });
-      return ok(compactItemList(response.data), metaToJson(response.meta), { config, raw: response.data });
+      return ok(compactItemListWithDetail(response.data, normalizeDetailLevel(detail_level, "minimal")), metaToJson(response.meta), { config, raw: response.data });
     }
   );
 
@@ -1306,15 +1417,15 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     {
       title: "List Yifangyun Department Folders",
       description: "List first-level cloud-drive folders for a department. Uses a user token because file access depends on user permissions.",
-      inputSchema: { department_id: IdSchema.describe("Department id."), ...OptionalUserShape, ...PageShape }
+      inputSchema: { department_id: IdSchema.describe("Department id."), detail_level: DetailLevelSchema.default("minimal"), ...OptionalUserShape, ...PageShape }
     },
-    async ({ department_id, user_id, page_id, page_capacity }) => {
+    async ({ department_id, detail_level, user_id, page_id, page_capacity }) => {
       const response = await client.getAsUser("/v2/folder/department_folders", normalizeOptionalId(user_id as IdLike | "" | undefined), {
         department_id: String(department_id as IdLike),
         page_id: page_id as number,
         page_capacity: clampPageCapacity(page_capacity as number | undefined, config)
       });
-      return ok(compactItemList(response.data), metaToJson(response.meta), { config, raw: response.data });
+      return ok(compactItemListWithDetail(response.data, normalizeDetailLevel(detail_level, "minimal")), metaToJson(response.meta), { config, raw: response.data });
     }
   );
 
@@ -1323,15 +1434,15 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     {
       title: "List Yifangyun Folder Children",
       description: "List direct child files and folders under a folder. This tool does not recurse.",
-      inputSchema: { folder_id: IdSchema.describe("Folder id."), type: FolderChildTypeSchema.default("all"), ...OptionalUserShape, ...PageShape }
+      inputSchema: { folder_id: IdSchema.describe("Folder id."), type: FolderChildTypeSchema.default("all"), detail_level: DetailLevelSchema.default("minimal"), ...OptionalUserShape, ...PageShape }
     },
-    async ({ folder_id, type, user_id, page_id, page_capacity }) => {
+    async ({ folder_id, type, detail_level, user_id, page_id, page_capacity }) => {
       const response = await client.getAsUser(`/v2/folder/${idToPath(folder_id as IdLike)}/children`, normalizeOptionalId(user_id as IdLike | "" | undefined), {
         type: type as string,
         page_id: page_id as number,
         page_capacity: clampPageCapacity(page_capacity as number | undefined, config)
       });
-      return ok(compactItemList(response.data), metaToJson(response.meta), { config, raw: response.data });
+      return ok(compactItemListWithDetail(response.data, normalizeDetailLevel(detail_level, "minimal")), metaToJson(response.meta), { config, raw: response.data });
     }
   );
 
@@ -1345,6 +1456,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     sort_direction: SortDirectionSchema.default("desc"),
     precise_search: z.boolean().optional(),
     fields: z.string().optional(),
+    detail_level: DetailLevelSchema.default("minimal").describe("Output projection level. Full includes ownership names but not login/contact fields."),
     ...OptionalUserShape,
     ...PageShape
   };
@@ -1353,7 +1465,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     "yfy_search_items",
     {
       title: "Search Yifangyun Items",
-      description: "Search files/folders by keyword. Supports personal space, collaboration space, department space via department_id, or folder scope via search_in_folder.",
+      description: "Deprecated simplified alias for official indexed search. Results are hint-only and cannot prove absence; prefer yfy_search_items_advanced.",
       inputSchema: searchSchema
     },
     async (params) => {
@@ -1370,7 +1482,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
         page_id: params.page_id as number,
         page_capacity: clampPageCapacity(params.page_capacity as number | undefined, config)
       });
-      return ok(compactItemList(response.data), metaToJson(response.meta), { config, raw: response.data });
+      return ok(withSearchAuthority(compactItemListWithDetail(response.data, normalizeDetailLevel(params.detail_level, "minimal"))), metaToJson(response.meta), { config, raw: response.data });
     }
   );
 
@@ -1379,7 +1491,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     {
       title: "Search Yifangyun Items Advanced",
       description: "OpenAPI-first advanced search wrapper with the full supported query surface and richer metadata output.",
-      inputSchema: { ...searchSchema, include_full_metadata: z.boolean().default(true) }
+      inputSchema: { ...searchSchema, include_full_metadata: z.boolean().default(false).describe("Deprecated compatibility flag. Prefer detail_level.") }
     },
     async (params) => {
       const response = await client.getAsUser("/v2/item/search", normalizeOptionalId(params.user_id as IdLike | "" | undefined), {
@@ -1395,7 +1507,8 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
         page_id: params.page_id as number,
         page_capacity: clampPageCapacity(params.page_capacity as number | undefined, config)
       });
-      return ok(compactItemListWithMode(response.data, params.include_full_metadata as boolean), metaToJson(response.meta), { config, raw: response.data });
+      const detailLevel = params.include_full_metadata === true ? "full" : normalizeDetailLevel(params.detail_level, "minimal");
+      return ok(withSearchAuthority(compactItemListWithDetail(response.data, detailLevel)), metaToJson(response.meta), { config, raw: response.data });
     }
   );
 
@@ -1404,11 +1517,11 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     {
       title: "Get Yifangyun File Info",
       description: "Get file metadata by file id. Uses user-token permissions.",
-      inputSchema: { file_id: IdSchema.describe("File id."), external_enterprise_id: OptionalIdSchema.describe("External collaboration enterprise id when required."), ...OptionalUserShape }
+      inputSchema: { file_id: IdSchema.describe("File id."), detail_level: DetailLevelSchema.default("minimal"), external_enterprise_id: OptionalIdSchema.describe("External collaboration enterprise id when required."), ...OptionalUserShape }
     },
-    async ({ file_id, external_enterprise_id, user_id }) => {
+    async ({ file_id, detail_level, external_enterprise_id, user_id }) => {
       const response = await getFileInfo(file_id as IdLike, normalizeOptionalId(external_enterprise_id as IdLike | "" | undefined), normalizeOptionalId(user_id as IdLike | "" | undefined));
-      return ok(compactItem(response.data), metaToJson(response.meta), { config, raw: response.data });
+      return ok(compactItemWithDetail(response.data, normalizeDetailLevel(detail_level, "minimal")), metaToJson(response.meta), { config, raw: response.data });
     }
   );
 
@@ -1430,11 +1543,11 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     {
       title: "Get Yifangyun Folder Info",
       description: "Get folder metadata by folder id, including ancestry information when the OpenAPI returns path fields.",
-      inputSchema: { folder_id: IdSchema.describe("Folder id."), ...OptionalUserShape }
+      inputSchema: { folder_id: IdSchema.describe("Folder id."), detail_level: DetailLevelSchema.default("standard"), ...OptionalUserShape }
     },
-    async ({ folder_id, user_id }) => {
+    async ({ folder_id, detail_level, user_id }) => {
       const response = await getFolderInfo(folder_id as IdLike, normalizeOptionalId(user_id as IdLike | "" | undefined));
-      return ok(compactItem(response.data), metaToJson(response.meta), { config, raw: response.data });
+      return ok(compactItemWithDetail(response.data, normalizeDetailLevel(detail_level, "standard")), metaToJson(response.meta), { config, raw: response.data });
     }
   );
 
@@ -1491,6 +1604,31 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
   );
 
   registerReadTool(
+    "yfy_get_file_scope_membership",
+    {
+      title: "Get Yifangyun File Scope Membership",
+      description: "Query whether a file belongs to a root folder. A negative membership is a successful query result, not a tool failure.",
+      inputSchema: { file_id: IdSchema.describe("File id."), root_folder_id: IdSchema.describe("Expected root folder id."), external_enterprise_id: OptionalIdSchema.describe("External collaboration enterprise id when required."), ...OptionalUserShape }
+    },
+    async ({ file_id, root_folder_id, external_enterprise_id, user_id }) => {
+      const result = await collectFileAncestors(file_id as IdLike, normalizeOptionalId(external_enterprise_id as IdLike | "" | undefined), normalizeOptionalId(user_id as IdLike | "" | undefined));
+      const rootId = String(root_folder_id as IdLike);
+      const ancestorIds = result.chain.map((entry) => entry.id).filter((entry): entry is string => typeof entry === "string");
+      const inScope = ancestorIds.includes(rootId) || String(result.file.parent_folder_id ?? "") === rootId;
+      metrics.increment("scope_assertion_total", { outcome: inScope ? "inside_scope" : "outside_scope" });
+      return ok({
+        assertion_passed: inScope,
+        file: result.file,
+        in_scope: inScope,
+        outcome: inScope ? "inside_scope" : "outside_scope",
+        ancestor_chain: result.chain,
+        ancestor_folder_ids: ancestorIds,
+        root_folder_id: rootId
+      }, metaToJson(result.meta));
+    }
+  );
+
+  registerReadTool(
     "yfy_assert_file_in_scope",
     {
       title: "Assert Yifangyun File In Scope",
@@ -1502,7 +1640,17 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
       const rootId = String(root_folder_id as IdLike);
       const ancestorIds = result.chain.map((entry) => entry.id).filter((entry): entry is string => typeof entry === "string");
       const inScope = ancestorIds.includes(rootId) || String(result.file.parent_folder_id ?? "") === rootId;
+      if (!inScope) {
+        metrics.increment("scope_assertion_total", { outcome: "outside_scope" });
+        throw new YifangyunError("File is outside the requested root_folder_id scope.", {
+          code: "YFY_SCOPE_ASSERTION_FAILED",
+          details: { ancestor_folder_ids: ancestorIds, file_id: String(file_id as IdLike), root_folder_id: rootId },
+          phase: "scope_assertion"
+        });
+      }
+      metrics.increment("scope_assertion_total", { outcome: "inside_scope" });
       return ok({
+        assertion_passed: true,
         file: result.file,
         in_scope: inScope,
         matched_ancestor_id: inScope ? rootId : null,
@@ -1517,7 +1665,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     "yfy_build_scope_snapshot",
     {
       title: "Build Yifangyun Scope Snapshot",
-      description: "Build a flat structured snapshot for a root folder using official list-children pagination.",
+      description: "Legacy bounded synchronous snapshot. Prefer yfy_start_scope_scan for large or resumable scopes.",
       inputSchema: {
         root_folder_id: IdSchema.describe("Root folder id."),
         max_depth: z.number().int().min(0).default(5).describe("Maximum descendant folder depth to expand. Direct children are depth 1, so max_depth=0 still scans only direct children."),
@@ -1544,7 +1692,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     "yfy_list_folder_tree",
     {
       title: "List Yifangyun Folder Tree",
-      description: "List a recursive folder tree as a flat item array using only official OpenAPI list endpoints.",
+      description: "Legacy bounded synchronous tree listing. Prefer durable scope scan artifacts for large scopes.",
       inputSchema: {
         root_folder_id: IdSchema.describe("Root folder id."),
         max_depth: z.number().int().min(0).default(5).describe("Maximum descendant folder depth to expand. Direct children are depth 1, so max_depth=0 still scans only direct children."),
@@ -1572,7 +1720,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     "yfy_search_items_recursive",
     {
       title: "Search Yifangyun Items Recursively",
-      description: "Recursively search descendant file and folder names under a root folder using official children pagination. This is a bounded local tree search, not the official /v2/item/search endpoint.",
+      description: "Legacy bounded synchronous descendant search. Prefer yfy_start_scope_scan plus yfy_search_scope_snapshot for resumability and completeness metadata.",
       inputSchema: {
         root_folder_id: IdSchema.describe("Root folder id."),
         query_words: z.string().trim().min(1).max(200).describe("Name keyword to match inside the root folder subtree."),
@@ -1727,14 +1875,14 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     {
       title: "Get Yifangyun Group Users",
       description: "Get group member list through the official group users endpoint.",
-      inputSchema: { group_id: IdSchema.describe("Group id."), query_words: z.string().max(200).optional(), page_id: z.number().int().min(0).default(0), ...OptionalUserShape }
+      inputSchema: { group_id: IdSchema.describe("Group id."), query_words: z.string().max(200).optional(), page_id: z.number().int().min(0).default(0), include_contact: z.boolean().default(false), ...OptionalUserShape }
     },
-    async ({ group_id, query_words, page_id, user_id }) => {
+    async ({ group_id, query_words, page_id, include_contact, user_id }) => {
       const response = await client.getAsUser(`/v2/group/${idToPath(group_id as IdLike)}/users`, normalizeOptionalId(user_id as IdLike | "" | undefined), {
         query_words: query_words as string | undefined,
         page_id: page_id as number
       });
-      return ok(compactUserList(response.data, true), metaToJson(response.meta), { config, raw: response.data });
+      return ok(compactUserList(response.data, include_contact === true), metaToJson(response.meta), { config, raw: response.data });
     }
   );
 
@@ -1743,14 +1891,14 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     {
       title: "Search Yifangyun Users",
       description: "Search enterprise users through the official /v2/user/search endpoint.",
-      inputSchema: { query_words: z.string().max(200).optional().describe("Search text; omitted means enterprise-wide list."), page_id: z.number().int().min(0).default(0), ...OptionalUserShape }
+      inputSchema: { query_words: z.string().max(200).optional().describe("Search text; omitted means enterprise-wide list."), page_id: z.number().int().min(0).default(0), include_contact: z.boolean().default(false), ...OptionalUserShape }
     },
-    async ({ query_words, page_id, user_id }) => {
+    async ({ query_words, page_id, include_contact, user_id }) => {
       const response = await client.getAsUser("/v2/user/search", normalizeOptionalId(user_id as IdLike | "" | undefined), {
         query_words: query_words as string | undefined,
         page_id: page_id as number
       });
-      return ok(compactUserList(response.data, true), metaToJson(response.meta), { config, raw: response.data });
+      return ok(compactUserList(response.data, include_contact === true), metaToJson(response.meta), { config, raw: response.data });
     }
   );
 
@@ -1788,7 +1936,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
     "yfy_download_file_to_temp",
     {
       title: "Download Yifangyun File To Temp",
-      description: "Download a file to a local temp path without exposing download_url to the MCP caller.",
+      description: "Compatibility alias for download-and-hash. Prefer yfy_download_and_hash for explicit evidence semantics.",
       inputSchema: { file_id: IdSchema.describe("File id."), version_id: OptionalIdSchema.describe("Optional version id."), external_enterprise_id: OptionalIdSchema.describe("External collaboration enterprise id when required."), ...OptionalUserShape }
     },
     async ({ file_id, version_id, external_enterprise_id, user_id }) => {
@@ -1859,6 +2007,7 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
         const download = await getDownloadToTemp(params.file_id as IdLike, undefined, externalEnterpriseId, userId);
         metas.push(...download.metas);
         checks.download_sha256 = params.expected_sha256 ? download.download.sha256 === params.expected_sha256 : true;
+        checks.download_sha1 = params.expected_sha1 ? download.download.sha1 === params.expected_sha1 : true;
         checks.download_size_bytes = params.expected_size_bytes !== undefined ? download.download.size_bytes === params.expected_size_bytes : true;
       }
       const checkValues = Object.values(checks).filter((value): value is boolean => typeof value === "boolean");
@@ -1874,12 +2023,15 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
       inputSchema: { file_id: IdSchema.describe("File id."), root_folder_id: IdSchema.describe("Expected root folder id."), external_enterprise_id: OptionalIdSchema.optional(), ...OptionalUserShape }
     },
     async ({ file_id, root_folder_id, external_enterprise_id, user_id }) => {
-      const ancestry = await collectFileAncestors(file_id as IdLike, normalizeOptionalId(external_enterprise_id as IdLike | "" | undefined), normalizeOptionalId(user_id as IdLike | "" | undefined));
+      const externalEnterpriseId = normalizeOptionalId(external_enterprise_id as IdLike | "" | undefined);
+      const userId = normalizeOptionalId(user_id as IdLike | "" | undefined);
+      const ancestry = await collectFileAncestors(file_id as IdLike, externalEnterpriseId, userId);
       const rootId = String(root_folder_id as IdLike);
       const ancestorIds = ancestry.chain.map((entry) => entry.id).filter((entry): entry is string => typeof entry === "string");
       const inScope = ancestorIds.includes(rootId) || String(ancestry.file.parent_folder_id ?? "") === rootId;
       if (!inScope) {
         throw new YifangyunError("File is outside the requested root_folder_id scope.", {
+          code: "YFY_SCOPE_ASSERTION_FAILED",
           details: {
             root_folder_id: rootId,
             ancestor_folder_ids: ancestorIds,
@@ -1887,7 +2039,42 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
           }
         });
       }
-      const download = await getDownloadToTemp(file_id as IdLike, undefined, normalizeOptionalId(external_enterprise_id as IdLike | "" | undefined), normalizeOptionalId(user_id as IdLike | "" | undefined));
+      const versionsResponse = await getFileVersions(file_id as IdLike, userId);
+      const versionList = compactVersionList(versionsResponse.data);
+      const versions = arrayValue(versionList.versions).filter((value): value is JsonObject => isObject(value));
+      const currentVersion = versions.find((value) => value.current === true);
+      const currentVersionId = typeof currentVersion?.id === "string" ? currentVersion.id : undefined;
+      const download = await getDownloadToTemp(file_id as IdLike, currentVersionId, externalEnterpriseId, userId);
+      const finalAncestry = await collectFileAncestors(file_id as IdLike, externalEnterpriseId, userId);
+      const finalAncestorIds = finalAncestry.chain.map((entry) => entry.id).filter((entry): entry is string => typeof entry === "string");
+      const finalInScope = finalAncestorIds.includes(rootId) || String(finalAncestry.file.parent_folder_id ?? "") === rootId;
+      const driftChecks: JsonObject = {
+        file_version_key: ancestry.file.file_version_key === finalAncestry.file.file_version_key,
+        modified_at_unix: ancestry.file.modified_at_unix === finalAncestry.file.modified_at_unix,
+        parent_folder_id: ancestry.file.parent_folder_id === finalAncestry.file.parent_folder_id,
+        path_chain: JSON.stringify(ancestry.chain) === JSON.stringify(finalAncestry.chain),
+        sha1: ancestry.file.sha1 === finalAncestry.file.sha1 && (ancestry.file.sha1 === undefined || ancestry.file.sha1 === download.download.sha1),
+        size_bytes: ancestry.file.size === finalAncestry.file.size && finalAncestry.file.size === download.download.size_bytes,
+        scope_unchanged: finalInScope
+      };
+      if (!Object.values(driftChecks).every((value) => value === true)) {
+        for (const [field, matched] of Object.entries(driftChecks)) {
+          if (matched !== true) {
+            metrics.increment("current_original_drift_total", { field });
+          }
+        }
+        const tempPath = stringValue(download.download.temp_path);
+        if (tempPath) {
+          await fs.rm(tempPath, { force: true }).catch(() => undefined);
+        }
+        throw new YifangyunError("File metadata or scope changed while locking the current original.", {
+          code: "YFY_CURRENT_ORIGINAL_DRIFT",
+          details: { checks: driftChecks, file_id: String(file_id as IdLike), root_folder_id: rootId },
+          phase: "current_original_recheck",
+          retryable: true,
+          suggestedAction: "Retry the complete lock workflow after the file becomes stable."
+        });
+      }
       return ok({
         scope_proof: {
           in_scope: true,
@@ -1895,9 +2082,11 @@ export function registerTools(server: McpServer, client: YifangyunClient, config
           ancestor_chain: ancestry.chain,
           ancestor_folder_ids: ancestorIds
         },
-        file: ancestry.file,
+        file: finalAncestry.file,
+        current_version_id: currentVersionId ?? null,
+        drift_checks: driftChecks,
         download: download.download
-      }, workflowMeta("yfy_lock_current_original", [ancestry.meta, ...download.metas]));
+      }, workflowMeta("yfy_lock_current_original", [ancestry.meta, versionsResponse.meta, ...download.metas, finalAncestry.meta]));
     }
   );
 
