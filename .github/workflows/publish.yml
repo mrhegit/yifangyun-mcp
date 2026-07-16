@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   publish:
@@ -40,6 +41,12 @@ jobs:
 
       - name: Build package
         run: npm run build
+
+      - name: Run tests
+        run: npm test
+
+      - name: Run snapshot performance test
+        run: npm run test:perf
 
       - name: Check package contents
         run: npm pack --dry-run
@@ -75,8 +82,19 @@ jobs:
             echo "- \`npm pack --dry-run\`"
           } > release-notes.md
 
+      - name: Select npm dist-tag
+        id: dist-tag
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "name=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=latest" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish to npm
-        run: npm publish
+        run: npm publish --provenance --tag "${{ steps.dist-tag.outputs.name }}"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -84,3 +102,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           body_path: release-notes.md
+          prerelease: ${{ contains(github.ref_name, '-') }}

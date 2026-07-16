@@ -2,78 +2,97 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { loadConfig } from "./config.js";
 
-const REQUIRED_KEYS = [
-  "YFY_CLIENT_ID",
-  "YFY_CLIENT_SECRET",
-  "YFY_ENTERPRISE_ID",
-  "YFY_DEFAULT_USER_ID",
-  "YFY_OPENAPI_BASE_URL",
-  "YFY_OAUTH_BASE_URL",
-  "YFY_API_BASE_URL",
-  "YFY_ADMIN_USER_ID",
-  "YFY_FILE_ACCESS_USER_STRATEGY",
-  "YFY_ALLOW_DOWNLOAD_URL",
-  "YFY_ENABLE_MUTATION_TOOLS",
-  "YFY_ENABLE_ADMIN_TOOLS",
-  "YFY_ENABLE_RAW_RESPONSE",
-  "YFY_MAX_DOWNLOAD_BYTES",
-  "YFY_TEMP_DIR",
-  "YFY_TEMP_FILE_TTL_SECONDS",
-  "YFY_RETRY_MAX_ATTEMPTS",
-  "YFY_RETRY_BASE_DELAY_MS",
-  "YFY_MAX_RETRY_DELAY_MS",
-  "YFY_MAX_CONCURRENT_PROVIDER_REQUESTS",
-  "YFY_MAX_CONCURRENT_REQUESTS_PER_IDENTITY",
-  "YFY_DOWNLOAD_IDLE_TIMEOUT_MS",
-  "YFY_DOWNLOAD_WALL_TIMEOUT_MS",
-  "YFY_MAX_TEMP_BYTES",
-  "YFY_SCAN_DIR",
-  "YFY_SCAN_TTL_SECONDS",
-  "YFY_MAX_SCAN_BYTES",
-  "YFY_AUTHORITY_ROOT_FOLDER_ID",
-  "YFY_ALLOW_PRIVATE_TRANSFER_URLS",
-  "YFY_TRANSPORT",
-  "YFY_HTTP_HOST",
-  "YFY_HTTP_PORT",
-  "YFY_HTTP_BEARER_TOKEN",
-  "YFY_HTTP_ALLOWED_HOSTS",
-  "YFY_HTTP_ALLOWED_ORIGINS"
-];
+const ENV_KEYS = [
+  "YFY_CLIENT_ID", "YFY_CLIENT_SECRET", "YFY_ENTERPRISE_ID", "YFY_DEFAULT_USER_ID", "YFY_TOOLSETS", "YFY_ACCESS_CONTEXTS_JSON", "YFY_SCOPES_JSON",
+  "YFY_API_BASE_URL", "YFY_OAUTH_BASE_URL", "YFY_SNAPSHOT_CONCURRENCY", "YFY_STATE_DB", "YFY_TEMP_DIR", "YFY_MAX_DOWNLOAD_BYTES",
+  "YFY_MAX_EVIDENCE_RESOURCE_BYTES", "YFY_TEMP_FILE_TTL_SECONDS", "YFY_LOG_LEVEL", "YFY_UPLOAD_ROOT_DIR"
+] as const;
 
-function setBaseEnv(): void {
-  for (const key of REQUIRED_KEYS) {
-    delete process.env[key];
+function withEnv(values: Record<string, string | undefined>, work: () => void): void {
+  const previous = new Map<string, string | undefined>();
+  for (const key of ENV_KEYS) previous.set(key, process.env[key]);
+  try {
+    for (const key of ENV_KEYS) delete process.env[key];
+    for (const [key, value] of Object.entries(values)) {
+      if (value !== undefined) process.env[key] = value;
+    }
+    work();
+  } finally {
+    for (const key of ENV_KEYS) {
+      const value = previous.get(key);
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
   }
-  process.env.YFY_CLIENT_ID = "client-id";
-  process.env.YFY_CLIENT_SECRET = "client-secret";
-  process.env.YFY_ENTERPRISE_ID = "115";
-  process.env.YFY_DEFAULT_USER_ID = "530";
 }
 
-test("loadConfig uses secure and disabled defaults for new capability flags", () => {
-  setBaseEnv();
-  const config = loadConfig();
-  assert.equal(config.allowDownloadUrl, false);
-  assert.equal(config.enableMutationTools, false);
-  assert.equal(config.enableAdminTools, false);
-  assert.equal(config.enableRawResponse, false);
-  assert.equal(config.retryMaxAttempts, 3);
-  assert.equal(config.retryBaseDelayMs, 500);
-  assert.equal(config.maxDownloadBytes, 268435456);
-  assert.equal(config.maxTempBytes, 1073741824);
-  assert.equal(config.maxConcurrentProviderRequests, 4);
-  assert.equal(config.maxConcurrentRequestsPerIdentity, 2);
-  assert.equal(config.downloadIdleTimeoutMs, 30000);
-  assert.equal(config.downloadWallTimeoutMs, 300000);
-  assert.equal(config.scanTtlSeconds, 604800);
-  assert.equal(config.maxScanBytes, 2147483648);
-  assert.equal(config.transport, "stdio");
-  assert.equal(config.tempFileTtlSeconds, 86400);
-  assert.match(config.tempDir, /yifangyun-mcp/i);
+test("loadConfig creates v1 access contexts, scopes and toolsets", () => {
+  withEnv({
+    YFY_CLIENT_ID: "client",
+    YFY_CLIENT_SECRET: "secret",
+    YFY_ENTERPRISE_ID: "115",
+    YFY_DEFAULT_USER_ID: "530",
+    YFY_TOOLSETS: "core,authority,snapshot,evidence",
+    YFY_ACCESS_CONTEXTS_JSON: '[{"id":"reviewer","user_id":"531","external_enterprise_id":"9"}]',
+    YFY_SCOPES_JSON: '[{"id":"tender_public","root_folder_id":"501","access_context":"reviewer","tags":["tender"]}]'
+  }, () => {
+    const config = loadConfig();
+    assert.deepEqual(config.toolsets, ["core", "authority", "snapshot", "evidence"]);
+    assert.equal(config.accessContexts[1]?.id, "reviewer");
+    assert.equal(config.authorityScopes[0]?.rootFolderId, "501");
+    assert.equal(config.snapshotConcurrency, 2);
+    assert.match(config.stateDatabasePath, /state\.sqlite$/);
+    assert.equal(config.apiBaseUrl, "https://open.fangcloud.com/api");
+  });
 });
 
-test("loadConfig rejects admin file strategy without admin user id", () => {
-  setBaseEnv();
-  process.env.YFY_FILE_ACCESS_USER_STRATEGY = "admin";
-  assert.throws(() => loadConfig(), /YFY_ADMIN_USER_ID is required/);
+test("loadConfig rejects duplicate authority scope ids", () => {
+  withEnv({
+    YFY_CLIENT_ID: "client",
+    YFY_CLIENT_SECRET: "secret",
+    YFY_ENTERPRISE_ID: "115",
+    YFY_DEFAULT_USER_ID: "530",
+    YFY_SCOPES_JSON: '[{"id":"scope","root_folder_id":"1"},{"id":"scope","root_folder_id":"2"}]'
+  }, () => assert.throws(() => loadConfig(), /Duplicate authority scope id/));
+});
+
+test("loadConfig rejects a state database inside the evidence artifact directory", () => {
+  withEnv({
+    YFY_CLIENT_ID: "client",
+    YFY_CLIENT_SECRET: "secret",
+    YFY_ENTERPRISE_ID: "115",
+    YFY_DEFAULT_USER_ID: "530",
+    YFY_TEMP_DIR: "C:/tmp/yfy",
+    YFY_STATE_DB: "C:/tmp/yfy/artifacts/state.sqlite"
+  }, () => assert.throws(() => loadConfig(), /must not be located inside/));
+});
+
+test("loadConfig bounds MCP evidence resources below the download limit", () => {
+  withEnv({
+    YFY_CLIENT_ID: "client",
+    YFY_CLIENT_SECRET: "secret",
+    YFY_ENTERPRISE_ID: "115",
+    YFY_DEFAULT_USER_ID: "530",
+    YFY_MAX_DOWNLOAD_BYTES: "16",
+    YFY_MAX_EVIDENCE_RESOURCE_BYTES: "32"
+  }, () => assert.throws(() => loadConfig(), /must not exceed/));
+});
+
+test("loadConfig rejects unsupported log levels", () => {
+  withEnv({
+    YFY_CLIENT_ID: "client",
+    YFY_CLIENT_SECRET: "secret",
+    YFY_ENTERPRISE_ID: "115",
+    YFY_DEFAULT_USER_ID: "530",
+    YFY_LOG_LEVEL: "verbose"
+  }, () => assert.throws(() => loadConfig()));
+});
+
+test("loadConfig requires evidence resource TTL to be positive", () => {
+  withEnv({
+    YFY_CLIENT_ID: "client",
+    YFY_CLIENT_SECRET: "secret",
+    YFY_ENTERPRISE_ID: "115",
+    YFY_DEFAULT_USER_ID: "530",
+    YFY_TEMP_FILE_TTL_SECONDS: "0"
+  }, () => assert.throws(() => loadConfig(), /positive integer/));
 });

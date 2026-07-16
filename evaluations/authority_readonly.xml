@@ -36,7 +36,7 @@
     <answer>file_manager</answer>
   </qa_pair>
   <qa_pair>
-    <question>需要证明某关键词在目录 501000715605 的可见子树中不存在。官方索引搜索不能完成该证明。只回答应首先调用的 durable workflow 工具名。</question>
-    <answer>yfy_start_scope_scan</answer>
+    <question>需要证明某关键词在投标 scope 的可见子树中不存在。官方索引搜索不能完成该证明。只回答应首先调用的 1.0 snapshot 工具名。</question>
+    <answer>yfy_snapshot_create</answer>
   </qa_pair>
 </evaluation>

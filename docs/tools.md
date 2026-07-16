@@ -1,208 +1,156 @@
 # 工具参考
 
-本文档描述当前 `yifangyun-mcp-server` 的工具分组、默认暴露策略和推荐使用方式。
+## 返回契约
 
-如果你关心“当前到底覆盖了哪些官方 OpenAPI、哪些是部分覆盖、哪些明确不在范围内”，请同时阅读 [OpenAPI 覆盖矩阵](openapi-coverage.md)。
-
-## 返回格式
-
-所有工具统一返回：
+成功时，`structuredContent` 直接是工具领域结果：
 
 ```json
 {
-  "ok": true,
-  "request_succeeded": true,
-  "outcome": "success",
-  "server_version": "0.4.0",
-  "data": {},
-  "meta": {
-    "endpoint": "/api/v2/...",
-    "fetched_at_iso": "2026-07-07T10:00:00.000Z",
-    "fetched_at_unix": 1780000000,
-    "source_api_version": "v2",
-    "status_code": 200,
-    "request_id": "optional",
-    "rate_limit": {
-      "limit": 100,
-      "remaining": 97,
-      "reset_seconds": 12
-    }
-  },
-  "warnings": []
-}
-```
-
-错误时返回：
-
-```json
-{
-  "ok": false,
-  "error": {
-    "message": "错误说明",
-    "retryable": false,
-    "status_code": 403,
-    "details": {}
+  "item": {"id":"10","name":"证书.pdf","type":"file"},
+  "provenance": {
+    "source":"yifangyun_openapi",
+    "observed_at":"2026-07-16T00:00:00.000Z",
+    "access_context":"default"
   }
 }
 ```
 
-## 通用参数
+失败时返回 `isError=true`：
 
-### `user_id`
-
-用于指定文件访问身份。文件、搜索、下载、协作、群组等用户态工具都支持该参数。
-
-未传时按 `YFY_FILE_ACCESS_USER_STRATEGY` 决定默认用户。
-
-### 分页参数
-
-| 参数 | 默认值 | 说明 |
-|---|---:|---|
-| `page_id` | `0` | 亿方云接口页码，从 0 开始 |
-| `page_capacity` | `50` | 请求页容量，会受 `YFY_MAX_PAGE_CAPACITY` 限制 |
-
-## 默认只读工具
-
-### Durable Discovery Workflow
-
-| Tool | 说明 |
-|---|---|
-| `yfy_start_scope_scan` | 初始化或复用 identity-scoped 持久化扫描 |
-| `yfy_advance_scope_scan` | 按页数和 wall time 预算推进，使用 revision 做 CAS |
-| `yfy_get_scope_scan` | 查询状态、frontier、完整性和 observation window |
-| `yfy_cancel_scope_scan` | 显式取消 durable scan |
-| `yfy_search_scope_snapshot` | 对已落盘 page artifacts 做多关键词搜索 |
-| `yfy_list_scope_scan_matches` | 使用 scan policy 中保存的 query set 列出命中 |
-| `yfy_list_scope_snapshot_items` | 通过 offset/limit 分页读取 snapshot items |
-
-`pagination_complete=true` 只表示该访问身份在 observation window 内完成了策略范围内的分页观察。`safe_to_claim_absence=true` 仍限定为 `within_observed_accessible_scope`，不代表 Provider 提供强一致快照隔离。
-
-### 基础与组织
-
-| Tool | 说明 |
-|---|---|
-| `yfy_auth_test` | 验证企业 JWT、用户 JWT、基础接口 |
-| `yfy_get_user_info` | 获取当前用户基础信息 |
-| `yfy_get_department_info` | 获取部门详情 |
-| `yfy_list_department_children` | 获取子部门 |
-| `yfy_list_department_users` | 获取部门成员 |
-
-### 文件与搜索基线
-
-| Tool | 说明 |
-|---|---|
-| `yfy_list_personal_items` | 个人空间首层文件/文件夹 |
-| `yfy_list_department_folders` | 部门首层文件夹 |
-| `yfy_list_folder_children` | 文件夹单层 children |
-| `yfy_search_items_recursive` | 基于 children 分页的有界递归名称搜索 |
-| `yfy_search_items` | 官方搜索包装 |
-| `yfy_search_items_advanced` | 同一官方搜索端点的增强包装 |
-| `yfy_get_file_info` | 文件元信息 |
-| `yfy_get_file_info_full` | richer file metadata |
-| `yfy_get_folder_info` | 文件夹元信息 |
-
-说明：`yfy_search_items_recursive` 不是 `/v2/item/search` 的直包，而是基于 `/v2/folder/{id}/children` 的分页递归能力，只在已知 `root_folder_id` 的前提下对子树后代名称做搜索。直接 children 记为深度 1，所以 `max_depth=0` 仍会扫描 root 的直接 children。结果完整性受 `max_depth`、`max_items`、`max_results` 与 `page_capacity` 共同约束。
-
-### Authority 工具
-
-| Tool | 说明 |
-|---|---|
-| `yfy_get_file_versions` | 获取文件版本列表 |
-| `yfy_get_file_version_info` | 获取指定版本信息 |
-| `yfy_get_folder_ancestors` | 获取文件夹祖先链 |
-| `yfy_get_file_ancestors` | 获取文件祖先链 |
-| `yfy_assert_file_in_scope` | 断言文件是否属于某 root folder |
-| `yfy_get_file_scope_membership` | 查询文件 scope membership，允许返回 `in_scope=false` |
-| `yfy_validate_authority_root` | 组合 folder、department chain 和可达性校验 |
-| `yfy_build_scope_snapshot` | 构建 flat snapshot |
-| `yfy_list_folder_tree` | 扁平化递归目录树 |
-| `yfy_batch_get_file_info` | 批量获取文件详情 |
-| `yfy_resolve_path` | 通过目录遍历解析 path |
-| `yfy_verify_file_current_version` | 校验当前元数据是否与预期一致 |
-| `yfy_lock_current_original` | scope proof + metadata + temp_path + sha256 |
-
-### 协作与分享
-
-| Tool | 说明 |
-|---|---|
-| `yfy_get_share_links` | 文件/文件夹分享链接列表 |
-| `yfy_get_comments` | 文件评论列表 |
-| `yfy_list_collab_items` | 与我协作的文件夹 |
-| `yfy_get_folder_collabs` | 文件夹协作成员 |
-| `yfy_list_groups` | 公司可见群组 |
-| `yfy_get_group_users` | 群组成员 |
-| `yfy_get_user_by_query` | 企业用户搜索 |
-
-### 本地原件落地
-
-| Tool | 说明 |
-|---|---|
-| `yfy_download_file_to_temp` | 下载到本地 temp 目录 |
-| `yfy_download_and_hash` | 下载并返回 `sha256 + size_bytes + temp_path` |
-
-## 受控敏感工具
-
-### 下载链接工具
-
-仅当 `YFY_ALLOW_DOWNLOAD_URL=enabled` 时注册：
-
-| Tool | 说明 |
-|---|---|
-| `yfy_get_download_url` | 返回预签名 `download_url` |
-
-## 受控 Mutation 工具
-
-仅当 `YFY_ENABLE_MUTATION_TOOLS=enabled` 时注册：
-
-| Tool | 说明 |
-|---|---|
-| `yfy_create_folder` | 创建文件夹 |
-| `yfy_update_file` | 更新文件名称/描述 |
-| `yfy_update_folder` | 更新文件夹名称/描述 |
-| `yfy_move_item` | 移动文件/文件夹 |
-| `yfy_copy_item` | 复制文件/文件夹 |
-| `yfy_delete_item` | 删除到回收站或彻底删除 |
-| `yfy_restore_item` | 从回收站恢复 |
-| `yfy_upload_file` | 本地文件上传到指定 folder |
-| `yfy_upload_file_by_path` | 本地文件上传到指定 path |
-| `yfy_upload_new_version` | 上传新版本 |
-| `yfy_manage_collab` | 协作 invite/update/delete/remove |
-
-## 受控 Admin 工具
-
-仅当 `YFY_ENABLE_ADMIN_TOOLS=enabled` 时注册：
-
-| Tool | 说明 |
-|---|---|
-| `yfy_admin_departments` | admin 部门相关 action wrapper |
-| `yfy_admin_groups` | admin 群组相关 action wrapper |
-| `yfy_admin_users` | admin 用户相关 action wrapper |
-| `yfy_admin_logs` | admin 日志相关 action wrapper |
-| `yfy_admin_sync` | 平台同步与 mapping wrapper |
-
-## 推荐使用顺序
-
-### 找文件并锁原件
-
-```text
-1. 精确相对路径 -> yfy_resolve_path；已知 folder scope 且希望走官方索引 -> yfy_search_items(search_in_folder=...)；已知 root_folder_id 且需要对子树后代名称做有界递归搜索 -> yfy_search_items_recursive；否则 -> yfy_search_items
-2. yfy_get_file_info_full
-3. yfy_assert_file_in_scope
-4. yfy_lock_current_original
+```json
+{
+  "error": {
+    "code":"YFY_PERMISSION_DENIED",
+    "message":"Permission denied.",
+    "retryable":false,
+    "phase":"provider_request",
+    "suggested_action":"..."
+  }
+}
 ```
 
-### 做目录快照
+全部工具都声明具体 `outputSchema`，MCP 客户端可以验证 `structuredContent` 的稳定顶层字段和类型。不存在 `ok`、`request_succeeded`、`outcome`、`server_version` 和 `raw` 字段。
 
-```text
-1. yfy_get_folder_info
-2. yfy_build_scope_snapshot
-3. yfy_batch_get_file_info (按需回源)
+## 分页
+
+直接暴露分页的领域工具统一接收 0-based `page_id` 和 `page_capacity`，并返回统一 `page` 对象：
+
+```json
+{
+  "page": {
+    "page_id": 0,
+    "page_capacity": 50,
+    "page_count": 3,
+    "total_count": 124,
+    "has_more": true,
+    "next_page_id": 1
+  }
+}
 ```
 
-### 做受控上传
+`page_count`、`total_count` 和 `next_page_id` 在 Provider 无法提供时可以省略；`page_id`、`page_capacity` 和 `has_more` 始终存在。Agent 应优先使用 `has_more` 和 `next_page_id`。Snapshot 查询使用签名 cursor，不使用 page number。
 
-```text
-1. 开启 YFY_ENABLE_MUTATION_TOOLS=enabled
-2. yfy_upload_file / yfy_upload_new_version
-3. yfy_get_file_info_full 或 yfy_get_file_versions 校验结果
+## Core
+
+| 工具 | 说明 |
+|---|---|
+| `yfy_connection_check` | 实际验证企业和 user token |
+| `yfy_context_get` | 查看运行时可用的 context、scope 和 toolset |
+| `yfy_item_get` | 文件、文件版本、文件夹元数据；`view=summary/evidence/full` |
+| `yfy_items_get` | 最多 100 个文件的批量元数据 |
+| `yfy_folder_list` | 一页直接子项，不递归 |
+| `yfy_item_search` | 官方索引候选发现，永远是 hint-only |
+| `yfy_path_resolve` | 分页逐层解析精确路径 |
+| `yfy_file_versions` | 文件版本列表 |
+| `yfy_file_comments` | 评论列表 |
+| `yfy_share_list` | 分享元数据，URL 和密码始终脱敏 |
+
+## Authority
+
+| 工具 | 说明 |
+|---|---|
+| `yfy_authority_validate` | 验证命名 scope、业务路径和分页可达性 |
+| `yfy_scope_check` | `mode=query` 返回 `in_scope=false`；`mode=assert` 返回业务错误 |
+
+## Snapshot
+
+| 工具 | 说明 |
+|---|---|
+| `yfy_snapshot_create` | 创建或复用后台快照，Agent 不管理 revision |
+| `yfy_snapshot_get` | 状态、计数、观察窗口、完整性、artifact URI |
+| `yfy_snapshot_query` | `mode=search/list`，直接查询 SQLite 索引；有后续结果时返回 opaque `next_cursor` |
+| `yfy_snapshot_cancel` | 取消后台任务 |
+
+`yfy_snapshot_create` 只接受命名 `scope_id`。根目录和访问身份由已配置的 Authority Scope 派生，Agent 不能直接指定任意根目录。
+
+续页时原样回传 `next_cursor` 到 `cursor`。Cursor 使用服务端签名，并绑定 snapshot、revision、mode、item type 和查询词；Agent 不需要解析内部排序键，深页查询不会随已跳过行数线性变慢。后台扫描使 revision 变化时会返回 `YFY_SNAPSHOT_CURSOR_STALE`，此时从无 cursor 的第一页重新查询。
+
+超过 100,000 项的 Snapshot 要求每个查询词至少 3 个字符，并限制单次最多 10 个查询词，以确保使用 trigram 索引而不是阻塞式全表子串扫描。
+
+Snapshot 在每页原子提交时增量维护完整 receipt digest；manifest 最多内嵌前 1000 条 receipt，并通过 `receipt_count` 和 `receipts_truncated` 标记总量与截断状态。
+
+典型完整性结果：
+
+```json
+{
+  "pagination_complete": true,
+  "safe_to_claim_absence": true,
+  "scope": "within_observed_accessible_scope",
+  "consistency_level": "best_effort_complete_observation",
+  "incomplete_reasons": []
+}
 ```
+
+## Evidence
+
+| 工具 | 说明 |
+|---|---|
+| `yfy_evidence_capture` | `download` 或 `current_locked`；返回本地路径和短期 Evidence resource link |
+| `yfy_evidence_verify` | 验证 SHA-1、SHA-256、size、modified time 和 version key |
+
+`current_locked` 要求 `scope_id`，并执行：范围证明、当前版本固定、下载、SHA-1/SHA-256、下载后元数据和范围复核。
+
+远程 HTTP Agent 应读取结果中的 `resource_uri` / `resource_link`，HTTP 结果不暴露服务器 `temp_path`；stdio 客户端仍可使用本地路径。超过 `YFY_MAX_EVIDENCE_RESOURCE_BYTES` 的结果不会注册 resource，并通过 `resource_omitted` 说明原因。
+
+## Organization
+
+| 工具 | 说明 |
+|---|---|
+| `yfy_space_list` | personal、collaboration、department 空间 |
+| `yfy_department_read` | get、children、users |
+| `yfy_user_search` | 企业用户搜索 |
+| `yfy_group_read` | group list 或 users |
+
+## Mutation
+
+| 工具 | 说明 |
+|---|---|
+| `yfy_folder_create` | 创建文件夹 |
+| `yfy_item_mutate` | update、move、copy、trash、delete_permanently、restore |
+| `yfy_file_upload` | folder ID 或 path 上传 |
+| `yfy_file_version_upload` | 上传新版本 |
+
+## Collaboration
+
+| 工具 | 说明 |
+|---|---|
+| `yfy_collaboration_read` | list_folder 或 get |
+| `yfy_collaboration_mutate` | invite、invite_batch、update_role、delete、remove_batch |
+
+## Admin
+
+管理员能力按领域组合，避免 35 个浅工具：
+
+- `yfy_admin_department_read`
+- `yfy_admin_department_mutate`
+- `yfy_admin_group_read`
+- `yfy_admin_group_mutate`
+- `yfy_admin_user_read`
+- `yfy_admin_user_mutate`
+- `yfy_admin_log_query`
+- `yfy_admin_platform_map`
+- `yfy_admin_platform_sync`
+
+## Transfer
+
+`yfy_transfer_ticket_get` 返回短时下载 URL，仅在 `transfer` toolset 开启时注册。常规 Evidence 工作流不需要开启它。

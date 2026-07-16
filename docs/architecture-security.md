@@ -1,190 +1,130 @@
 # 架构与安全
 
-本文档说明 `yifangyun-mcp-server` 当前的架构设计、安全默认值与边界策略。
-
-## 架构总览
+## Runtime
 
 ```text
-MCP Client
-  |
-  v
-yifangyun-mcp-server
-  |
-  |-- src/index.ts
-  |     |-- 创建 McpServer
-  |     |-- 使用 StdioServerTransport 或 StreamableHTTPServerTransport
-  |
-  |-- src/config.ts
-  |     |-- 读取环境变量
-  |     |-- 校验 URL、ID、能力开关、运行保护参数
-  |
-  |-- src/client.ts
-  |     |-- 生成 JWT assertion
-  |     |-- enterprise/user token 缓存和提前刷新
-  |     |-- GET/POST JSON 请求
-  |     |-- GET/list 的 429/5xx jitter 退避；非幂等 POST 不重试
-  |     |-- token singleflight 与 Provider 并发调度
-  |     |-- 下载到 temp 并计算 sha256
-  |     |-- 本地文件上传到 presign_url
-  |
-  |-- src/tools/registerTools.ts
-        |-- 注册默认只读 authority 工具
-        |-- 按开关注册 mutation/admin 工具
-        |-- 输出裁剪、workflow 组合、统一返回 envelope
-  |
-  |-- src/scan/
-  |     |-- durable scan state、frontier、revision/CAS
-  |     |-- 独立 page artifacts 与 receipts
-  |     |-- 恢复、取消、多关键词 snapshot search
-  |
-  |-- src/tools/registerWorkflowTools.ts
-        |-- authority root、durable discovery、batch scope assertion
+MCP Transport
+  -> Tool Catalog
+    -> Core / Authority / Snapshot / Evidence / Organization
+    -> Optional Collaboration / Mutation / Admin / Transfer
+      -> AppRuntime
+        -> AccessRegistry
+        -> YifangyunGateway
+          -> YifangyunClient
+        -> SnapshotService
+          -> ScopeScanEngine
+          -> SqliteScopeScanStore
 ```
 
-核心原则：
+`AppRuntime` 在进程启动时创建一次。stdio 和所有 HTTP 请求共享：
 
-1. **OpenAPI-first**：优先封装官方公开路径
-2. **默认最小暴露**：敏感下载 URL、mutation、admin 默认不注册
-3. **authority 优先**：优先支持 `metadata + ancestry + versions + download+hash`
+- OAuth token cache 和 singleflight
+- Provider 并发调度器
+- AccessRegistry
+- SnapshotService 后台 worker
+- SQLite connection
+- metrics
 
-## 认证流程
+MCP Server 和 HTTP transport 可以按请求创建，但不重新创建业务 Runtime。
 
-亿方云企业 JWT 模式：
+## Interface 与 Provider Adapter
 
-```text
-client_id + client_secret
-  |
-  |-- Basic Authorization
-  v
-JWT assertion payload
-  |
-  |-- base64(JSON)
-  v
-POST /oauth/token?grant_type=jwt_simple&assertion=...
-  |
-  v
-enterprise / user access_token
-```
+Tool Catalog 只暴露稳定领域模型。Provider 路径、参数、分页和字段差异集中在 Gateway、Client 和 projector 中。
 
-服务按以下维度缓存 token：
+不提供 raw response 开关。未知 Provider 字段不会自动泄漏到 Agent 上下文。
 
-```text
-enterprise:<enterprise_id>
-user:<user_id>
-```
+## 身份
 
-## 权限边界
+`access_context` 是 Agent 接口。它解析为：
 
-| 能力 | Token | 原因 |
-|---|---|---|
-| 部门、管理员、同步、日志 | 企业 token | 组织管理平面 |
-| 文件夹、文件、搜索、版本、下载、协作 | 用户 token | 云盘访问平面 |
+- user ID
+- 可选 external enterprise ID
+- HMAC identity ref
 
-管理员账号只是一个拥有更大云盘权限的用户账号，不等同于企业 token。
+identity ref 用于 snapshot 访问隔离和本地 evidence 目录命名，不包含原始凭据。
 
-## 安全默认值
+当前 HTTP 部署仍是单配置主体模型：一个 MCP Server 进程使用一套企业凭据和静态 context 注册表。它不是面向不可信多租户的 OAuth delegation server。
 
-| 开关 | 默认值 | 影响 |
-|---|---:|---|
-| `YFY_ALLOW_DOWNLOAD_URL` | `disabled` | 不注册 `yfy_get_download_url` |
-| `YFY_ENABLE_MUTATION_TOOLS` | `disabled` | 不注册写工具 |
-| `YFY_ENABLE_ADMIN_TOOLS` | `disabled` | 不注册 admin 工具 |
-| `YFY_ENABLE_RAW_RESPONSE` | `disabled` | 不把原始响应体透给调用方 |
+## Snapshot
 
-## 下载安全策略
+SnapshotService 在后台自动推进 Provider 分页。Agent 不管理 revision、CAS 或 page checkpoint。
 
-当前优先推荐：
+SQLite 表：
 
-- `yfy_download_file_to_temp`
-- `yfy_download_and_hash`
-- `yfy_lock_current_original`
+- `snapshots`
+- `snapshot_pages`
+- `snapshot_items`
+- `snapshot_seen_items`
+- `snapshot_frontier`
+- `snapshot_items_fts`
+- `snapshot_storage`
 
-原因：
+启用 WAL、外键、事务和 busy timeout。`snapshot_seen_items` 提供持久化全局判重；`snapshot_frontier` 将 FIFO cursor 独立持久化，避免宽树每页重写完整 state JSON；`snapshot_items_fts` 为 3 字符以上查询提供 trigram 子串索引；`snapshot_storage` 同时参考增量逻辑字节和 SQLite 活动页/WAL 大小。页面事务提交前会按序列化增量预留 FTS、索引和 WAL 写放大空间。每个 page receipt、item index、seen index、frontier 变更和 state checkpoint 在同一事务中提交。
 
-1. `download_url` 本身是敏感的短期访问凭据
-2. 对证据链来说，`temp_path + sha1 + sha256 + size_bytes + metadata` 更有价值
-3. 服务端可以在不暴露 URL 的前提下完成下载与哈希
+Provider I/O 使用有界并发抓取。正式结果由单一提交器按 FIFO canonical order 串行提交；请求完成顺序不会改变截断点、重复项胜者或 receipt 顺序。状态和局部索引查询不等待慢 Provider 请求，取消会先传播 AbortSignal，再写入 durable 终态。
 
-下载保护包括：
+文件型 SQLite 使用同主机进程锁，第二个进程不能同时打开同一个 `YFY_STATE_DB`。
 
-- `YFY_MAX_DOWNLOAD_BYTES` 大小限制
-- `YFY_TEMP_DIR` 本地落地目录
-- `YFY_TEMP_FILE_TTL_SECONDS` 过期清理
-- 对 `download_url` / `presign_url` 的日志脱敏
-- HTTPS/private-address URL 校验、idle/wall timeout、temp 总配额
-- 下载前后 metadata、version、path 和 scope 漂移复核
+Snapshot 可检测：
 
-## 写操作策略
+- 分页元数据缺失
+- 空页面但还有下一页
+- page loop
+- 重复 ID 和元数据冲突
+- 目录循环
+- 深度或数量上限
+- 权限变化
+- Provider 错误
+- 根目录观察漂移
 
-写操作通过官方 OpenAPI 路径完成，但默认不注册。包括：
+`safe_to_claim_absence` 只适用于 observation window 内、当前 access context 可访问并完成分页的范围。
 
-- create / update / move / copy / delete / restore
-- upload / upload_by_path / upload_new_version
-- collab mutations
-- admin department/group/user/log/sync wrappers
+## Evidence
 
-开启前建议：
+Evidence capture 默认不返回下载 URL。Provider URL 只在服务内部使用。
 
-```text
-YFY_ENABLE_MUTATION_TOOLS=enabled
-YFY_ENABLE_ADMIN_TOOLS=enabled
-```
+安全措施：
 
-## 上传策略
+- HTTPS 校验
+- DNS 解析后私网地址拦截
+- idle 和 wall timeout
+- 单文件和 temp 总配额
+- 并发下载预留配额；缺少 `Content-Length` 时按单文件上限预留
+- identity 隔离目录
+- `0600/0700` 权限尝试
+- SHA-1 和 SHA-256
+- MIME 嗅探
+- TTL 清理
+- drift 时删除候选文件
 
-上传采用官方推荐的两段式流程：
+成功 Evidence 在大小不超过 `YFY_MAX_EVIDENCE_RESOURCE_BYTES` 时注册随机、短期 `yfy://evidence/{token}` resource。读取 resource 会在分配内存前再次校验文件大小。stdio 调用方可使用 `temp_path`；HTTP 输出移除服务器绝对路径，远程调用方应读取 resource link，超限结果包含 `resource_omitted`。`transfer` toolset 是唯一直接返回 Provider 下载 URL 的接口。
 
-```text
-1. 调 OpenAPI 获取 presign_url
-2. 使用本地文件内容上传到该 presign_url
-```
+## HTTP
 
-当前实现优先尝试：
+Streamable HTTP 使用内存型 stateful session transport，`POST`、SSE `GET`、session `DELETE` 和取消通知按 `mcp-session-id` 路由。非回环监听必须配置：
 
-1. `PUT` 原始二进制
-2. 若失败，再回退到 `POST multipart/form-data`
+- Bearer Token
+- Host 白名单
+- Origin 白名单
 
-这样做是为了兼容官方文档中“获取 presign_url 后再上传”的契约，同时尽量适配不同部署网关。
+Session 数量由 `YFY_HTTP_MAX_SESSIONS` 限制，无活动请求的 session 超过 `YFY_HTTP_SESSION_IDLE_SECONDS` 后自动关闭。
 
-## 输出裁剪策略
+本地文件上传属于显式高权限能力，所有源路径必须位于 `YFY_UPLOAD_ROOT_DIR` 内，HTTP 和 stdio 结果均不回显服务器绝对源路径。
 
-默认输出会优先保留：
+Bearer 使用 timing-safe compare。Express 禁用 `X-Powered-By`。进程处理 SIGINT/SIGTERM 时停止 HTTP 接受请求、等待 snapshot worker 结束并关闭 SQLite。
 
-- id / parent / path_chain / ancestor_folder_ids
-- created_at / modified_at 的 unix + ISO 双字段
-- ownership / modified_by
-- size / sha1 / file_version_key
-- workflow 所需的关键结构
+## Provider 请求
 
-默认不回传完整原始响应体，除非显式开启 `YFY_ENABLE_RAW_RESPONSE=enabled`。
+- GET/list：429/5xx jitter retry，支持 Retry-After
+- POST：默认不重试
+- OAuth：singleflight 和提前刷新
+- 全局并发限制
+- identity/endpoint bucket 并发限制
+- AbortSignal 和 wall timeout
+- 稳定 `YFY_*` 错误码
 
-## 限流与错误处理
+## 生产边界
 
-客户端统一处理：
+SQLite 适合同一主机、单写入进程。多个 MCP 进程不得同时把同一个 SQLite 文件放在不支持文件锁的网络文件系统上。
 
-- 请求超时
-- 401 / 403 / 404 语义化错误
-- 429 / 5xx 自动退避
-- 统一返回 `request_id` 和 `rate_limit` 元数据（若服务端提供）
-- 稳定的 `YFY_*` 错误码、phase、retryable 和 suggested_action
-
-## Durable Scope Scan
-
-每个 Provider page 会写入独立 artifact，再提交小型 state checkpoint。`expected_revision` 用于防止并发旧写覆盖新进度。扫描结果只声明 observation window 内、当前 access identity 可见范围中的完整性；目录漂移、权限变化、深度/数量上限和分页异常都会关闭 `safe_to_claim_absence`。
-
-当前文件型 store 面向单机 stdio 或单实例 HTTP。多实例部署应在保持 store 接口不变的前提下替换为 SQLite/PostgreSQL 等具备跨进程事务的实现。
-
-## 已知边界
-
-| 边界 | 说明 |
-|---|---|
-| transport | 默认 stdio；可显式启用受 Host/Origin/Bearer 保护的 Streamable HTTP |
-| OpenAPI 依赖 | 以官方公开 OpenAPI 为准；私有化部署返回字段可能有轻微差异 |
-| 上传兼容性 | presign_url 二段上传已实现，但不同存储网关的细节仍建议实测 |
-| temp 文件 | 下载原件会落本地临时目录，运维需关注磁盘配额 |
-
-## 后续建议
-
-1. 若要远程共享部署，下一步优先补 `Streamable HTTP` transport
-2. 若要更强审计，增加独立 audit sink，而不是只依赖 MCP 客户端日志
-3. 若要进一步追求 OpenAPI 完整覆盖，可按当前 action-wrapper 模式继续扩展 share-link 与 review 相关接口
+需要真正多租户或跨区域水平扩展时，应实现独立的 PostgreSQL SnapshotRepository 和请求主体认证 adapter。

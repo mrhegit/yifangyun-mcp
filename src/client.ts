@@ -2,10 +2,14 @@ import crypto from "node:crypto";
 import dns from "node:dns";
 import fs from "node:fs";
 import { promises as fsp } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import net from "node:net";
+import type { LookupFunction } from "node:net";
 import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { Agent, fetch as undiciFetch } from "undici";
+import type { RequestInit as UndiciRequestInit } from "undici";
 import type {
   ApiJsonResponse,
   ApiResponseMeta,
@@ -27,6 +31,9 @@ interface ApiTokenRequest {
   subjectId: IdLike;
 }
 
+type TransferFetch = (url: string, init: RequestInit & { dispatcher: Agent }) => Promise<Response>;
+type DnsLookup = typeof dns.lookup;
+
 interface RequestJsonOptions {
   body?: JsonValue;
   method: "GET" | "POST";
@@ -47,7 +54,9 @@ interface RawRequestResult {
 interface DownloadOptions {
   fileNameHint: string;
   namespace?: string;
+  onProgress?: (bytes: number, totalBytes?: number) => void;
   retry?: boolean;
+  signal?: AbortSignal;
 }
 
 export class YifangyunError extends Error {
@@ -86,21 +95,85 @@ export class YifangyunError extends Error {
   }
 }
 
+export function createTransferLookup(allowPrivateTransferUrls: boolean, lookup: DnsLookup = dns.lookup): LookupFunction {
+  return (hostname, options, callback) => {
+    lookup(hostname, { ...options, all: true }, (error, addresses) => {
+      if (error) {
+        callback(error, []);
+        return;
+      }
+      if (!allowPrivateTransferUrls && addresses.some((entry) => isPrivateAddress(entry.address))) {
+        const rejected = Object.assign(new Error("Provider transfer URL resolved to a private network address."), { code: "YFY_TRANSFER_URL_PRIVATE_ADDRESS" });
+        callback(rejected, []);
+        return;
+      }
+      if (options.all) {
+        callback(null, addresses);
+        return;
+      }
+      const selected = addresses[0];
+      if (!selected) {
+        callback(Object.assign(new Error("Provider transfer hostname did not resolve."), { code: "ENOTFOUND" }), "", 0);
+        return;
+      }
+      callback(null, selected.address, selected.family);
+    });
+  };
+}
+
+function waitForSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    return Promise.reject(new YifangyunError("Yifangyun request was cancelled.", { code: "YFY_REQUEST_CANCELLED", phase: "provider_auth" }));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const cancel = () => reject(new YifangyunError("Yifangyun request was cancelled.", { code: "YFY_REQUEST_CANCELLED", phase: "provider_auth" }));
+    signal.addEventListener("abort", cancel, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", cancel));
+  });
+}
+
 class Semaphore {
   private active = 0;
-  private readonly waiters: Array<() => void> = [];
+  private readonly waiters: Array<{ reject: (error: unknown) => void; resolve: (release: () => void) => void; signal?: AbortSignal }> = [];
 
   constructor(private readonly limit: number) {}
 
-  async acquire(): Promise<() => void> {
-    if (this.active >= this.limit) {
-      await new Promise<void>((resolve) => this.waiters.push(resolve));
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted) {
+      throw new YifangyunError("Yifangyun request was cancelled while waiting for concurrency capacity.", { code: "YFY_REQUEST_CANCELLED", phase: "provider_queue" });
     }
-    this.active += 1;
-    return () => {
+    if (this.active < this.limit) {
+      this.active += 1;
+      return () => this.release();
+    }
+    return new Promise<() => void>((resolve, reject) => {
+      let waiter: { reject: (error: unknown) => void; resolve: (release: () => void) => void; signal?: AbortSignal };
+      const cancel = () => {
+        const index = this.waiters.indexOf(waiter);
+        if (index >= 0) this.waiters.splice(index, 1);
+        reject(new YifangyunError("Yifangyun request was cancelled while waiting for concurrency capacity.", { code: "YFY_REQUEST_CANCELLED", phase: "provider_queue" }));
+      };
+      signal?.addEventListener("abort", cancel, { once: true });
+      waiter = {
+        reject,
+        ...(signal ? { signal } : {}),
+        resolve: (release) => {
+          signal?.removeEventListener("abort", cancel);
+          resolve(release);
+        }
+      };
+      this.waiters.push(waiter);
+    });
+  }
+
+  private release(): void {
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter.resolve(() => this.release());
+    } else {
       this.active -= 1;
-      this.waiters.shift()?.();
-    };
+    }
   }
 }
 
@@ -192,8 +265,21 @@ function parseRateLimit(headers: Headers): RateLimitMeta | undefined {
   return Object.keys(output).length ? output : undefined;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(new YifangyunError("Yifangyun request was cancelled.", { code: "YFY_REQUEST_CANCELLED", phase: "provider_retry" }));
+  }
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener("abort", cancel);
+      resolve();
+    }, ms);
+    const cancel = () => {
+      clearTimeout(timeout);
+      reject(new YifangyunError("Yifangyun request was cancelled.", { code: "YFY_REQUEST_CANCELLED", phase: "provider_retry" }));
+    };
+    signal?.addEventListener("abort", cancel, { once: true });
+  });
 }
 
 function sanitizeFileName(value: string): string {
@@ -272,42 +358,40 @@ export function redactSensitiveText(text: string): string {
 }
 
 export class YifangyunClient {
+  private readonly cleanupTimer: NodeJS.Timeout;
   private lastTempPruneAt = 0;
   private readonly bucketSemaphores = new Map<string, Semaphore>();
   private readonly requestSemaphore: Semaphore;
+  private readonly transferDispatcher: Agent;
+  private readonly tempCapacitySemaphore = new Semaphore(1);
+  private reservedTempBytes = 0;
   private readonly tokenCache = new Map<string, TokenRecord>();
   private readonly tokenInflight = new Map<string, Promise<TokenRecord>>();
 
-  constructor(private readonly config: AppConfig) {
+  constructor(private readonly config: AppConfig, private readonly transferFetch: TransferFetch = (url, init) => undiciFetch(url, init as UndiciRequestInit) as unknown as Promise<Response>) {
     this.requestSemaphore = new Semaphore(Math.max(1, config.maxConcurrentProviderRequests ?? 4));
-    const cleanupTimer = setInterval(() => void this.pruneExpiredTempFiles(), 60000);
-    cleanupTimer.unref();
+    this.transferDispatcher = new Agent({
+      connect: { lookup: createTransferLookup(Boolean(config.allowPrivateTransferUrls)) }
+    });
+    this.cleanupTimer = setInterval(() => void this.pruneExpiredTempFiles(), 60000);
+    this.cleanupTimer.unref();
   }
 
-  async getEnterpriseToken(): Promise<string> {
-    return this.getToken({ subjectType: "enterprise", subjectId: this.config.enterpriseId });
+  close(): void {
+    clearInterval(this.cleanupTimer);
+    void this.transferDispatcher.close();
   }
 
-  async getUserToken(userId?: IdLike): Promise<string> {
-    return this.getToken({ subjectType: "user", subjectId: userId ?? this.config.defaultUserId });
+  async getEnterpriseToken(signal?: AbortSignal): Promise<string> {
+    return this.getToken({ subjectType: "enterprise", subjectId: this.config.enterpriseId }, signal);
+  }
+
+  async getUserToken(userId?: IdLike, signal?: AbortSignal): Promise<string> {
+    return this.getToken({ subjectType: "user", subjectId: userId ?? this.config.defaultUserId }, signal);
   }
 
   resolveFileAccessUser(userId?: IdLike): IdLike {
-    if (userId !== undefined) {
-      return userId;
-    }
-    if (this.config.fileAccessUserStrategy === "explicit") {
-      throw new YifangyunError("This server requires an explicit user_id for file access tools.", {
-        details: { suggestion: "Pass user_id, or change YFY_FILE_ACCESS_USER_STRATEGY to default/admin." }
-      });
-    }
-    if (this.config.fileAccessUserStrategy === "admin") {
-      if (this.config.adminUserId === undefined) {
-        throw new YifangyunError("Admin file access strategy is enabled but YFY_ADMIN_USER_ID is not configured.");
-      }
-      return this.config.adminUserId;
-    }
-    return this.config.defaultUserId;
+    return userId ?? this.config.defaultUserId;
   }
 
   resolveAccessIdentityRef(userId?: IdLike, externalEnterpriseId?: IdLike): string {
@@ -319,26 +403,29 @@ export class YifangyunClient {
       .slice(0, 24);
   }
 
-  async getEnterprise(pathname: string, params: Record<string, string | number | boolean | undefined> = {}): Promise<ApiJsonResponse> {
+  async getEnterprise(pathname: string, params: Record<string, string | number | boolean | undefined> = {}, signal?: AbortSignal): Promise<ApiJsonResponse> {
     return this.apiJsonRequest(pathname, {
       method: "GET",
       params,
       retry: true,
-      token: await this.getEnterpriseToken()
+      signal,
+      token: await this.getEnterpriseToken(signal)
     });
   }
 
   async postEnterprise(
     pathname: string,
     body: JsonValue,
-    params: Record<string, string | number | boolean | undefined> = {}
+    params: Record<string, string | number | boolean | undefined> = {},
+    signal?: AbortSignal
   ): Promise<ApiJsonResponse> {
     return this.apiJsonRequest(pathname, {
       body,
       method: "POST",
       params,
       retry: false,
-      token: await this.getEnterpriseToken()
+      signal,
+      token: await this.getEnterpriseToken(signal)
     });
   }
 
@@ -354,7 +441,7 @@ export class YifangyunClient {
       params,
       retry: true,
       signal,
-      token: await this.getUserToken(resolvedUserId)
+      token: await this.getUserToken(resolvedUserId, signal)
     });
   }
 
@@ -362,7 +449,8 @@ export class YifangyunClient {
     pathname: string,
     userId: IdLike | undefined,
     body: JsonValue,
-    params: Record<string, string | number | boolean | undefined> = {}
+    params: Record<string, string | number | boolean | undefined> = {},
+    signal?: AbortSignal
   ): Promise<ApiJsonResponse> {
     const resolvedUserId = this.resolveFileAccessUser(userId);
     return this.apiJsonRequest(pathname, {
@@ -370,18 +458,19 @@ export class YifangyunClient {
       method: "POST",
       params,
       retry: false,
-      token: await this.getUserToken(resolvedUserId)
+      signal,
+      token: await this.getUserToken(resolvedUserId, signal)
     });
   }
 
   async downloadFromUrlToTemp(url: string, options: DownloadOptions): Promise<DownloadedFile> {
     const downloadStartedAt = Date.now();
     await this.validateTransferUrl(url);
-    await this.pruneExpiredTempFiles();
-    const targetDir = await this.ensureTempDir(options.namespace);
     const result = await this.rawRequest(url, { method: "GET" }, {
       retry: options.retry ?? true,
-      timeoutMs: this.config.downloadWallTimeoutMs ?? 300000
+      signal: options.signal,
+      timeoutMs: this.config.downloadWallTimeoutMs ?? 300000,
+      transfer: true
     });
     const contentLength = Number(result.response.headers.get("content-length") ?? "0");
     if (contentLength > 0 && contentLength > this.config.maxDownloadBytes) {
@@ -392,11 +481,21 @@ export class YifangyunClient {
         details: { content_length: contentLength, max_download_bytes: this.config.maxDownloadBytes }
       });
     }
+    let reservation: { bytes: number; release: () => Promise<void> };
     try {
-      await this.ensureTempCapacity(contentLength > 0 ? contentLength : 0);
+      reservation = await this.reserveTempCapacity(contentLength > 0 ? contentLength : undefined, options.signal);
     } catch (error) {
       await result.response.body?.cancel().catch(() => undefined);
       result.cleanup();
+      throw error;
+    }
+    let targetDir: string;
+    try {
+      targetDir = await this.ensureTempDir(options.namespace);
+    } catch (error) {
+      await result.response.body?.cancel().catch(() => undefined);
+      result.cleanup();
+      await reservation.release();
       throw error;
     }
 
@@ -422,9 +521,18 @@ export class YifangyunClient {
       transform: (chunk, _encoding, callback) => {
         resetIdleTimeout();
         sizeBytes += chunk.length;
+        options.onProgress?.(sizeBytes, contentLength > 0 ? contentLength : undefined);
         if (sizeBytes > this.config.maxDownloadBytes) {
           callback(new YifangyunError("Download exceeds YFY_MAX_DOWNLOAD_BYTES while streaming.", {
             details: { max_download_bytes: this.config.maxDownloadBytes }
+          }));
+          return;
+        }
+        if (sizeBytes > reservation.bytes) {
+          callback(new YifangyunError("Download exceeded its reserved temporary storage capacity.", {
+            code: "YFY_LOCAL_STORAGE_INSUFFICIENT",
+            details: { reserved_bytes: reservation.bytes },
+            phase: "temp_storage"
           }));
           return;
         }
@@ -462,6 +570,7 @@ export class YifangyunClient {
         clearTimeout(idleTimeout);
       }
       result.cleanup();
+      await reservation.release();
     }
 
     metrics.increment("download_bytes_total", {}, sizeBytes);
@@ -478,11 +587,11 @@ export class YifangyunClient {
     };
   }
 
-  async uploadLocalFileToPresignedUrl(presignUrl: string, localPath: string, fileName: string): Promise<UploadDeliveryResult> {
+  async uploadLocalFileToPresignedUrl(presignUrl: string, source: FileHandle, fileName: string, signal?: AbortSignal): Promise<UploadDeliveryResult> {
     await this.validateTransferUrl(presignUrl);
-    const stat = await fsp.stat(localPath);
+    const stat = await source.stat();
     if (!stat.isFile()) {
-      throw new YifangyunError("local_path must point to a file.", { details: { local_path: localPath } });
+      throw new YifangyunError("local_path must point to a file.", { code: "YFY_UPLOAD_SOURCE_INVALID", phase: "upload_source" });
     }
 
     if (stat.size > this.config.maxDownloadBytes) {
@@ -497,8 +606,9 @@ export class YifangyunClient {
         "Content-Length": String(stat.size),
         "Content-Type": "application/octet-stream"
       },
-      body: fs.createReadStream(localPath) as unknown as RequestInit["body"],
-      duplex: "half"
+      body: source.createReadStream({ autoClose: false, start: 0 }) as unknown as RequestInit["body"],
+      duplex: "half",
+      signal
     } as RequestInit);
 
     let deliveryMethod = "PUT_BINARY";
@@ -512,12 +622,20 @@ export class YifangyunClient {
           suggestedAction: "Check the presigned upload contract instead of buffering the file in memory."
         });
       }
-      const fileBuffer = await fsp.readFile(localPath);
+      const fileBuffer = Buffer.alloc(stat.size);
+      let offset = 0;
+      while (offset < fileBuffer.length) {
+        if (signal?.aborted) throw signal.reason;
+        const read = await source.read(fileBuffer, offset, fileBuffer.length - offset, offset);
+        if (read.bytesRead === 0) break;
+        offset += read.bytesRead;
+      }
       const form = new FormData();
-      form.append("file", new Blob([fileBuffer]), fileName);
+      form.append("file", new Blob([fileBuffer.subarray(0, offset)]), fileName);
       response = await this.fetchTransfer(presignUrl, {
         method: "POST",
-        body: form
+        body: form,
+        signal
       });
       deliveryMethod = "POST_MULTIPART";
     }
@@ -539,13 +657,12 @@ export class YifangyunClient {
     return {
       deliveryMethod,
       fileName,
-      localPath,
       remoteStatusCode: response.status,
       sizeBytes: stat.size
     };
   }
 
-  private async getToken(request: ApiTokenRequest): Promise<string> {
+  private async getToken(request: ApiTokenRequest, signal?: AbortSignal): Promise<string> {
     const cacheKey = `${request.subjectType}:${String(request.subjectId)}`;
     const cached = this.tokenCache.get(cacheKey);
     const now = Date.now();
@@ -555,16 +672,15 @@ export class YifangyunClient {
 
     let inflight = this.tokenInflight.get(cacheKey);
     if (!inflight) {
-      inflight = this.requestToken(request);
+      inflight = this.requestToken(request).then((token) => {
+        this.tokenCache.set(cacheKey, token);
+        return token;
+      }).finally(() => {
+        if (this.tokenInflight.get(cacheKey) === inflight) this.tokenInflight.delete(cacheKey);
+      });
       this.tokenInflight.set(cacheKey, inflight);
     }
-    try {
-      const token = await inflight;
-      this.tokenCache.set(cacheKey, token);
-      return token.accessToken;
-    } finally {
-      this.tokenInflight.delete(cacheKey);
-    }
+    return (await waitForSignal(inflight, signal)).accessToken;
   }
 
   private async requestToken(request: ApiTokenRequest): Promise<TokenRecord> {
@@ -654,7 +770,7 @@ export class YifangyunClient {
     }
   }
 
-  private async rawRequest(url: string, init: RequestInit, options: { retry: boolean; signal?: AbortSignal; timeoutMs?: number }): Promise<RawRequestResult> {
+  private async rawRequest(url: string, init: RequestInit, options: { retry: boolean; signal?: AbortSignal; timeoutMs?: number; transfer?: boolean }): Promise<RawRequestResult> {
     let lastError: unknown;
     const attempts = options.retry ? Math.max(1, this.config.retryMaxAttempts) : 1;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -666,14 +782,29 @@ export class YifangyunClient {
         cancelFromCaller();
       }
       const timeout = setTimeout(() => controller.abort(new Error("Request wall timeout.")), options.timeoutMs ?? this.config.requestTimeoutMs);
-      const release = await this.requestSemaphore.acquire();
       const bucketKey = this.requestBucket(url, init);
       let bucket = this.bucketSemaphores.get(bucketKey);
       if (!bucket) {
         bucket = new Semaphore(Math.max(1, this.config.maxConcurrentRequestsPerIdentity ?? 2));
         this.bucketSemaphores.set(bucketKey, bucket);
       }
-      const releaseBucket = await bucket.acquire();
+      let releaseBucket: () => void;
+      try {
+        releaseBucket = await bucket.acquire(controller.signal);
+      } catch (error) {
+        clearTimeout(timeout);
+        options.signal?.removeEventListener("abort", cancelFromCaller);
+        throw error;
+      }
+      let release: () => void;
+      try {
+        release = await this.requestSemaphore.acquire(controller.signal);
+      } catch (error) {
+        clearTimeout(timeout);
+        options.signal?.removeEventListener("abort", cancelFromCaller);
+        releaseBucket();
+        throw error;
+      }
       let returned = false;
       const cleanup = () => {
         clearTimeout(timeout);
@@ -685,14 +816,16 @@ export class YifangyunClient {
         }
       };
       try {
-        const response = await fetch(url, { ...init, signal: controller.signal });
+        const response = options.transfer
+          ? await this.fetchTransfer(url, { ...init, signal: controller.signal })
+          : await fetch(url, { ...init, signal: controller.signal });
         metrics.observe("provider_request_latency_ms", Date.now() - attemptStartedAt, { endpoint: new URL(url).pathname, status: String(response.status) });
         if (!response.ok && (response.status === 429 || response.status >= 500) && attempt + 1 < attempts) {
           metrics.increment("provider_retry_total", { reason: response.status === 429 ? "rate_limit" : "server_error" });
           const delayMs = this.calculateRetryDelay(response.headers, attempt);
           await response.body?.cancel().catch(() => undefined);
           cleanup();
-          await sleep(delayMs);
+          await sleep(delayMs, options.signal);
           continue;
         }
         return {
@@ -703,13 +836,17 @@ export class YifangyunClient {
           signal: controller.signal
         };
       } catch (error) {
+        if (error instanceof YifangyunError) {
+          cleanup();
+          throw error;
+        }
         metrics.observe("provider_request_latency_ms", Date.now() - attemptStartedAt, { endpoint: new URL(url).pathname, status: "network_error" });
         cleanup();
         lastError = error;
         const aborted = controller.signal.aborted;
         if (!aborted && attempt + 1 < attempts) {
           metrics.increment("provider_retry_total", { reason: "network_error" });
-          await sleep(this.config.retryBaseDelayMs * Math.pow(2, attempt));
+          await sleep(this.config.retryBaseDelayMs * Math.pow(2, attempt), options.signal);
           continue;
         }
         if (aborted) {
@@ -804,9 +941,9 @@ export class YifangyunClient {
     }
 
     if (response.status === 401) {
-      message = "Authentication failed. Check client credentials, enterprise_id, user_id, and OAuth base URL.";
+      message = "Authentication failed. Check client credentials, enterprise id, access context, and OAuth base URL.";
     } else if (response.status === 403) {
-      message = "Permission denied. Use a user_id that has access to the requested cloud-drive resource.";
+      message = "Permission denied. Use an access context that can read the requested cloud-drive resource.";
     } else if (response.status === 404) {
       message = "Resource not found. Check the department, folder, file, group, or user id.";
     }
@@ -854,16 +991,39 @@ export class YifangyunClient {
     return targetDir;
   }
 
-  private async ensureTempCapacity(incomingBytes: number): Promise<void> {
-    const maxTempBytes = this.config.maxTempBytes ?? 1073741824;
-    const usedBytes = await this.directoryFileBytes(this.config.tempDir);
-    if (usedBytes + incomingBytes > maxTempBytes) {
-      throw new YifangyunError("Local temporary storage quota would be exceeded.", {
-        code: "YFY_LOCAL_STORAGE_INSUFFICIENT",
-        details: { incoming_bytes: incomingBytes, max_temp_bytes: maxTempBytes, used_bytes: usedBytes },
-        phase: "temp_storage"
-      });
+  private async reserveTempCapacity(contentLength: number | undefined, signal?: AbortSignal): Promise<{ bytes: number; release: () => Promise<void> }> {
+    const releaseLock = await this.tempCapacitySemaphore.acquire(signal);
+    const reservationBytes = contentLength ?? this.config.maxDownloadBytes;
+    try {
+      await this.pruneExpiredTempFiles();
+      const maxTempBytes = this.config.maxTempBytes ?? 1073741824;
+      const usedBytes = await this.directoryFileBytes(path.join(this.config.tempDir, "artifacts"));
+      if (usedBytes + this.reservedTempBytes + reservationBytes > maxTempBytes) {
+        throw new YifangyunError("Local temporary storage quota would be exceeded.", {
+          code: "YFY_LOCAL_STORAGE_INSUFFICIENT",
+          details: { incoming_bytes: reservationBytes, max_temp_bytes: maxTempBytes, reserved_bytes: this.reservedTempBytes, used_bytes: usedBytes },
+          phase: "temp_storage"
+        });
+      }
+      this.reservedTempBytes += reservationBytes;
+    } finally {
+      releaseLock();
     }
+    let released = false;
+    return {
+      bytes: reservationBytes,
+      release: async () => {
+        if (released) return;
+        const release = await this.tempCapacitySemaphore.acquire();
+        try {
+          if (released) return;
+          released = true;
+          this.reservedTempBytes = Math.max(0, this.reservedTempBytes - reservationBytes);
+        } finally {
+          release();
+        }
+      }
+    };
   }
 
   private async validateTransferUrl(value: string): Promise<void> {
@@ -901,7 +1061,7 @@ export class YifangyunClient {
       return;
     }
     const cutoffMs = Date.now() - this.config.tempFileTtlSeconds * 1000;
-    await this.pruneDirectory(this.config.tempDir, cutoffMs);
+    await this.pruneDirectory(path.join(this.config.tempDir, "artifacts"), cutoffMs);
   }
 
   private async directoryFileBytes(directory: string): Promise<number> {
@@ -941,10 +1101,53 @@ export class YifangyunClient {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(new Error("Transfer wall timeout.")), this.config.downloadWallTimeoutMs ?? 300000);
     try {
-      return await fetch(url, { ...init, signal: controller.signal });
+      const signal = init.signal ? AbortSignal.any([init.signal, controller.signal]) : controller.signal;
+      let currentUrl = url;
+      for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
+        await this.validateTransferUrl(currentUrl);
+        let response: Response;
+        try {
+          response = await this.transferFetch(currentUrl, {
+            ...init,
+            redirect: "manual",
+            signal,
+            dispatcher: this.transferDispatcher
+          } as RequestInit & { dispatcher: Agent });
+        } catch (error) {
+          if (this.errorChainHasCode(error, "YFY_TRANSFER_URL_PRIVATE_ADDRESS")) {
+            throw new YifangyunError("Provider transfer URL resolves to a private network address.", {
+              code: "YFY_TRANSFER_URL_PRIVATE_ADDRESS",
+              phase: "transfer_url_validation",
+              suggestedAction: "Set YFY_ALLOW_PRIVATE_TRANSFER_URLS=enabled only for a trusted private deployment."
+            });
+          }
+          throw error;
+        }
+        if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+        const location = response.headers.get("location");
+        await response.body?.cancel().catch(() => undefined);
+        if (!location) {
+          throw new YifangyunError("Provider transfer redirect did not include a Location header.", { code: "YFY_TRANSFER_REDIRECT_INVALID", phase: "transfer_url_validation" });
+        }
+        const method = String(init.method ?? "GET").toUpperCase();
+        if (method !== "GET" && method !== "HEAD") {
+          throw new YifangyunError("Provider upload redirect was rejected to avoid replaying credentials or request bodies.", { code: "YFY_TRANSFER_REDIRECT_REJECTED", phase: "transfer_url_validation" });
+        }
+        currentUrl = new URL(location, currentUrl).toString();
+      }
+      throw new YifangyunError("Provider transfer URL exceeded the redirect limit.", { code: "YFY_TRANSFER_REDIRECT_LIMIT", phase: "transfer_url_validation" });
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  private errorChainHasCode(error: unknown, code: string): boolean {
+    let current = error;
+    for (let depth = 0; depth < 5 && current && typeof current === "object"; depth += 1) {
+      if ("code" in current && current.code === code) return true;
+      current = "cause" in current ? current.cause : undefined;
+    }
+    return false;
   }
 
   private requestBucket(url: string, init: RequestInit): string {

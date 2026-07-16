@@ -7,7 +7,20 @@ export type IdLike = string | number;
 
 export type TokenSubjectType = "enterprise" | "user";
 
-export type FileAccessUserStrategy = "default" | "admin" | "explicit";
+export type Toolset = "core" | "authority" | "snapshot" | "evidence" | "organization" | "collaboration" | "mutation" | "admin" | "transfer";
+
+export interface AccessContext {
+  externalEnterpriseId?: string;
+  id: string;
+  userId: string;
+}
+
+export interface AuthorityScope {
+  accessContext: string;
+  id: string;
+  rootFolderId: string;
+  tags: string[];
+}
 
 export interface RateLimitMeta {
   limit?: number;
@@ -44,24 +57,20 @@ export interface DownloadedFile {
 export interface UploadDeliveryResult {
   deliveryMethod: string;
   fileName: string;
-  localPath: string;
   remoteStatusCode: number;
   sizeBytes: number;
 }
 
 export interface AppConfig {
+  accessContexts: AccessContext[];
   apiBaseUrl: string;
-  allowDownloadUrl: boolean;
-  adminUserId?: IdLike;
+  authorityScopes: AuthorityScope[];
   oauthBaseUrl: string;
   clientId: string;
   clientSecret: string;
-  enterpriseId: IdLike;
-  defaultUserId: IdLike;
-  enableAdminTools: boolean;
-  enableMutationTools: boolean;
-  enableRawResponse: boolean;
-  fileAccessUserStrategy: FileAccessUserStrategy;
+  defaultAccessContext: string;
+  defaultUserId: string;
+  enterpriseId: string;
   logLevel: string;
   maxDownloadBytes: number;
   maxPageCapacity: number;
@@ -72,22 +81,28 @@ export interface AppConfig {
   tempFileTtlSeconds: number;
   tokenRefreshSkewSeconds: number;
   allowPrivateTransferUrls?: boolean;
-  authorityRootFolderId?: IdLike;
   downloadIdleTimeoutMs?: number;
   downloadWallTimeoutMs?: number;
   httpAllowedHosts?: string[];
   httpAllowedOrigins?: string[];
   httpBearerToken?: string;
   httpHost?: string;
+  httpMaxSessions?: number;
   httpPort?: number;
+  httpSessionIdleSeconds?: number;
   maxConcurrentProviderRequests?: number;
   maxConcurrentRequestsPerIdentity?: number;
+  maxEvidenceResourceBytes?: number;
   maxRetryDelayMs?: number;
-  maxScanBytes?: number;
+  maxStateBytes?: number;
   maxTempBytes?: number;
-  scanDir?: string;
-  scanTtlSeconds?: number;
+  snapshotConcurrency?: number;
+  snapshotTtlSeconds?: number;
+  stateDatabasePath: string;
+  toolsets: Toolset[];
   transport?: "stdio" | "http";
+  uploadRootDir?: string;
+  workflowProfiles: string[];
 }
 
 export interface TokenResponse {
@@ -104,13 +119,7 @@ export interface TokenRecord {
 }
 
 export interface ToolOutput extends Record<string, unknown> {
-  meta?: JsonObject;
-  ok: boolean;
-  outcome?: string;
-  request_succeeded?: boolean;
-  server_version?: string;
-  data?: JsonValue;
   error?: JsonObject;
-  raw?: JsonValue;
+  provenance?: JsonObject;
   warnings?: string[];
 }

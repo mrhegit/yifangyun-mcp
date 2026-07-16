@@ -1,10 +1,10 @@
 {
   "name": "yifangyun-mcp-server",
-  "version": "0.4.0",
+  "version": "1.0.0-beta.1",
   "description": "MCP server for Yifangyun cloud drive access with enterprise JWT authentication.",
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/mrhegit/yifangyun-mcp.git"
+    "url": "https://github.com/mrhegit/yifangyun-mcp.git"
   },
   "keywords": [
     "mcp",
@@ -16,6 +16,7 @@
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "bin": {
     "yifangyun-mcp-server": "dist/index.js"
   },
@@ -24,23 +25,25 @@
     "README.md",
     "LICENSE",
     "docs",
-    "evaluations",
     ".env.example"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/clean.mjs dist && tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test": "node --test dist/*.test.js",
-    "test:perf": "node scripts/perf-test.mjs",
+    "test:compile": "node scripts/clean.mjs dist-test && tsc -p tsconfig.test.json",
+    "test": "npm run test:compile && node --test dist-test/*.test.js",
+    "test:perf": "npm run test:compile && node scripts/perf-test.mjs",
+    "check": "npm run build && npm test && npm run test:perf",
     "prepare": "npm run build"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "express": "^5.2.1",
+    "undici": "^7.28.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {

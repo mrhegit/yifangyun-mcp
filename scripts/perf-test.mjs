@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 
-const child = spawn(process.execPath, ["--test", "dist/scanEngine.test.js"], {
+const child = spawn(process.execPath, ["--test", "dist-test/snapshot.test.js"], {
   env: { ...process.env, YFY_RUN_PERF_TESTS: "1" },
   stdio: "inherit"
 });

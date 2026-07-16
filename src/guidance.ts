@@ -1,182 +1,116 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { AppConfig } from "./types.js";
-
-const IdArg = z.union([z.string().trim().regex(/^\d+$/, "id must contain digits only"), z.number().int().nonnegative()]);
+import type { AppRuntime } from "./runtime/runtime.js";
 
 export const SERVER_INSTRUCTIONS = [
-  "Yifangyun MCP is an OpenAPI-first cloud-drive authority server.",
-  "Prefer read-only discovery, metadata, scope proof, then download/hash workflows.",
-  "Pass user_id only when the caller specifies an access identity; otherwise use the configured default strategy.",
-  "Mutation/admin tools are gated by environment variables and may be absent.",
-  "For new automation prefer atomic tools and explicit scope-bounded workflows, and prefer temp_path+sha256 over exposing download_url.",
-  "Use durable scope scans for large folders; official indexed search is hint-only and cannot prove absence."
+  "Yifangyun MCP is a general cloud authority and evidence server optimized for tender-document workflows.",
+  "Use configured access_context and scope identifiers instead of raw user ids whenever possible.",
+  "Use official index search only for candidate discovery; use snapshots when completeness or absence matters.",
+  "Use evidence capture with a configured authority scope before relying on an original file.",
+  "Mutation, collaboration, admin and transfer capabilities are available only when their toolsets are enabled."
 ].join(" ");
 
-function asIdText(value: string | number | undefined): string {
-  return value === undefined ? "<optional>" : String(value);
-}
-
 function textResource(uri: URL, text: string) {
-  return {
-    contents: [{ uri: uri.href, mimeType: "text/markdown", text }]
-  };
+  return { contents: [{ uri: uri.href, mimeType: "text/markdown", text }] };
 }
 
-export function registerGuidance(server: McpServer, config: AppConfig): void {
-  server.registerResource(
-    "yfy_overview",
-    "yfy://guide/overview",
-    {
-      title: "Yifangyun MCP Overview",
-      description: "Short runtime guide for tool selection and capability gates.",
-      mimeType: "text/markdown"
-    },
-    async (uri) => textResource(uri, [
-      "# Yifangyun MCP",
-      "",
-      "Use yfy_resolve_path when you know the exact relative path under a personal, department, or folder root.",
-      "Use yfy_search_items for official indexed search across accessible spaces, and pass search_in_folder when you want server-side search within a known folder scope.",
-      "Use yfy_start_scope_scan, yfy_advance_scope_scan and yfy_search_scope_snapshot for large or resumable descendant searches.",
-      "Treat yfy_search_items and yfy_search_items_advanced as hint-only official index searches.",
-      "Download URL exposure is disabled by default; use temp download tools for evidence workflows.",
-      "Mutation tools are registered only when YFY_ENABLE_MUTATION_TOOLS is enabled.",
-      "Admin tools are registered only when YFY_ENABLE_ADMIN_TOOLS is enabled.",
-      "Prefer atomic admin/collab tools for new agents.",
-      "",
-      `Capabilities: mutation=${config.enableMutationTools ? "enabled" : "disabled"}, admin=${config.enableAdminTools ? "enabled" : "disabled"}, download_url=${config.allowDownloadUrl ? "enabled" : "disabled"}.`
-    ].join("\n"))
-  );
+export function registerGuidance(server: McpServer, runtime: AppRuntime): void {
+  server.registerResource("yfy_overview", "yfy://guide/overview", {
+    title: "Yifangyun MCP Overview",
+    description: "Runtime toolsets, access contexts, authority scopes and recommended selection rules.",
+    mimeType: "text/markdown"
+  }, async (uri) => textResource(uri, [
+    "# Yifangyun MCP 1.0",
+    "",
+    `Enabled toolsets: ${runtime.config.toolsets.join(", ")}`,
+    `Workflow profiles: ${runtime.config.workflowProfiles.join(", ")}`,
+    `Access contexts: ${runtime.access.listContexts().map((context) => context.id).join(", ")}`,
+    `Authority scopes: ${runtime.access.listScopes().map((scope) => scope.id).join(", ") || "none"}`,
+    "",
+    "Use yfy_item_search for indexed candidate discovery.",
+    "Use yfy_path_resolve for an exact known path.",
+    "Use yfy_snapshot_create and yfy_snapshot_query for exhaustive bounded scope work.",
+    "Use yfy_evidence_capture with current_locked mode for authority-bound originals."
+  ].join("\n")));
 
-  server.registerResource(
-    "yfy_workflows",
-    "yfy://guide/workflows",
-    {
-      title: "Yifangyun MCP Workflows",
-      description: "Minimal recommended tool chains for common agent tasks.",
-      mimeType: "text/markdown"
-    },
-    async (uri) => textResource(uri, [
-      "# Workflows",
-      "",
-      "## Find and lock original",
-      "1. Exact path -> yfy_resolve_path; candidate discovery -> yfy_search_items_advanced; exhaustive bounded scope -> yfy_start_scope_scan + repeated yfy_advance_scope_scan + yfy_search_scope_snapshot",
-      "2. yfy_get_file_info_full",
-      "3. yfy_assert_file_in_scope",
-      "4. yfy_lock_current_original",
-      "",
-      "## Snapshot a folder",
-      "1. yfy_get_folder_info",
-      "2. yfy_start_scope_scan",
-      "3. Repeat yfy_advance_scope_scan with expected_revision until complete or partial",
-      "4. Read yfy_get_scope_scan or the manifest resource; use yfy_batch_get_file_info only for selected candidates",
-      "",
-      "## Safe upload/new version",
-      "1. Confirm mutation tools are registered",
-      "2. yfy_upload_file or yfy_upload_new_version",
-      "3. yfy_get_file_info_full or yfy_get_file_versions to verify"
-    ].join("\n"))
-  );
+  server.registerResource("yfy_safety", "yfy://guide/safety", {
+    title: "Yifangyun MCP Safety",
+    description: "Authority, evidence and mutation safety rules.",
+    mimeType: "text/markdown"
+  }, async (uri) => textResource(uri, [
+    "# Safety",
+    "",
+    "Official indexed search cannot prove absence.",
+    "Snapshot completeness applies only to the observed accessible scope and observation window.",
+    "Evidence capture deletes the downloaded temp file when metadata drift is detected.",
+    "Permanent deletion, collaboration removal and platform synchronization require explicit user intent.",
+    "Direct transfer tickets and admin login material are sensitive."
+  ].join("\n")));
 
-  server.registerResource(
-    "yfy_safety",
-    "yfy://guide/safety",
-    {
-      title: "Yifangyun MCP Safety",
-      description: "Short safety rules for authority, download, mutation, and admin operations.",
-      mimeType: "text/markdown"
-    },
-    async (uri) => textResource(uri, [
-      "# Safety",
-      "",
-      "Use user-token file tools for cloud-drive access; enterprise token tools are for organization/admin planes.",
-      "Do not assume an enterprise/admin token can read files.",
-      "For evidence work, keep root_folder_id scope proof with sha256 and size_bytes.",
-      "Treat admin delete, sync, and permanent trash deletion as destructive operations requiring explicit user intent."
-    ].join("\n"))
-  );
+  if (runtime.config.workflowProfiles.includes("tender") && ["core", "authority", "snapshot", "evidence"].every((toolset) => runtime.config.toolsets.includes(toolset as AppRuntime["config"]["toolsets"][number]))) {
+    registerTenderProfile(server);
+  }
+}
 
-  server.registerPrompt(
-    "yfy_find_and_lock_original",
-    {
-      title: "Find And Lock Original",
-      description: "Guide an agent to locate a Yifangyun file, prove folder scope, and download+hash the original.",
-      argsSchema: {
-        file_hint: z.string().min(1).describe("File name, path, or search keyword."),
-        root_folder_id: IdArg.describe("Authorized root folder id used for scope proof."),
-        user_id: IdArg.optional().describe("Optional file-access user id."),
-        external_enterprise_id: IdArg.optional().describe("Optional external collaboration enterprise id.")
-      }
-    },
-    ({ file_hint, root_folder_id, user_id, external_enterprise_id }) => ({
-      messages: [{
-        role: "user",
-        content: {
-          type: "text",
-          text: [
-            `Find the Yifangyun file matching: ${file_hint}.`,
-            `Use root_folder_id=${root_folder_id} to prove scope before downloading.`,
-            `Use user_id=${asIdText(user_id)} and external_enterprise_id=${asIdText(external_enterprise_id)} when applicable.`,
-            "Recommended tools: use yfy_resolve_path for an exact relative path; use yfy_search_items_advanced only for candidate discovery; use durable scope scan tools when absence or pagination completeness matters; then yfy_get_file_info_full, yfy_assert_file_in_scope, yfy_lock_current_original.",
-            "Return the file id, path/ancestor proof, sha256, size_bytes, and temp_path."
-          ].join("\n")
-        }
-      }]
-    })
-  );
+function registerTenderProfile(server: McpServer): void {
+  server.registerResource("yfy_tender_profile", "yfy://profile/tender", {
+    title: "Tender Document Workflow Profile",
+    description: "Reusable tender-document workflows built on generic authority, snapshot and evidence tools.",
+    mimeType: "text/markdown"
+  }, async (uri) => textResource(uri, [
+    "# Tender Profile",
+    "",
+    "## Material completeness audit",
+    "1. Validate the configured tender scope.",
+    "2. Create a snapshot with qualification and certificate queries.",
+    "3. Wait for complete or partial status and report incomplete reasons.",
+    "4. Query candidates and group them by expected material category.",
+    "",
+    "## Lock an original",
+    "1. Resolve or search the candidate.",
+    "2. Check scope membership.",
+    "3. Capture current_locked evidence.",
+    "4. Return path proof, version, sha256, size and observation time."
+  ].join("\n")));
 
-  server.registerPrompt(
-    "yfy_snapshot_folder",
-    {
-      title: "Snapshot Folder",
-      description: "Guide an agent to build a bounded flat snapshot for a Yifangyun folder.",
-      argsSchema: {
-        root_folder_id: IdArg.describe("Folder id to snapshot."),
-        max_depth: z.number().int().min(0).max(20).default(3).describe("Maximum recursion depth."),
-        max_items: z.number().int().min(1).max(1000000).default(50000).describe("Maximum descendants observed by the durable scan."),
-        user_id: IdArg.optional().describe("Optional file-access user id.")
-      }
-    },
-    ({ root_folder_id, max_depth, max_items, user_id }) => ({
-      messages: [{
-        role: "user",
-        content: {
-          type: "text",
-          text: [
-            `Build a bounded Yifangyun folder snapshot for root_folder_id=${root_folder_id}.`,
-            `Use max_depth=${max_depth}, max_items=${max_items}, user_id=${asIdText(user_id)}.`,
-            "Recommended tools: yfy_validate_authority_root, yfy_start_scope_scan, repeated yfy_advance_scope_scan, then yfy_get_scope_scan.",
-            "Report pagination_complete, safe_to_claim_absence, incomplete_reasons and the artifact URI."
-          ].join("\n")
-        }
-      }]
-    })
-  );
+  server.registerPrompt("yfy_tender_material_audit", {
+    title: "Audit Tender Materials",
+    description: "Audit a configured tender scope for required material categories.",
+    argsSchema: {
+      scope_id: z.string().min(1),
+      required_materials: z.string().min(1).describe("Comma-separated or newline-separated required material names."),
+      max_depth: z.string().regex(/^\d+$/).default("20"),
+      max_items: z.string().regex(/^\d+$/).default("50000")
+    }
+  }, ({ scope_id, required_materials, max_depth, max_items }) => ({ messages: [{ role: "user", content: { type: "text", text: [
+    `Audit tender materials in authority scope ${scope_id}.`,
+    `Required materials: ${required_materials}`,
+    `Create a snapshot with max_depth=${Math.min(100, Number(max_depth))} and max_items=${Math.min(1000000, Math.max(1, Number(max_items)))}.`,
+    "Use yfy_authority_validate, yfy_snapshot_create, yfy_snapshot_get and yfy_snapshot_query.",
+    "Separate confirmed matches, ambiguous candidates and missing categories.",
+    "Do not claim absence unless safe_to_claim_absence is true."
+  ].join("\n") } }] }));
 
-  server.registerPrompt(
-    "yfy_safe_upload_new_version",
-    {
-      title: "Safe Upload New Version",
-      description: "Guide an agent to upload a local file as a new Yifangyun version and verify it.",
-      argsSchema: {
-        file_id: IdArg.describe("Existing file id to receive the new version."),
-        local_path: z.string().min(1).describe("Absolute local path to upload."),
-        user_id: IdArg.optional().describe("Optional file-access user id.")
-      }
-    },
-    ({ file_id, local_path, user_id }) => ({
-      messages: [{
-        role: "user",
-        content: {
-          type: "text",
-          text: [
-            `Upload local_path=${local_path} as a new version of file_id=${file_id}.`,
-            `Use user_id=${asIdText(user_id)} when applicable.`,
-            "First confirm mutation tools are available. Then call yfy_upload_new_version and verify with yfy_get_file_info_full or yfy_get_file_versions.",
-            "Return upload delivery metadata and current file/version proof."
-          ].join("\n")
-        }
-      }]
-    })
-  );
+  server.registerPrompt("yfy_tender_lock_evidence", {
+    title: "Lock Tender Evidence",
+    description: "Locate and capture authority-bound evidence for one tender document.",
+    argsSchema: { scope_id: z.string().min(1), file_hint: z.string().min(1) }
+  }, ({ scope_id, file_hint }) => ({ messages: [{ role: "user", content: { type: "text", text: [
+    `Find the tender document matching: ${file_hint}`,
+    `Authority scope: ${scope_id}`,
+    "Use exact path resolution when possible, otherwise indexed search for candidates or a snapshot for exhaustive search.",
+    "Call yfy_scope_check in assert mode, then yfy_evidence_capture in current_locked mode.",
+    "Return file id, path proof, version id, sha256, size_bytes and the evidence resource_uri; include temp_path only for a local stdio caller."
+  ].join("\n") } }] }));
+
+  server.registerPrompt("yfy_tender_compare_versions", {
+    title: "Compare Tender Document Versions",
+    description: "Inspect version history and verify a tender document against expected evidence.",
+    argsSchema: { file_id: z.string().regex(/^\d+$/), expected_sha256: z.string().optional(), access_context: z.string().optional() }
+  }, ({ file_id, expected_sha256, access_context }) => ({ messages: [{ role: "user", content: { type: "text", text: [
+    `Inspect version history for file ${file_id}.`,
+    `Access context: ${access_context ?? "default"}`,
+    "Use yfy_file_versions and yfy_item_get with evidence view.",
+    expected_sha256 ? `Verify current content against sha256=${expected_sha256} with yfy_evidence_verify.` : "Report current version metadata and material changes without downloading unless needed."
+  ].join("\n") } }] }));
 }

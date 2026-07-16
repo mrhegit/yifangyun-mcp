@@ -1,0 +1,42 @@
+<evaluation>
+  <qa_pair>
+    <question>法务知道合同在合同库中的精确相对路径，需要避免索引误匹配。只回答首选工具名。</question>
+    <answer>yfy_path_resolve</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>采购只需要从全公司索引中发现供应商证书候选，暂时不要求完整性证明。只回答首选工具名。</question>
+    <answer>yfy_item_search</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>审计需要证明某关键词在一个已配置 scope 的可见子树中不存在。只回答首先创建观察任务的工具名。</question>
+    <answer>yfy_snapshot_create</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Snapshot 已完成，需要分页搜索其中多个关键词且不能重新请求 Provider 目录。只回答工具名。</question>
+    <answer>yfy_snapshot_query</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>需要查询文件是否属于合同归档 scope，但文件在 scope 外也应作为正常查询结果返回。只回答工具名和 mode，格式为 tool,mode。</question>
+    <answer>yfy_scope_check,query</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>需要在文件越界时让 Agent 工作流立即失败。只回答工具名和 mode，格式为 tool,mode。</question>
+    <answer>yfy_scope_check,assert</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>需要下载当前原件、固定版本、计算 SHA-256，并在下载期间元数据变化时拒绝结果。只回答工具名和 mode，格式为 tool,mode。</question>
+    <answer>yfy_evidence_capture,current_locked</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>需要比较现有证据 SHA-256 与当前远端内容，但不创建新的 Authority Scope。只回答工具名。</question>
+    <answer>yfy_evidence_verify</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>需要查看当前 MCP 配置中有哪些 access context 和 authority scope，不应读取环境变量或凭据。只回答工具名。</question>
+    <answer>yfy_context_get</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>需要将本地修订稿上传为已有合同文件的新版本。只回答工具名。</question>
+    <answer>yfy_file_version_upload</answer>
+  </qa_pair>
+</evaluation>

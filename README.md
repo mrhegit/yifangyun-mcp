@@ -1,235 +1,150 @@
 # yifangyun-mcp-server
 
-亿方云 OpenAPI 的 MCP Server。当前版本定位为 **OpenAPI-first 的 Cloud Authority Server**：
+亿方云 OpenAPI 的通用 Cloud Authority 与 Evidence MCP Server，针对投标资料查找、完整性判断、范围证明和原件固化进行了重点优化，同时可复用于法务、采购、审计、合规和档案业务。
 
-- 默认暴露只读 authority 能力
-- 写操作与管理员操作按环境变量显式开启
-- 默认不暴露 `download_url`
-- 支持把原件下载到本地临时目录并计算 `sha256`
-- 支持可恢复、可取消、带 checkpoint 和 page receipt 的大目录扫描
-- 支持本地 stdio 和受保护的 Streamable HTTP transport
+当前版本：`1.0.0-beta.1`。
 
-## 核心特性
+## 1.0 设计
 
-| 特性 | 说明 |
+- Agent 使用 `access_context`，不再向每个工具传递裸 `user_id`
+- 业务使用命名 `scope`，不再反复传递 Authority Root ID
+- 默认只暴露高频只读工具，其他能力通过 toolset 开启
+- 官方索引搜索只用于候选发现，不能证明资料不存在
+- 大目录扫描由后台 Snapshot Module 有界并发抓取、确定顺序提交、自动 checkpoint 和恢复
+- Snapshot 状态和索引存储在 SQLite，不再依赖 JSON 页面目录
+- Evidence capture 统一完成范围证明、版本固定、下载、SHA-1/SHA-256 和漂移复核
+- Evidence 在资源大小上限内返回短期 `yfy://evidence/...` resource link，远程 HTTP Agent 不依赖服务器本地路径
+- 工具成功结果直接返回领域数据，不再使用 `ok/request_succeeded/outcome` envelope
+- 不暴露 Provider raw response
+- stdio 和 Streamable HTTP 共享同一个 Runtime、缓存和 snapshot repository
+
+## 默认工具
+
+| 工具 | 用途 |
 |---|---|
-| 企业 JWT 默认认证 | 使用 `grant_type=jwt_simple` 换取企业 token 和用户 token |
-| OpenAPI-first | 以亿方云官方 OpenAPI 路径为主，不做脱离官方能力面的私有协议 |
-| 分层能力面 | `只读 authority` + `受控 mutation/admin` |
-| Authority 工具 | folder/file info、versions、ancestors、scope assert、snapshot、download+hash |
-| 本地下载落地 | 按 access identity 下载文件到 temp，返回 `temp_path + sha1 + sha256 + size_bytes` |
-| 安全默认值 | `download_url` 默认不注册，mutation/admin 默认不注册 |
-| 私有化部署适配 | 支持 `https://host/openapi` 和 `https://host/openapi/api` 两类地址配置 |
-| 统一响应 | 所有工具统一返回 `ok/data/meta/warnings/raw?` 结构 |
-| 限流元数据 | 返回 `request_id`、`source_api_version`、`X-Rate-Limit-*` 摘要 |
-| Durable scan | `start / advance / status / search / cancel`，进程重启后可恢复 |
-| 完整性边界 | 明确返回 `pagination_complete`、`safe_to_claim_absence`、`incomplete_reasons` |
+| `yfy_connection_check` | 验证企业和用户认证 |
+| `yfy_context_get` | 查看 access context、scope、toolset 和 workflow profile |
+| `yfy_item_get` | 获取文件、文件版本或文件夹稳定元数据 |
+| `yfy_items_get` | 批量读取文件元数据 |
+| `yfy_folder_list` | 分页列出直接子项 |
+| `yfy_item_search` | 官方索引候选发现 |
+| `yfy_path_resolve` | 按精确路径逐层解析 |
+| `yfy_space_list` | 个人、协作或部门空间列表 |
+| `yfy_authority_validate` | 验证命名 Authority Scope |
+| `yfy_scope_check` | 查询或断言文件范围 |
+| `yfy_snapshot_create` | 创建后台可恢复快照 |
+| `yfy_snapshot_get` | 查询快照状态和完整性 |
+| `yfy_snapshot_query` | 查询 SQLite 快照索引 |
+| `yfy_snapshot_cancel` | 取消快照 |
+| `yfy_evidence_capture` | 下载、哈希并锁定原件证据 |
+| `yfy_evidence_verify` | 验证元数据或内容证据 |
 
-## 主要能力
+## Toolsets
 
-### 核心能力
-
-这部分默认开启，适合做文件定位、范围校验、版本核对和原件锁定：
-
-- `yfy_get_folder_info`
-- `yfy_get_file_info`
-- `yfy_get_file_info_full`
-- `yfy_get_file_versions`
-- `yfy_get_file_version_info`
-- `yfy_get_folder_ancestors`
-- `yfy_get_file_ancestors`
-- `yfy_assert_file_in_scope`
-- `yfy_get_file_scope_membership`
-- `yfy_validate_authority_root`
-- `yfy_download_file_to_temp`
-- `yfy_download_and_hash`
-- `yfy_verify_file_current_version`
-- `yfy_lock_current_original`
-
-### 扩展只读能力
-
-这部分默认也会开启，适合做目录快照、批量回源、路径解析、协作与组织信息查询：
-
-- `yfy_start_scope_scan`
-- `yfy_advance_scope_scan`
-- `yfy_get_scope_scan`
-- `yfy_cancel_scope_scan`
-- `yfy_search_scope_snapshot`
-- `yfy_list_scope_scan_matches`
-- `yfy_list_scope_snapshot_items`
-- `yfy_build_scope_snapshot`
-- `yfy_list_folder_tree`
-- `yfy_search_items_recursive`
-- `yfy_batch_get_file_info`
-- `yfy_resolve_path`
-- `yfy_search_items`
-- `yfy_search_items_advanced`
-- `yfy_get_share_links`
-- `yfy_get_comments`
-- `yfy_list_collab_items`
-- `yfy_get_folder_collabs`
-- `yfy_list_groups`
-- `yfy_get_group_users`
-- `yfy_get_user_by_query`
-
-搜索定位建议：精确路径优先 `yfy_resolve_path`；官方索引搜索使用 `yfy_search_items_advanced`，但其结果仅用于候选发现；需要大目录遍历、恢复或缺失结论时使用 durable scope scan。`yfy_search_items_recursive`、`yfy_build_scope_snapshot` 和 `yfy_list_folder_tree` 保留为小目录兼容工具。
-
-### 可选写入与管理员能力
-
-这部分默认关闭。只有在显式开启对应环境变量后，才会注册：
-
-- `yfy_create_folder`
-- `yfy_update_file`
-- `yfy_update_folder`
-- `yfy_move_item`
-- `yfy_copy_item`
-- `yfy_delete_item`
-- `yfy_restore_item`
-- `yfy_upload_file`
-- `yfy_upload_file_by_path`
-- `yfy_upload_new_version`
-- `yfy_manage_collab`
-- `yfy_admin_departments`
-- `yfy_admin_groups`
-- `yfy_admin_users`
-- `yfy_admin_logs`
-- `yfy_admin_sync`
-
-### 底层能力说明
-
-为了支撑上面的工具，服务内部已经实现：
-
-- 统一 `GET/POST JSON` 请求内核
-- token 缓存和提前刷新
-- 429/5xx 自动退避
-- 非幂等 POST 不自动重试
-- Provider 并发上限、带 jitter 的退避和 token singleflight
-- 本地 temp 下载与 `sha256` 计算
-- 预签名上传地址后的本地文件投递
-
-## 安全默认值
-
-| 环境变量 | 默认值 | 说明 |
-|---|---:|---|
-| `YFY_ALLOW_DOWNLOAD_URL` | `disabled` | 关闭后不注册 `yfy_get_download_url` |
-| `YFY_ENABLE_MUTATION_TOOLS` | `disabled` | 关闭后不注册任何写工具 |
-| `YFY_ENABLE_ADMIN_TOOLS` | `disabled` | 关闭后不注册任何 admin 工具 |
-| `YFY_ENABLE_RAW_RESPONSE` | `disabled` | 关闭后工具不回传原始响应体 |
-| `YFY_MAX_DOWNLOAD_BYTES` | `268435456` | 默认最大下载 256 MiB |
-
-## 快速开始
-
-```bash
-npm install
-npm run build
+```env
+YFY_TOOLSETS=core,authority,snapshot,evidence,organization
 ```
 
-最小公有云配置：
+可选值：
 
-```bash
+| Toolset | 能力 |
+|---|---|
+| `core` | 文件、目录、搜索、路径、版本、评论、分享 |
+| `authority` | 命名 scope 验证和范围证明 |
+| `snapshot` | SQLite 后台快照 |
+| `evidence` | 下载、哈希、漂移检测 |
+| `organization` | 部门、用户、群组和空间读取 |
+| `collaboration` | 协作查询和变更 |
+| `mutation` | 创建、更新、移动、复制、删除、上传 |
+| `admin` | 部门、群组、用户、日志和平台治理 |
+| `transfer` | 敏感的短时下载 URL |
+
+## Access Context
+
+默认 context 使用 `YFY_DEFAULT_USER_ID`。其他身份通过 JSON 配置：
+
+```env
+YFY_ACCESS_CONTEXTS_JSON=[{"id":"reviewer","user_id":"530","external_enterprise_id":"9"}]
+YFY_DEFAULT_ACCESS_CONTEXT=default
+```
+
+工具只接收 `access_context="reviewer"`，不会在每次调用中传播裸身份信息。
+
+## Authority Scope
+
+```env
+YFY_SCOPES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_context":"default","tags":["tender","public-material"]}]
+```
+
+投标资料工作流使用 `scope_id="tender_public"`。同一套工具也可定义合同库、供应商库或审计底稿 scope。
+
+## 投标工作流
+
+### 完整性检查
+
+1. `yfy_authority_validate`
+2. `yfy_snapshot_create`
+3. 轮询 `yfy_snapshot_get`
+4. `yfy_snapshot_query`
+5. 只有 `safe_to_claim_absence=true` 时才能声明资料在已观察范围内不存在
+
+### 原件固化
+
+1. `yfy_path_resolve` 或 `yfy_item_search`
+2. `yfy_scope_check(mode="assert")`
+3. `yfy_evidence_capture(mode="current_locked")`
+4. 保存 file ID、path proof、version ID、SHA-256、size 和 observation time
+
+## 最小配置
+
+```env
 YFY_CLIENT_ID=your-client-id
 YFY_CLIENT_SECRET=your-client-secret
 YFY_ENTERPRISE_ID=115
 YFY_DEFAULT_USER_ID=530
+YFY_SCOPES_JSON=[]
 ```
 
-私有化部署再覆盖地址：
+## 运行
 
 ```bash
-YFY_OPENAPI_BASE_URL=https://qiyeyun.example.com/openapi
-YFY_OAUTH_BASE_URL=https://qiyeyun.example.com/openoauth
-
-# 如果部署直接暴露 /openapi/api，可改用：
-# YFY_API_BASE_URL=https://qiyeyun.example.com/openapi/api
-```
-
-启动 stdio MCP：
-
-```bash
+npm ci
+npm run build
 npm start
 ```
 
-## MCP 客户端配置示例
+要求 Node.js `>=22.13`，因为 Snapshot Module 使用内置 `node:sqlite`。
 
-```json
-{
-  "mcpServers": {
-    "yifangyun": {
-      "command": "node",
-      "args": ["/path/to/yifangyun-mcp/dist/index.js"],
-      "env": {
-        "YFY_CLIENT_ID": "your-client-id",
-        "YFY_CLIENT_SECRET": "your-client-secret",
-        "YFY_ENTERPRISE_ID": "115",
-        "YFY_DEFAULT_USER_ID": "530"
-      }
-    }
-  }
-}
+## HTTP
+
+```env
+YFY_TRANSPORT=http
+YFY_HTTP_HOST=127.0.0.1
+YFY_HTTP_PORT=3000
+YFY_HTTP_BEARER_TOKEN=replace-with-a-long-random-token
 ```
 
-## 权限模型
+端点：`POST /mcp`、`GET /health`、`GET /metrics`。
 
-亿方云 OpenAPI 仍然有两个权限平面：
+非回环监听必须同时配置 Bearer、Host 白名单和 Origin 白名单。
 
-| 权限平面 | Token | 适用接口 |
-|---|---|---|
-| 企业管理 | 企业 token | 部门、管理员、同步、日志 |
-| 云盘访问 | 用户 token | 文件夹、文件、搜索、版本、下载、协作 |
-
-即使某个账号是云盘管理员，也不要假设企业 token 能直接访问文件接口。文件访问工具默认使用 `YFY_DEFAULT_USER_ID`，或根据 `YFY_FILE_ACCESS_USER_STRATEGY` 走 `admin/explicit` 策略。
-
-## 典型调用链
-
-### 锁定当前原件
-
-```text
-yfy_assert_file_in_scope(file_id, root_folder_id)
-  -> 证明文件属于授权根目录
-yfy_lock_current_original(file_id, root_folder_id)
-  -> 返回 metadata + temp_path + sha256
-```
-
-### 构建目录快照
-
-```text
-yfy_start_scope_scan(root_folder_id, queries=[...])
-  -> scan_id + revision=0
-  -> 重复调用直到 complete 或 partial
-  -> 基于本地 page artifacts 搜索，不重复遍历 Provider
-```
-
-### 受控上传新版本
-
-```text
-设置 YFY_ENABLE_MUTATION_TOOLS=enabled
-yfy_upload_new_version(file_id, local_path="/path/to/file")
-  -> OpenAPI 申请 presign_url
-  -> 本地字节上传
-  -> 返回 current_file
-```
-
-## 开发命令
+## 开发验证
 
 ```bash
 npm run build
 npm test
-npm run dev
+npm run test:perf
+npm run check
+npm pack --dry-run
 ```
 
-## 详细文档
+生产构建输出到 `dist`，测试构建输出到 `dist-test`。npm 包不再包含测试文件和 source map。
 
-| 文档 | 内容 |
-|---|---|
-| [配置说明](docs/configuration.md) | 环境变量、能力开关、私有化部署地址、运行保护参数 |
-| [工具参考](docs/tools.md) | 当前工具分组、推荐使用方式、默认暴露策略 |
-| [OpenAPI 覆盖矩阵](docs/openapi-coverage.md) | 当前 MCP 对官方 OpenAPI 的覆盖范围、部分覆盖项与明确不在范围内的域 |
-| [部署指南](docs/deployment.md) | 本地运行、MCP 客户端接入、GitHub 安装建议 |
-| [架构与安全](docs/architecture-security.md) | 架构分层、认证流程、安全默认值、下载与写操作边界 |
-| [v0.4 迁移说明](docs/migration-v0.4.md) | durable scan、scope assert、projection 和弃用策略 |
+## 文档
 
-## 版本状态
-
-当前包版本：`0.4.0`。
-
-当前版本增加 durable scan、完整性语义、字段投影、下载漂移复核、统一错误码、可观测性和 Streamable HTTP。
+- [配置](docs/configuration.md)
+- [工具](docs/tools.md)
+- [架构与安全](docs/architecture-security.md)
+- [部署](docs/deployment.md)
+- [OpenAPI 覆盖](docs/openapi-coverage.md)
+- [1.0 迁移说明](docs/migration-v1.md)
