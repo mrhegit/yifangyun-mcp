@@ -2,7 +2,7 @@
 
 ## 要求
 
-- Node.js `>=22.13`
+- Node.js `>=24`
 - 可写的 SQLite 和临时文件目录
 - 亿方云 OAuth Client 凭据
 - 至少一个可用 user ID

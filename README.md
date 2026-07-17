@@ -113,7 +113,7 @@ npm run build
 npm start
 ```
 
-要求 Node.js `>=22.13`，因为 Snapshot Module 使用内置 `node:sqlite`。
+要求 Node.js `>=24`，因为 Snapshot Module 依赖内置 `node:sqlite` 的 FTS5 能力和稳定性能。
 
 ## HTTP
 
