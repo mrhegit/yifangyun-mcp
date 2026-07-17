@@ -46,19 +46,21 @@ export class ScopeScanEngine {
     accessContextId: string;
     accessIdentityRef: string;
     externalEnterpriseId?: IdLike;
+    forceRefresh?: boolean;
+    maxAgeSeconds?: number;
     policy: ScopeScanPolicy;
     rootFolderId: IdLike;
     signal?: AbortSignal;
     userId?: IdLike;
-  }): Promise<{ reused: boolean; state: ScopeScanState }> {
+  }): Promise<{ reuseReason: "fresh_complete" | "running_join" | "new"; reused: boolean; state: ScopeScanState }> {
     const policyHash = digest(input.policy);
     const rootFolderId = String(input.rootFolderId);
     const startLockKey = `start:${digest({ accessIdentityRef: input.accessIdentityRef, policyHash, rootFolderId })}`;
     return this.store.withLock(startLockKey, async () => {
       await this.store.pruneExpired();
-      const reusable = await this.store.findReusable(input.accessIdentityRef, rootFolderId, policyHash);
+      const reusable = input.forceRefresh ? undefined : await this.store.findReusable(input.accessIdentityRef, rootFolderId, policyHash, Date.now() - (input.maxAgeSeconds ?? 300) * 1000);
       if (reusable) {
-        return { reused: true, state: reusable };
+        return { reuseReason: reusable.status === "complete" ? "fresh_complete" : "running_join", reused: true, state: reusable };
       }
       const observed = await this.provider.getRoot(input.rootFolderId, input.userId, input.signal);
       const now = new Date().toISOString();
@@ -90,7 +92,7 @@ export class ScopeScanEngine {
         updatedAt: now
       };
       await this.store.create(state, [{ attempt: 0, depth: 0, folderId: rootFolderId, pageId: 0, pathDisplay: rootName }]);
-      return { reused: false, state };
+      return { reuseReason: "new", reused: false, state };
     });
   }
 
@@ -110,11 +112,11 @@ export class ScopeScanEngine {
       }
       if (state.revision !== input.expectedRevision) {
         throw new YifangyunError("Scope scan revision conflict.", {
-          code: "YFY_SNAPSHOT_REVISION_CONFLICT",
+          code: "YFY_INVENTORY_REVISION_CONFLICT",
           details: { actual_revision: state.revision, expected_revision: input.expectedRevision },
-          phase: "snapshot_advance",
+          phase: "inventory_advance",
           scanId: input.scanId,
-            suggestedAction: "Call yfy_snapshot_get and retry the operation with the latest snapshot state."
+            suggestedAction: "Call yfy_inventory_get and retry with the latest inventory state."
         });
       }
       if (["cancelled", "complete", "failed", "expired"].includes(state.status)) {
@@ -143,7 +145,7 @@ export class ScopeScanEngine {
         const batchSize = Math.min(concurrency, input.maxPages - processedPages, state.frontierCount);
         const cursors = (await this.store.peekFrontier(state.scanId, batchSize)).map((cursor) => ({ ...cursor, attempt: cursor.attempt + 1 }));
         if (cursors.length === 0) {
-          throw new YifangyunError("Snapshot frontier count does not match persisted cursors.", { code: "YFY_SNAPSHOT_FRONTIER_CONFLICT", phase: "snapshot_fetch", scanId: state.scanId });
+          throw new YifangyunError("Inventory frontier count does not match persisted cursors.", { code: "YFY_INVENTORY_FRONTIER_CONFLICT", phase: "inventory_fetch", scanId: state.scanId });
         }
         const fetched = await Promise.allSettled(cursors.map(async (cursor) => {
           const requestStartedAt = Date.now();
@@ -157,7 +159,7 @@ export class ScopeScanEngine {
           const pageKey = cursorKey(cursor);
           const current = (await this.store.peekFrontier(state.scanId, 1))[0];
           if (!sameCursor(current, cursor)) {
-            throw new YifangyunError("Snapshot frontier order changed during a fetch batch.", { code: "YFY_SNAPSHOT_FRONTIER_CONFLICT", phase: "snapshot_commit", scanId: state.scanId });
+            throw new YifangyunError("Inventory frontier order changed during a fetch batch.", { code: "YFY_INVENTORY_FRONTIER_CONFLICT", phase: "inventory_commit", scanId: state.scanId });
           }
           if (await this.store.hasPage(state.scanId, pageKey)) {
             addReason(state, "PAGINATION_LOOP");
@@ -189,7 +191,7 @@ export class ScopeScanEngine {
               addReason(state, "PROVIDER_TERMINAL_FAILURE");
             }
             metrics.increment("snapshot_incomplete_total", { reason: state.incompleteReasons.at(-1) ?? "provider_step_failed" });
-            state.lastError = { code: yfyError?.code ?? "YFY_SNAPSHOT_PROVIDER_FAILURE", message: error instanceof Error ? error.message : String(error) };
+            state.lastError = { code: yfyError?.code ?? "YFY_INVENTORY_PROVIDER_FAILURE", message: error instanceof Error ? error.message : String(error) };
             state.revision += 1;
             state.updatedAt = new Date().toISOString();
             await this.store.save(state);
@@ -358,7 +360,7 @@ export class ScopeScanEngine {
           const yfyError = error instanceof YifangyunError ? error : undefined;
           state.status = input.signal?.aborted ? "paused_retryable" : yfyError?.code === "YFY_PERMISSION_DENIED" ? "partial" : yfyError?.retryable !== false || finalDeadline.aborted ? "paused_retryable" : "failed";
           addReason(state, input.signal?.aborted ? "CLIENT_CANCELLED_STEP" : yfyError?.code === "YFY_PERMISSION_DENIED" ? "PERMISSION_CHANGED_OR_DENIED" : "PROVIDER_STEP_FAILED");
-          state.lastError = { code: yfyError?.code ?? "YFY_SNAPSHOT_PROVIDER_FAILURE", message: error instanceof Error ? error.message : String(error) };
+          state.lastError = { code: yfyError?.code ?? "YFY_INVENTORY_PROVIDER_FAILURE", message: error instanceof Error ? error.message : String(error) };
           state.revision += 1;
           state.updatedAt = new Date().toISOString();
           await this.store.save(state);
@@ -391,8 +393,9 @@ export class ScopeScanEngine {
     return this.store.withLock(scanId, async () => {
       const state = await this.store.load(scanId);
       if (expectedRevision !== undefined && state.revision !== expectedRevision) {
-        throw new YifangyunError("Snapshot revision conflict.", { code: "YFY_SNAPSHOT_REVISION_CONFLICT", scanId });
+        throw new YifangyunError("Inventory revision conflict.", { code: "YFY_INVENTORY_REVISION_CONFLICT", scanId });
       }
+      if (["complete", "partial", "cancelled", "failed", "expired"].includes(state.status)) return state;
       state.status = "cancelled";
       state.expiresAt = this.store.makeExpiry();
       state.revision += 1;
@@ -409,7 +412,7 @@ export class ScopeScanEngine {
       const yfyError = error instanceof YifangyunError ? error : undefined;
       state.status = "failed";
       state.expiresAt = this.store.makeExpiry();
-      state.lastError = { code: yfyError?.code ?? "YFY_SNAPSHOT_WORKER_FAILED", message: error instanceof Error ? error.message : String(error) };
+      state.lastError = { code: yfyError?.code ?? "YFY_INVENTORY_WORKER_FAILED", message: error instanceof Error ? error.message : String(error) };
       addReason(state, "SNAPSHOT_WORKER_FAILED");
       state.revision += 1;
       state.updatedAt = new Date().toISOString();
@@ -425,27 +428,27 @@ export class ScopeScanEngine {
       .filter((query) => Boolean(query.normalized));
     const itemCount = state.fileCount + state.folderCount;
     if (itemCount > 100_000 && normalizedQueries.some((query) => Array.from(query.normalized).length < 3)) {
-      throw new YifangyunError("Snapshot queries shorter than 3 characters are disabled for large snapshots.", {
-        code: "YFY_SNAPSHOT_QUERY_TOO_SHORT",
+      throw new YifangyunError("Inventory queries shorter than 3 characters are disabled for large inventories.", {
+        code: "YFY_INVENTORY_QUERY_TOO_SHORT",
         details: { item_count: itemCount, minimum_characters: 3 },
-        phase: "snapshot_query",
+        phase: "inventory_query",
         suggestedAction: "Use a more specific query so the FTS trigram index can be used."
       });
     }
     if (itemCount > 100_000 && normalizedQueries.length > 10) {
-      throw new YifangyunError("Too many query terms were requested for a large snapshot.", {
-        code: "YFY_SNAPSHOT_QUERY_TOO_BROAD",
+      throw new YifangyunError("Too many query terms were requested for a large inventory.", {
+        code: "YFY_INVENTORY_QUERY_TOO_BROAD",
         details: { item_count: itemCount, max_queries: 10 },
-        phase: "snapshot_query",
+        phase: "inventory_query",
         suggestedAction: "Split the query set into smaller batches."
       });
     }
     if (itemCount > 100_000 && state.policy.caseSensitive) {
-      throw new YifangyunError("Case-sensitive search is disabled for large snapshots.", {
-        code: "YFY_SNAPSHOT_CASE_SENSITIVE_QUERY_TOO_LARGE",
+      throw new YifangyunError("Case-sensitive search is disabled for large inventories.", {
+        code: "YFY_INVENTORY_CASE_SENSITIVE_QUERY_TOO_LARGE",
         details: { item_count: itemCount },
-        phase: "snapshot_query",
-        suggestedAction: "Create a case-insensitive snapshot for indexed large-space search."
+        phase: "inventory_query",
+        suggestedAction: "Create a case-insensitive inventory for indexed large-space search."
       });
     }
     return this.store.searchItems(scanId, normalizedQueries, state.policy.matchFields, type, cursor, limit, state.policy.caseSensitive);
@@ -459,7 +462,7 @@ export class ScopeScanEngine {
     const paginationComplete = state.status === "complete" && state.frontierCount === 0 && state.incompleteReasons.length === 0;
     const safeToClaimAbsence = paginationComplete && state.policy.includeFiles && state.policy.includeFolders;
     return {
-      snapshot_id: state.scanId,
+      inventory_id: state.scanId,
       status: state.status,
       access_context: state.accessContextId,
       root_folder_id: state.rootFolderId,
@@ -479,8 +482,7 @@ export class ScopeScanEngine {
       created_at: state.createdAt,
       updated_at: state.updatedAt,
       expires_at: state.expiresAt,
-      artifact_uri: `yfy://snapshot/${state.scanId}/${state.artifactToken}/${state.accessContextId}/manifest`,
-      ...(state.status === "running" || state.status === "paused_retryable" ? { next_action: { tool: "yfy_snapshot_get", arguments: { snapshot_id: state.scanId, access_context: state.accessContextId }, stop_when_terminal: true } } : {})
+      manifest_uri: `yfy://inventory/${state.scanId}/${state.artifactToken}/${state.accessContextId}/manifest`
     };
   }
 
@@ -504,6 +506,6 @@ export class ScopeScanEngine {
         };
       }
     }
-    throw new YifangyunError("Snapshot is changing too quickly to build a consistent manifest.", { code: "YFY_SNAPSHOT_MANIFEST_BUSY", phase: "snapshot_manifest", retryable: true, scanId });
+    throw new YifangyunError("Inventory is changing too quickly to build a consistent manifest.", { code: "YFY_INVENTORY_MANIFEST_BUSY", phase: "inventory_manifest", retryable: true, scanId });
   }
 }

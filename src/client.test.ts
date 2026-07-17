@@ -13,7 +13,7 @@ function makeConfig(): AppConfig {
     clientId: "client-id", clientSecret: "client-secret", enterpriseId: "115", defaultUserId: "530", defaultAccessContext: "default", logLevel: "info",
     maxDownloadBytes: 1024, maxPageCapacity: 500, requestTimeoutMs: 1000, retryBaseDelayMs: 100, retryMaxAttempts: 1,
     stateDatabasePath: ":memory:", tempDir: "C:/temp/yifangyun-mcp-test", tempFileTtlSeconds: 60, tokenRefreshSkewSeconds: 300,
-    toolsets: ["core"], transport: "stdio", workflowProfiles: []
+    toolsets: ["drive"], transport: "stdio", workflowProfiles: []
   };
 }
 

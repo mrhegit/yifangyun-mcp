@@ -1,119 +1,100 @@
 # yifangyun-mcp-server
 
-亿方云 OpenAPI 的通用 Cloud Authority 与 Evidence MCP Server，针对投标资料查找、完整性判断、范围证明和原件固化进行了重点优化，同时可复用于法务、采购、审计、合规和档案业务。
+亿方云 OpenAPI 的通用 MCP Server。默认提供轻量 Drive 平面；需要范围证明、完整性判断或原件固化时，可启用 Workspace、Inventory 和 Evidence 平面。
 
-当前版本：`1.0.0-beta.4`。
+当前版本：`1.0.0-beta.5`。这是一次不保留旧工具别名、旧参数或旧配置键的破坏性更新。
 
-## 1.0 设计
+## Interface
 
-- Agent 使用 `access_context`，不再向每个工具传递裸 `user_id`
-- 业务使用命名 `scope`，不再反复传递 Authority Root ID
-- 默认只暴露高频只读工具，其他能力通过 toolset 开启
-- 官方索引搜索只用于候选发现，不能证明资料不存在
-- 大目录扫描由后台 Snapshot Module 有界并发抓取、确定顺序提交、自动 checkpoint 和恢复
-- Snapshot 状态和索引存储在 SQLite，不再依赖 JSON 页面目录
-- Evidence 工具统一完成版本选择、范围证明、下载、SHA-1/SHA-256 和漂移复核
-- Evidence 在资源大小上限内返回短期 `yfy://evidence/...` resource link，远程 HTTP Agent 不依赖服务器本地路径
-- 工具成功结果直接返回领域数据，不再使用 `ok/request_succeeded/outcome` envelope
-- 不暴露 Provider raw response
-- stdio 和 Streamable HTTP 共享同一个 Runtime、缓存和 snapshot repository
-
-## 先选择使用方式
-
-| 需求 | 推荐配置 | 结果 |
-|---|---|---|
-| 只浏览和搜索云盘 | `YFY_TOOLSETS=core` | 不下载、不扫描、不修改云端内容 |
-| 搜索并捕获校验文件 | `YFY_TOOLSETS=core,evidence`，并配置 Scope | 增加 Authority-bound 当前/历史 Evidence Capture、SHA-1/SHA-256 和验证 |
-| 做范围证明和完整性判断 | `YFY_TOOLSETS=core,authority,snapshot,evidence`，并配置 Scope | 增加 Scope 断言、SQLite Snapshot 和 Evidence Capture |
-| 使用投标专用 Prompt | 五个默认 Toolset、至少一个 Scope、`YFY_WORKFLOW_PROFILES=tender` | 增加投标审计、原件固化和版本比较工作流模板 |
-| 修改云端内容 | 显式增加 `mutation`、`collaboration` 或 `admin` | 开启云端写能力，应隔离部署并限制 Agent 权限 |
-
-需要区分三个概念：
-
-- Toolset 决定注册哪些工具。
-- Authority Scope 决定权威工作流允许在哪个目录和身份范围内运行。
-- Workflow Profile 只注册专用 Prompt 和 Guidance，不授予新的亿方云权限。
-
-Scope 只约束 Authority、Snapshot 和 Evidence Capture 等 Scope-bound 流程，不会自动限制所有 Core 读取工具。需要目录边界时必须显式使用 Scope 相关工具。
-
-完整选项、默认值和配置示例见 [配置指南](docs/configuration.md)。
-
-## 默认工具
+默认 `drive` toolset：
 
 | 工具 | 用途 |
 |---|---|
-| `yfy_connection_check` | 验证企业和用户认证 |
-| `yfy_context_get` | 查看 access context、scope、toolset 和 workflow profile |
-| `yfy_item_get` | 获取文件、文件版本或文件夹稳定元数据 |
-| `yfy_items_get` | 批量读取文件元数据 |
-| `yfy_folder_list` | 分页列出直接子项 |
-| `yfy_root_list` | 枚举个人、协作、部门、文件夹或 scope 根 |
-| `yfy_item_search` | 官方索引候选发现 |
-| `yfy_path_resolve` | 按精确路径逐层解析 |
-| `yfy_authority_validate` | 验证命名 Authority Scope |
-| `yfy_scope_check` | 查询或断言文件范围 |
-| `yfy_snapshot_create` | 创建后台可恢复快照 |
-| `yfy_snapshot_get` | 查询快照状态和完整性 |
-| `yfy_snapshot_query` | 查询 SQLite 快照索引 |
-| `yfy_snapshot_cancel` | 取消快照 |
-| `yfy_evidence_capture` | 在 Authority Scope 内捕获当前版或精确历史版，并统一验证范围、版本、元数据和内容 |
-| `yfy_evidence_release` | 释放本地短期证据资源 |
+| `yfy_status` | 验证身份并列出可复制 PlaceRef |
+| `yfy_browse` | 浏览个人盘、协作空间、部门、文件夹或 Workspace |
+| `yfy_search` | Provider 索引候选发现，永远不证明不存在 |
+| `yfy_resolve` | 按精确相对路径逐层解析 |
+| `yfy_get` | 读取单个文件或文件夹元数据 |
+| `yfy_get_many` | 批量读取最多 100 个 ItemRef |
+| `yfy_versions` | 返回绑定文件身份的历史 VersionRef |
+| `yfy_open` | 读取当前或历史内容，不要求 Workspace |
+| `yfy_comments` | 分页读取文件评论 |
+| `yfy_shares` | 分页读取脱敏分享元数据 |
+
+高级平面：
+
+| Toolset | 工具 |
+|---|---|
+| `workspace` | `yfy_workspace_validate`、`yfy_membership_check` |
+| `inventory` | `yfy_inventory_create`、`yfy_inventory_get`、`yfy_inventory_search`、`yfy_inventory_cancel` |
+| `evidence` | `yfy_capture` |
+| `organization` | 明确的 department、user、group 工具，不使用 action union |
+
+`yfy_resource_release` 是 Drive/Evidence 共享的 Resource 生命周期工具：启用任一平面时都会注册。
+
+## 引用与分页
+
+位置使用可复制字符串：
+
+```text
+personal
+collaboration
+department:480
+folder:501000715605
+workspace:tender_public
+```
+
+文件和版本引用：
+
+```text
+file:501
+folder:502
+version:501:7001
+```
+
+普通分页只暴露 `limit`、`cursor` 和 `next_action`。Provider 页码、实际 page capacity、过滤后的页内 offset 和签名细节都由服务端隐藏。
+
+## 两个内容工具
+
+- `yfy_open`：普通网盘内容读取，可读取当前版或 `yfy_versions` 返回的历史 VersionRef。
+- `yfy_capture`：要求命名 Workspace，下载前后校验成员关系、版本历史和文件元数据，并返回三态 assurance 检查。
+
+`expected` 是断言。任一字段不匹配时，`yfy_capture` 返回 `YFY_EXPECTATION_MISMATCH`，删除临时内容，不返回可用 Resource。
+
+文本 Resource 返回 MCP `text`，二进制返回 `blob`。大文件返回 multipart manifest，调用方按 manifest 中的 part URI 分段读取；任何结果都不暴露服务器 `local_path`。
+
+## Inventory Freshness
+
+`yfy_inventory_create.freshness`：
+
+```json
+{"max_age_seconds":300,"mode":"reuse_if_fresh"}
+```
+
+- `reuse_if_fresh`：只复用未超过调用方新鲜度要求的完整 Inventory，或加入仍在运行的等价 Inventory。
+- `force_refresh`：始终创建新 Inventory。
+- `partial`、`cancelled`、`failed`、`expired` 永不自动复用。
+- 对终态调用 `yfy_inventory_cancel` 是真正 no-op，不改变状态、revision 或时间戳。
+
+只有终态结果中 `safe_to_claim_absence=true` 时，才能在该 Workspace 和观察窗口内声明未找到。
 
 ## Toolsets
 
-```env
-YFY_TOOLSETS=core,authority,snapshot,evidence,organization
-```
-
-可选值：
-
-| Toolset | 能力 |
-|---|---|
-| `core` | 文件、目录、搜索、路径、版本、评论、分享 |
-| `authority` | 命名 scope 验证和范围证明 |
-| `snapshot` | SQLite 后台快照 |
-| `evidence` | 下载、哈希、漂移检测 |
-| `organization` | 部门、用户和群组读取 |
-| `collaboration` | 协作查询和变更 |
-| `mutation` | 创建、更新、移动、复制、删除、上传 |
-| `admin` | 部门、群组、用户、日志和平台治理 |
-| `transfer` | 敏感的短时下载 URL |
-
-## Access Context
-
-默认 context 使用 `YFY_DEFAULT_USER_ID`。其他身份通过 JSON 配置：
+默认配置只启用 Drive：
 
 ```env
-YFY_ACCESS_CONTEXTS_JSON=[{"id":"reviewer","user_id":"530","external_enterprise_id":"9"}]
-YFY_DEFAULT_ACCESS_CONTEXT=default
+YFY_TOOLSETS=drive
 ```
 
-工具只接收 `access_context="reviewer"`，不会在每次调用中传播裸身份信息。
-
-## Authority Scope
+投标完整工作流：
 
 ```env
-YFY_SCOPES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_context":"default","tags":["tender","public-material"]}]
+YFY_TOOLSETS=drive,workspace,inventory,evidence
+YFY_WORKFLOW_PROFILES=tender
+YFY_WORKSPACES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_context":"default","tags":["tender"]}]
 ```
 
-投标资料工作流使用 `scope_id="tender_public"`。同一套工具也可定义合同库、供应商库或审计底稿 scope。
-
-## 投标工作流
-
-### 完整性检查
-
-1. `yfy_authority_validate`
-2. `yfy_snapshot_create`
-3. 轮询 `yfy_snapshot_get`
-4. `yfy_snapshot_query`
-5. 只有 `safe_to_claim_absence=true` 时才能声明资料在已观察范围内不存在
-
-### 原件固化
-
-1. `yfy_path_resolve` 或 `yfy_item_search`
-2. `yfy_evidence_capture(scope_id, file_id, version)`；工具内部会在下载前后验证 Scope
-3. 保存 file ID、path proof、稳定版本 ID、SHA-256、size、observation time 和 `resource_uri`
-4. 下游处理完成后调用 `yfy_evidence_release`
+其他可选 toolset：`organization`、`collaboration`、`mutation`、`admin`、`transfer`。云端写工具不会默认注册。
 
 ## 最小配置
 
@@ -122,23 +103,39 @@ YFY_CLIENT_ID=your-client-id
 YFY_CLIENT_SECRET=your-client-secret
 YFY_ENTERPRISE_ID=115
 YFY_DEFAULT_USER_ID=530
-YFY_SCOPES_JSON=[]
+YFY_TOOLSETS=drive
+YFY_ACCESS_CONTEXTS_JSON=[]
+YFY_WORKSPACES_JSON=[]
 YFY_WORKFLOW_PROFILES=
 ```
 
-这是通用模式。默认 Toolset 为 `core,authority,snapshot,evidence,organization`，但没有 Scope 时不能创建 Authority Snapshot 或执行 Evidence Capture。
+Workspace 只收窄已有 Provider 权限，不授予新权限。普通 Drive 工具不自动受 Workspace 限制；需要范围保证时使用 Workspace/Inventory/Capture 工具。
 
-启用投标专用工作流：
+## 典型流程
 
-```env
-YFY_TOOLSETS=core,organization,authority,snapshot,evidence
-YFY_WORKFLOW_PROFILES=tender
-YFY_SCOPES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_context":"default","tags":["tender","public-material"]}]
-```
+精确查找并读取：
 
-Scope 不会授予云盘权限，只会把 Authority、Snapshot 和 Evidence Capture 等 Scope-bound 流程限制在指定业务目录。
+1. `yfy_resolve({path,from})`
+2. `yfy_open({file})`
+3. 处理完 Resource 后调用 `yfy_resource_release`
 
-## 运行
+完整性审计：
+
+1. `yfy_workspace_validate`
+2. `yfy_inventory_create`
+3. 跟随 `next_action` 直到 `terminal=true`
+4. 对每个材料类别调用 `yfy_inventory_search`
+5. 仅在 `safe_to_claim_absence=true` 时声明缺失
+
+原件固化：
+
+1. `yfy_resolve` 或 `yfy_search`
+2. 需要历史版时先调用 `yfy_versions`
+3. `yfy_capture({workspace,file,version?,expected?})`
+4. 记录 file/version ref、Workspace proof、SHA-256、size、观察时间和 Resource URI
+5. `yfy_resource_release`
+
+## 运行与验证
 
 ```bash
 npm ci
@@ -146,24 +143,7 @@ npm run build
 node --env-file=.env dist/index.js
 ```
 
-`npm start` 也可以启动服务，但只继承当前进程环境，不会自动读取 `.env`。MCP 客户端部署通常直接在服务器配置的 `env` 中传入变量。
-
-要求 Node.js `>=24`，因为 Snapshot Module 依赖内置 `node:sqlite` 的 FTS5 能力和稳定性能。
-
-## HTTP
-
-```env
-YFY_TRANSPORT=http
-YFY_HTTP_HOST=127.0.0.1
-YFY_HTTP_PORT=3000
-YFY_HTTP_BEARER_TOKEN=replace-with-a-long-random-token
-```
-
-端点：`POST /mcp`、`GET /health`、`GET /metrics`。
-
-非回环监听必须同时配置 Bearer、Host 白名单和 Origin 白名单。
-
-## 开发验证
+要求 Node.js `>=24`。HTTP 端点为 `POST /mcp`、`GET /health`、`GET /metrics`。
 
 ```bash
 npm run build
@@ -173,13 +153,11 @@ npm run check
 npm pack --dry-run
 ```
 
-生产构建输出到 `dist`，测试构建输出到 `dist-test`。npm 包不再包含测试文件和 source map。
-
 ## 文档
 
-- [配置指南：模式、Toolset、Context、Scope、Profile 和全部环境变量](docs/configuration.md)
-- [工具](docs/tools.md)
+- [配置指南](docs/configuration.md)
+- [工具参考](docs/tools.md)
 - [架构与安全](docs/architecture-security.md)
 - [部署](docs/deployment.md)
 - [OpenAPI 覆盖](docs/openapi-coverage.md)
-- [1.0 迁移说明](docs/migration-v1.md)
+- [从 0.4.0 迁移到 1.0.0-beta.5](docs/migration-v1.md)

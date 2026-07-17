@@ -35,41 +35,41 @@ test("live evidence tools download and hash a controlled file", { skip: process.
   const fileId = process.env.YFY_LIVE_DOWNLOAD_FILE_ID;
   assert.ok(fileId, "YFY_LIVE_DOWNLOAD_FILE_ID is required for live evidence testing.");
   const rootFolderId = process.env.YFY_LIVE_DOWNLOAD_ROOT_FOLDER_ID;
-  assert.ok(rootFolderId, "YFY_LIVE_DOWNLOAD_ROOT_FOLDER_ID is required for authority-bound evidence testing.");
+  assert.ok(rootFolderId, "YFY_LIVE_DOWNLOAD_ROOT_FOLDER_ID is required for workspace-bound evidence testing.");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yfy-v1-evidence-"));
   process.env.YFY_STATE_DB = path.join(dir, "state.sqlite");
-  process.env.YFY_TOOLSETS = "core,evidence,authority";
+  process.env.YFY_TOOLSETS = "drive,workspace,evidence";
   process.env.YFY_WORKFLOW_PROFILES = "";
-  process.env.YFY_SCOPES_JSON = JSON.stringify([{ id: "evidence_scope", root_folder_id: rootFolderId, access_context: "default", tags: ["live-test"] }]);
+  process.env.YFY_WORKSPACES_JSON = JSON.stringify([{ id: "evidence_scope", root_folder_id: rootFolderId, access_context: "default", tags: ["live-test"] }]);
   const runtime = await AppRuntime.create(loadConfig());
   const server = new FakeServer();
   registerCatalog(server as unknown as McpServer, runtime);
   const resourceUris: string[] = [];
   try {
-    const handler = server.tools.get("yfy_evidence_capture")!;
-    const result = await handler({ file_id: fileId, scope_id: "evidence_scope", version: { kind: "current" } }, { signal: new AbortController().signal, sendNotification: async () => undefined });
+    const handler = server.tools.get("yfy_capture")!;
+    const result = await handler({ file: `file:${fileId}`, workspace: "evidence_scope" }, { signal: new AbortController().signal, sendNotification: async () => undefined });
     assert.notEqual(result.isError, true, JSON.stringify(result.structuredContent));
-    const artifact = result.structuredContent?.artifact as Record<string, unknown>;
-    assert.match(String(artifact.sha256), /^[a-f0-9]{64}$/i);
-    if (typeof artifact.resource_uri === "string") resourceUris.push(artifact.resource_uri);
-    if (typeof artifact.local_path === "string") assert.equal(fs.statSync(artifact.local_path).size, artifact.size_bytes);
-    const verified = await handler({ file_id: fileId, scope_id: "evidence_scope", version: { kind: "current" }, expected: { sha256: String(artifact.sha256), size_bytes: Number(artifact.size_bytes) } }, { signal: new AbortController().signal, sendNotification: async () => undefined });
+    const resource = result.structuredContent?.resource as Record<string, unknown>;
+    assert.match(String(resource.sha256), /^[a-f0-9]{64}$/i);
+    assert.equal(resource.local_path, undefined);
+    if (typeof resource.resource_uri === "string") resourceUris.push(resource.resource_uri);
+    const verified = await handler({ file: `file:${fileId}`, workspace: "evidence_scope", expected: { sha256: String(resource.sha256), size_bytes: Number(resource.size_bytes) } }, { signal: new AbortController().signal, sendNotification: async () => undefined });
     assert.notEqual(verified.isError, true, JSON.stringify(verified.structuredContent));
-    assert.equal((verified.structuredContent?.expectation as Record<string, unknown>).matches, true);
-    const verifiedArtifact = verified.structuredContent?.artifact as Record<string, unknown>;
-    if (typeof verifiedArtifact?.resource_uri === "string") resourceUris.push(verifiedArtifact.resource_uri);
-    const versionsHandler = server.tools.get("yfy_file_versions")!;
-    const versionsResult = await versionsHandler({ file_id: fileId }, { signal: new AbortController().signal, sendNotification: async () => undefined });
+    assert.equal((verified.structuredContent?.expectation as Record<string, unknown>).verdict, "matched");
+    const verifiedResource = verified.structuredContent?.resource as Record<string, unknown>;
+    if (typeof verifiedResource?.resource_uri === "string") resourceUris.push(verifiedResource.resource_uri);
+    const versionsHandler = server.tools.get("yfy_versions")!;
+    const versionsResult = await versionsHandler({ file: `file:${fileId}` }, { signal: new AbortController().signal, sendNotification: async () => undefined });
     const versions = versionsResult.structuredContent?.versions as Array<Record<string, unknown>>;
-    if (process.env.YFY_LIVE_HISTORY_TESTS === "enabled" && versions.length > 1 && typeof versions[1]?.provider_version_id === "string") {
-      const historical = await handler({ file_id: fileId, scope_id: "evidence_scope", version: { kind: "historical", version_id: versions[1].provider_version_id } }, { signal: new AbortController().signal, sendNotification: async () => undefined });
+    if (process.env.YFY_LIVE_HISTORY_TESTS === "enabled" && versions.length > 1 && typeof versions[1]?.ref === "string") {
+      const historical = await handler({ file: `file:${fileId}`, workspace: "evidence_scope", version: versions[1].ref }, { signal: new AbortController().signal, sendNotification: async () => undefined });
       assert.notEqual(historical.isError, true, JSON.stringify(historical.structuredContent));
-      const historicalArtifact = historical.structuredContent?.artifact as Record<string, unknown>;
-      assert.equal(historicalArtifact.sha1, versions[1]?.sha1);
-      if (typeof historicalArtifact.resource_uri === "string") resourceUris.push(historicalArtifact.resource_uri);
+      const historicalResource = historical.structuredContent?.resource as Record<string, unknown>;
+      assert.equal(historicalResource.sha1, versions[1]?.sha1);
+      if (typeof historicalResource.resource_uri === "string") resourceUris.push(historicalResource.resource_uri);
     }
   } finally {
-    const release = server.tools.get("yfy_evidence_release");
+    const release = server.tools.get("yfy_resource_release");
     for (const resourceUri of resourceUris) await release?.({ resource_uri: resourceUri }, { signal: new AbortController().signal, sendNotification: async () => undefined });
     await runtime.close();
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });

@@ -24,7 +24,7 @@ function config(databasePath: string): AppConfig {
     clientId: "client", clientSecret: "secret", defaultAccessContext: "default", defaultUserId: "530", enterpriseId: "115", logLevel: "info",
     maxDownloadBytes: 1024, maxPageCapacity: 500, requestTimeoutMs: 1000, retryBaseDelayMs: 1, retryMaxAttempts: 1,
     stateDatabasePath: databasePath, tempDir: path.dirname(databasePath), tempFileTtlSeconds: 0, tokenRefreshSkewSeconds: 30,
-    toolsets: ["snapshot"], transport: "stdio", workflowProfiles: ["tender"]
+    toolsets: ["inventory"], transport: "stdio", workflowProfiles: ["tender"]
   };
 }
 
@@ -73,7 +73,7 @@ test("background snapshot completes and queries indexed SQLite items", async () 
     assert.notEqual(secondPage.items[0]?.id, firstPage.items[0]?.id);
     await assert.rejects(
       () => service.query({ scanId: completed.scanId, mode: "list", type: "all", cursor: { ...firstPage.nextCursor!, revision: firstPage.nextCursor!.revision - 1 }, limit: 1 }),
-      (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_SNAPSHOT_CURSOR_STALE")
+      (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_INVENTORY_CURSOR_STALE")
     );
     assert.equal((service.summary(completed).completeness as Record<string, unknown>).safe_to_claim_absence, true);
   } finally {
@@ -111,6 +111,72 @@ test("concurrent equivalent snapshot creation reuses one operation", async () =>
     assert.equal(left.state.scanId, right.state.scanId);
     assert.ok(left.reused || right.reused);
     await service.waitForIdle(left.state.scanId);
+  } finally {
+    await service.close();
+  }
+});
+
+test("inventory reuse honors freshness and force refresh", async () => {
+  const store = new SqliteScopeScanStore(":memory:", 3600, 10_000_000);
+  const service = new SnapshotService(new ScopeScanEngine(store, provider()), store, new AccessRegistry(config(":memory:")));
+  await service.initialize();
+  try {
+    const input = { accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"] as Array<"name" | "path">, maxAgeSeconds: 300, maxItemDepth: 5, maxItems: 1000, pageCapacity: 2, rootFolderId: "1" };
+    const first = await service.create(input);
+    await service.waitForIdle(first.state.scanId);
+    const reused = await service.create(input);
+    assert.equal(reused.state.scanId, first.state.scanId);
+    assert.equal(reused.reuseReason, "fresh_complete");
+    const refreshed = await service.create({ ...input, forceRefresh: true });
+    assert.notEqual(refreshed.state.scanId, first.state.scanId);
+    assert.equal(refreshed.reuseReason, "new");
+    await service.waitForIdle(refreshed.state.scanId);
+  } finally {
+    await service.close();
+  }
+});
+
+test("running inventories are reused even when the completed freshness window is zero", async () => {
+  let requestStarted!: () => void;
+  const startedRequest = new Promise<void>((resolve) => { requestStarted = resolve; });
+  const slowProvider: ScopeScanProvider = {
+    getRoot: async () => ({ folder: { id: "1", name: "Root", type: "folder" }, meta: meta("/root") }),
+    listChildren: async (_folderId, _userId, _pageId, _pageCapacity, signal) => {
+      requestStarted();
+      await new Promise<void>((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason ?? new Error("aborted")), { once: true }));
+      throw new Error("unreachable");
+    }
+  };
+  const store = new SqliteScopeScanStore(":memory:", 3600, 10_000_000);
+  const service = new SnapshotService(new ScopeScanEngine(store, slowProvider), store, new AccessRegistry(config(":memory:")));
+  await service.initialize();
+  try {
+    const input = { accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"] as Array<"name" | "path">, maxAgeSeconds: 0, maxItemDepth: 5, maxItems: 1000, pageCapacity: 2, rootFolderId: "1" };
+    const first = await service.create(input);
+    await startedRequest;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const reused = await service.create(input);
+    assert.equal(reused.state.scanId, first.state.scanId);
+    assert.equal(reused.reuseReason, "running_join");
+    await service.cancel(first.state.scanId);
+  } finally {
+    await service.close();
+  }
+});
+
+test("partial inventories are never reused automatically", async () => {
+  const store = new SqliteScopeScanStore(":memory:", 3600, 10_000_000);
+  const service = new SnapshotService(new ScopeScanEngine(store, provider()), store, new AccessRegistry(config(":memory:")));
+  await service.initialize();
+  try {
+    const input = { accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"] as Array<"name" | "path">, maxAgeSeconds: 300, maxItemDepth: 1, maxItems: 1000, pageCapacity: 2, rootFolderId: "1" };
+    const first = await service.create(input);
+    await service.waitForIdle(first.state.scanId);
+    assert.equal((await service.get(first.state.scanId)).status, "partial");
+    const second = await service.create(input);
+    assert.notEqual(second.state.scanId, first.state.scanId);
+    assert.equal(second.reuseReason, "new");
+    await service.waitForIdle(second.state.scanId);
   } finally {
     await service.close();
   }
@@ -230,6 +296,24 @@ test("snapshot status and cancellation remain responsive during slow Provider I/
   }
 });
 
+test("cancelling a terminal inventory is a revision-preserving no-op", async () => {
+  const store = new SqliteScopeScanStore(":memory:", 3600, 10_000_000);
+  const service = new SnapshotService(new ScopeScanEngine(store, provider()), store, new AccessRegistry(config(":memory:")));
+  await service.initialize();
+  try {
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 5, maxItems: 1000, pageCapacity: 2, rootFolderId: "1" });
+    await service.waitForIdle(started.state.scanId);
+    const terminal = await service.get(started.state.scanId);
+    assert.equal(terminal.status, "complete");
+    const cancelled = await service.cancel(terminal.scanId);
+    assert.equal(cancelled.status, "complete");
+    assert.equal(cancelled.revision, terminal.revision);
+    assert.equal(cancelled.updatedAt, terminal.updatedAt);
+  } finally {
+    await service.close();
+  }
+});
+
 test("snapshot worker persists a failed state when page commit exceeds quota", async () => {
   const quotaProvider: ScopeScanProvider = {
     getRoot: async () => ({ folder: { id: "1", name: "Root", type: "folder" }, meta: meta("/root") }),
@@ -243,7 +327,7 @@ test("snapshot worker persists a failed state when page commit exceeds quota", a
     await service.waitForIdle(started.state.scanId);
     const failed = await service.get(started.state.scanId);
     assert.equal(failed.status, "failed");
-    assert.equal((failed.lastError as Record<string, unknown>).code, "YFY_SNAPSHOT_STORAGE_INSUFFICIENT");
+    assert.equal((failed.lastError as Record<string, unknown>).code, "YFY_INVENTORY_STORAGE_INSUFFICIENT");
   } finally {
     await service.close();
   }
@@ -263,7 +347,7 @@ test("file-backed snapshot reserves WAL and index growth before committing a pag
     await service.waitForIdle(started.state.scanId);
     const failed = await service.get(started.state.scanId);
     assert.equal(failed.status, "failed");
-    assert.equal((failed.lastError as Record<string, unknown>).code, "YFY_SNAPSHOT_STORAGE_INSUFFICIENT");
+    assert.equal((failed.lastError as Record<string, unknown>).code, "YFY_INVENTORY_STORAGE_INSUFFICIENT");
   } finally {
     await service.close();
     await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
@@ -415,7 +499,7 @@ test("stale running snapshots are pruned instead of resumed across observation w
     const started = await engine.start({ accessContextId: "default", accessIdentityRef: access.identityRef, policy, rootFolderId: "1", userId: "530" });
     await new Promise((resolve) => setTimeout(resolve, 1100));
     await store.pruneExpired();
-    await assert.rejects(() => store.load(started.state.scanId), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_SNAPSHOT_NOT_FOUND"));
+    await assert.rejects(() => store.load(started.state.scanId), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_INVENTORY_NOT_FOUND"));
     assert.deepEqual(await store.listRunnable(), []);
   } finally {
     store.close();
@@ -470,8 +554,7 @@ test("omitting access_context cannot read another context snapshot", async () =>
   await service.initialize();
   try {
     const started = await service.create({ accessContextId: "other", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: 100, pageCapacity: 2, rootFolderId: "1" });
-    assert.deepEqual((service.summary(started.state).next_action as Record<string, unknown>).arguments, { snapshot_id: started.state.scanId, access_context: "other" });
-    await assert.rejects(() => service.get(started.state.scanId), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_SNAPSHOT_ACCESS_DENIED"));
+    await assert.rejects(() => service.get(started.state.scanId), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_INVENTORY_ACCESS_DENIED"));
     assert.equal((await service.get(started.state.scanId, "other")).accessContextId, "other");
   } finally {
     await service.close();
@@ -486,8 +569,8 @@ test("large snapshots reject short or excessively broad search terms before a ta
     const started = await engine.start({ accessContextId: "default", accessIdentityRef: access.identityRef, policy, rootFolderId: "1", userId: "530" });
     started.state.fileCount = 100_001;
     await store.save(started.state);
-    await assert.rejects(() => engine.search(started.state.scanId, ["证书"], "all", undefined, 10), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_SNAPSHOT_QUERY_TOO_SHORT"));
-    await assert.rejects(() => engine.search(started.state.scanId, Array.from({ length: 11 }, (_, index) => `query-${index}`), "all", undefined, 10), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_SNAPSHOT_QUERY_TOO_BROAD"));
+    await assert.rejects(() => engine.search(started.state.scanId, ["证书"], "all", undefined, 10), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_INVENTORY_QUERY_TOO_SHORT"));
+    await assert.rejects(() => engine.search(started.state.scanId, Array.from({ length: 11 }, (_, index) => `query-${index}`), "all", undefined, 10), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_INVENTORY_QUERY_TOO_BROAD"));
   } finally {
     store.close();
   }
@@ -549,7 +632,7 @@ test("SQLite snapshot handles 50000 synthetic files", { skip: process.env.YFY_RU
     const pruneStartedAt = performance.now();
     await store.pruneExpired();
     assert.ok(performance.now() - pruneStartedAt < 2_000, "50k FTS snapshot cleanup exceeded 2 seconds");
-    await assert.rejects(() => store.load(completed.scanId), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_SNAPSHOT_NOT_FOUND"));
+    await assert.rejects(() => store.load(completed.scanId), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_INVENTORY_NOT_FOUND"));
   } finally {
     await service.close();
     await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });

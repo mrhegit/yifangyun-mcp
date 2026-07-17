@@ -13,7 +13,7 @@ export function registerTransferTools(server: McpServer, runtime: AppRuntime): v
   }
   registerTool(server, "yfy_transfer_ticket_get", {
     title: "Get Current Transfer Ticket",
-    description: "Return a short-lived Provider URL for the current version only. This result has no content-integrity guarantee; use yfy_evidence_capture for evidence. Historical transfer tickets are intentionally unsupported.",
+    description: "Return a short-lived Provider URL for the current version only. This result has no content-integrity guarantee; use yfy_capture for workspace-bound evidence. Historical transfer tickets are intentionally unsupported.",
     inputSchema: { file_id: z.string().regex(/^\d+$/), access_context: z.string().trim().min(1).optional() },
     outputSchema: { download_url: z.string().url(), selection: z.object({ kind: z.literal("current"), provider_selector: z.literal(0), validation_level: z.literal("metadata_only") }), sensitive: z.literal(true), expires_quickly: z.literal(true), provenance: z.array(ProvenanceSchema) }
   }, { readOnly: true }, async ({ file_id, access_context }, extra) => {

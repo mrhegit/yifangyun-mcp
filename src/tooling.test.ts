@@ -6,9 +6,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { YifangyunError } from "./client.js";
 import type { AppRuntime } from "./runtime/runtime.js";
-import { registerAuthorityEvidenceTools } from "./tools/authorityEvidenceTools.js";
-import { registerCoreTools } from "./tools/coreTools.js";
-import { registerSnapshotTools } from "./tools/snapshotTools.js";
+import { registerWorkspaceContentTools } from "./tools/workspaceContentTools.js";
+import { registerDriveTools } from "./tools/driveTools.js";
+import { registerInventoryTools } from "./tools/inventoryTools.js";
 import { registerTool, serializeError } from "./tools/tooling.js";
 
 test("tool errors bypass successful output schema validation", async () => {
@@ -47,7 +47,7 @@ test("evidence integrity and Provider fallback errors use actionable categories"
 
 test("stale snapshot cursors expose a recoverable state category and safe diagnostics", () => {
   const error = serializeError(new YifangyunError("stale", {
-    code: "YFY_SNAPSHOT_CURSOR_STALE",
+    code: "YFY_INVENTORY_CURSOR_STALE",
     agentDetails: { current_revision: 2, cursor_revision: 1, restart_required: true },
     suggestedAction: "Retry without cursor."
   }));
@@ -56,10 +56,10 @@ test("stale snapshot cursors expose a recoverable state category and safe diagno
 });
 
 test("snapshot query input and capacity errors use recoverable categories", () => {
-  assert.equal(serializeError(new YifangyunError("empty", { code: "YFY_SNAPSHOT_QUERY_EMPTY" })).category, "invalid_input");
-  assert.equal(serializeError(new YifangyunError("cursor", { code: "YFY_SNAPSHOT_CURSOR_INVALID" })).category, "invalid_input");
-  assert.equal(serializeError(new YifangyunError("short", { code: "YFY_SNAPSHOT_QUERY_TOO_SHORT" })).category, "capacity_limit");
-  assert.equal(serializeError(new YifangyunError("broad", { code: "YFY_SNAPSHOT_QUERY_TOO_BROAD" })).category, "capacity_limit");
+  assert.equal(serializeError(new YifangyunError("empty", { code: "YFY_INVENTORY_QUERY_EMPTY" })).category, "invalid_input");
+  assert.equal(serializeError(new YifangyunError("cursor", { code: "YFY_INVENTORY_CURSOR_INVALID" })).category, "invalid_input");
+  assert.equal(serializeError(new YifangyunError("short", { code: "YFY_INVENTORY_QUERY_TOO_SHORT" })).category, "capacity_limit");
+  assert.equal(serializeError(new YifangyunError("broad", { code: "YFY_INVENTORY_QUERY_TOO_BROAD" })).category, "capacity_limit");
 });
 
 test("invalid successful output becomes a tool error and runs rollback", async () => {
@@ -93,31 +93,30 @@ test("unexpected system errors do not expose local details", () => {
   assert.doesNotMatch(String(error.message), /secret|artifact/);
 });
 
-test("the MCP client accepts a running snapshot success result", async () => {
+test("the MCP client accepts a running inventory success result", async () => {
   const server = new McpServer({ name: "test-server", version: "1.0.0" });
   const runtime = {
-    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["snapshot"] },
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["inventory"] },
     access: { resolveScope: () => ({ context: { id: "default" }, scope: { rootFolderId: "501" } }) },
     snapshots: {
-      create: async () => ({ reused: false, state: {} }),
-      summary: () => ({
-        snapshot_id: "123e4567-e89b-12d3-a456-426614174000", status: "running", access_context: "default", root_folder_id: "501",
-        scanned_file_count: 0, scanned_folder_count: 0, page_receipt_count: 0,
-        completeness: { pagination_complete: false, safe_to_claim_absence: false, scope: "observed_subset_only", consistency_level: "partial_observation", incomplete_reasons: [] },
-        terminal: false, limits: { max_item_depth: 20, max_items: 50000 }, observation_window: { started_at: "2026-07-16T00:00:00.000Z", updated_at: "2026-07-16T00:00:00.000Z" },
-        created_at: "2026-07-16T00:00:00.000Z", updated_at: "2026-07-16T00:00:00.000Z", expires_at: "2026-07-17T00:00:00.000Z",
-        artifact_uri: "yfy://snapshot/test", next_action: { tool: "yfy_snapshot_get", arguments: { snapshot_id: "123e4567-e89b-12d3-a456-426614174000", access_context: "default" }, stop_when_terminal: true }
-      })
+      create: async () => ({ reused: false, reuseReason: "new", state: {
+        accessContextId: "default", accessIdentityRef: "identity", artifactToken: "token", createdAt: "2026-07-16T00:00:00.000Z", expiresAt: "2026-07-17T00:00:00.000Z",
+        fileCount: 0, folderCount: 0, frontierCount: 1, incompleteReasons: [], observationStartedAt: "2026-07-16T00:00:00.000Z", observationUpdatedAt: "2026-07-16T00:00:00.000Z",
+        pageReceiptCount: 0, policy: { caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"], maxItemDepth: 20, maxItems: 50000, pageCapacity: 500 },
+        policyHash: "hash", receiptDigest: "digest", revision: 0, rootFolder: {}, rootFolderId: "501", rootObservationDigest: "root", scanId: "123e4567-e89b-12d3-a456-426614174000",
+        status: "running", updatedAt: "2026-07-16T00:00:00.000Z"
+      } }),
+      summary: () => ({ terminal: false, completeness: { pagination_complete: false, safe_to_claim_absence: false, scope: "observed_subset_only", consistency_level: "partial_observation", incomplete_reasons: [] } })
     }
   } as unknown as AppRuntime;
-  registerSnapshotTools(server, runtime);
+  registerInventoryTools(server, runtime);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test-client", version: "1.0.0" });
   try {
     await server.connect(serverTransport);
     await client.connect(clientTransport);
     await client.listTools();
-    const result = await client.callTool({ name: "yfy_snapshot_create", arguments: { scope_id: "tender" } });
+    const result = await client.callTool({ name: "yfy_inventory_create", arguments: { workspace: "tender" } });
     assert.equal(result.isError, undefined);
     assert.equal((result.structuredContent as Record<string, unknown>).status, "running");
   } finally {
@@ -129,29 +128,33 @@ test("the MCP client accepts a running snapshot success result", async () => {
 test("the MCP client validates a paginated success result", async () => {
   const server = new McpServer({ name: "test-server", version: "1.0.0" });
   const runtime = {
-    config: { maxPageCapacity: 500, toolsets: ["core"] },
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["drive"] },
     gateway: {
       context: () => ({ context: { id: "default" } }),
-      getUser: async (endpoint: string) => ({
-        data: { share_links: [{ id: 1 }], page_id: 0, page_capacity: 1, page_count: 2, total_count: 2, has_more: false },
+      getUser: async (endpoint: string, _context: string, params: Record<string, unknown>) => ({
+        data: { share_links: [{ id: Number(params.page_id ?? 0) + 1 }], page_id: Number(params.page_id ?? 0), page_capacity: 1, page_count: 2, total_count: 2, has_more: false },
         meta: { endpoint, fetchedAtIso: "2026-07-16T00:00:00.000Z", fetchedAtUnix: 1, sourceApiVersion: "v2", statusCode: 200 }
       })
     }
   } as unknown as AppRuntime;
-  registerCoreTools(server, runtime);
+  registerDriveTools(server, runtime);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test-client", version: "1.0.0" });
   try {
     await server.connect(serverTransport);
     await client.connect(clientTransport);
     await client.listTools();
-    const result = await client.callTool({ name: "yfy_share_list", arguments: { item_type: "file", item_id: "1", page_id: 0, page_capacity: 1 } });
+    const result = await client.callTool({ name: "yfy_shares", arguments: { item: "file:1", limit: 1 } });
     assert.equal(result.isError, undefined);
     const page = (result.structuredContent as Record<string, unknown>).page as Record<string, unknown>;
-    assert.deepEqual(page.requested, { page_id: 0, page_capacity: 1 });
-    assert.deepEqual(page.effective, { page_id: 0, page_capacity: 1, page_capacity_source: "provider" });
+    assert.equal(page.returned_count, 1);
     assert.equal(page.has_more, true);
-    assert.equal(page.next_page_id, 1);
+    assert.equal(typeof page.next_cursor, "string");
+    const nextAction = (result.structuredContent as Record<string, unknown>).next_action as { tool: string; arguments: Record<string, unknown> };
+    assert.deepEqual(Object.keys(nextAction.arguments), ["cursor"]);
+    const second = await client.callTool({ name: nextAction.tool, arguments: nextAction.arguments });
+    assert.equal(second.isError, undefined, JSON.stringify(second.content));
+    assert.equal((((second.structuredContent as Record<string, unknown>).shares as Array<Record<string, unknown>>)[0]?.id), "2");
   } finally {
     await client.close();
     await server.close();
@@ -172,21 +175,21 @@ test("the real MCP client validates current evidence capture and release", async
       meta: { endpoint, fetchedAtIso: "2026-07-16T00:00:00.000Z", fetchedAtUnix: 1, sourceApiVersion: "v2", statusCode: 200 }
     }) },
     client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/evidence.pdf", sha1: "a".repeat(40), sha256: "b".repeat(64), sizeBytes: 9, meta: { endpoint: "/download", fetchedAtIso: "2026-07-16T00:00:00.000Z", fetchedAtUnix: 1, sourceApiVersion: "v2", statusCode: 200 } }) },
-    evidence: { register: async () => resourceUri, release: async () => true, read: async () => ({ blob: "", mimeType: "application/pdf", name: "evidence.pdf" }) }
+    evidence: { register: async () => resourceUri, release: async () => true, read: async () => ({ kind: "blob", blob: "", mimeType: "application/pdf", name: "evidence.pdf" }) }
   } as unknown as AppRuntime;
-  registerAuthorityEvidenceTools(server, runtime);
+  registerWorkspaceContentTools(server, runtime);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test-client", version: "1.0.0" });
   try {
     await server.connect(serverTransport);
     await client.connect(clientTransport);
     await client.listTools();
-    const captured = await client.callTool({ name: "yfy_evidence_capture", arguments: { scope_id: "scope", file_id: "10" } });
+    const captured = await client.callTool({ name: "yfy_capture", arguments: { workspace: "scope", file: "file:10" } });
     assert.equal(captured.isError, undefined, JSON.stringify(captured.content));
-    const artifact = (captured.structuredContent as Record<string, unknown>).artifact as Record<string, unknown>;
-    assert.equal(artifact.resource_uri, resourceUri);
-    assert.equal(artifact.local_path, undefined);
-    const released = await client.callTool({ name: "yfy_evidence_release", arguments: { resource_uri: resourceUri } });
+    const resource = (captured.structuredContent as Record<string, unknown>).resource as Record<string, unknown>;
+    assert.equal(resource.resource_uri, resourceUri);
+    assert.equal(resource.local_path, undefined);
+    const released = await client.callTool({ name: "yfy_resource_release", arguments: { resource_uri: resourceUri } });
     assert.equal(((released.structuredContent as Record<string, unknown>).status), "released");
   } finally {
     await client.close();

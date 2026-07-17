@@ -46,7 +46,7 @@ export class EvidenceArtifactRegistry {
     return `yfy://evidence/${token}`;
   }
 
-  async read(token: string): Promise<{ blob: string; mimeType?: string; name: string }> {
+  async read(token: string): Promise<{ kind: "blob"; blob: string; mimeType?: string; name: string } | { kind: "text"; text: string; mimeType?: string; name: string }> {
     const artifact = this.artifacts.get(token);
     if (!artifact || artifact.expiresAtMs <= Date.now()) {
       if (artifact) await this.deleteArtifact(token, artifact);
@@ -65,7 +65,7 @@ export class EvidenceArtifactRegistry {
           code: "YFY_EVIDENCE_RESOURCE_TOO_LARGE",
           details: { max_resource_bytes: this.maxResourceBytes, size_bytes: stat.size },
           phase: "evidence_resource",
-          suggestedAction: "Use artifact.local_path from a local stdio capture, or capture a smaller file for MCP resource transfer."
+          suggestedAction: "Capture a smaller file or raise the configured MCP resource limit within the download limit."
         });
       }
       const content = Buffer.alloc(stat.size);
@@ -77,7 +77,72 @@ export class EvidenceArtifactRegistry {
       }
       const bytes = content.subarray(0, offset);
       if (crypto.createHash("sha256").update(bytes).digest("hex") !== artifact.expectedSha256) throw new Error("Evidence artifact hash changed after registration.");
-      return { blob: bytes.toString("base64"), ...(artifact.mimeType ? { mimeType: artifact.mimeType } : {}), name: artifact.name };
+      const textMedia = artifact.mimeType?.startsWith("text/")
+        || artifact.mimeType === "application/json"
+        || artifact.mimeType === "application/xml"
+        || artifact.mimeType?.endsWith("+json")
+        || artifact.mimeType?.endsWith("+xml");
+      if (textMedia) {
+        try {
+          return { kind: "text", text: new TextDecoder("utf-8", { fatal: true }).decode(bytes), ...(artifact.mimeType ? { mimeType: artifact.mimeType } : {}), name: artifact.name };
+        } catch {
+          // Invalid UTF-8 remains available as the verified original byte representation.
+        }
+      }
+      return { kind: "blob", blob: bytes.toString("base64"), ...(artifact.mimeType ? { mimeType: artifact.mimeType } : {}), name: artifact.name };
+    } catch (error) {
+      if (error instanceof YifangyunError) throw error;
+      await handle?.close().catch(() => undefined);
+      handle = undefined;
+      await this.deleteArtifact(token, artifact);
+      throw new YifangyunError("Evidence artifact integrity verification failed.", { code: "YFY_EVIDENCE_ARTIFACT_INTEGRITY_FAILED", phase: "evidence_resource" });
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+  }
+
+  async manifest(token: string): Promise<{ mimeType?: string; name: string; partCount: number; partSizeBytes: number; sizeBytes: number }> {
+    const artifact = await this.availableArtifact(token);
+    return {
+      ...(artifact.mimeType ? { mimeType: artifact.mimeType } : {}),
+      name: artifact.name,
+      partCount: Math.ceil(artifact.expectedSize / this.maxResourceBytes),
+      partSizeBytes: this.maxResourceBytes,
+      sizeBytes: artifact.expectedSize
+    };
+  }
+
+  async readPart(token: string, part: number): Promise<{ blob: string; mimeType?: string; name: string }> {
+    const artifact = await this.availableArtifact(token);
+    const partCount = Math.ceil(artifact.expectedSize / this.maxResourceBytes);
+    if (!Number.isInteger(part) || part < 0 || part >= partCount) {
+      throw new YifangyunError("Evidence resource part is invalid.", { code: "YFY_INPUT_INVALID", phase: "evidence_resource" });
+    }
+    let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+    try {
+      const pathStat = await fs.lstat(artifact.path);
+      if (pathStat.isSymbolicLink()) throw new Error("Evidence artifact path must not be a symbolic link.");
+      handle = await fs.open(artifact.path, "r");
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size !== artifact.expectedSize) throw new Error("Evidence artifact changed after registration.");
+      const start = part * this.maxResourceBytes;
+      const end = Math.min(stat.size, start + this.maxResourceBytes);
+      const selected = Buffer.alloc(end - start);
+      const hash = crypto.createHash("sha256");
+      const buffer = Buffer.alloc(Math.min(1_048_576, Math.max(1, stat.size)));
+      let offset = 0;
+      while (offset < stat.size) {
+        const result = await handle.read(buffer, 0, Math.min(buffer.length, stat.size - offset), offset);
+        if (result.bytesRead === 0) break;
+        const bytes = buffer.subarray(0, result.bytesRead);
+        hash.update(bytes);
+        const overlapStart = Math.max(offset, start);
+        const overlapEnd = Math.min(offset + result.bytesRead, end);
+        if (overlapStart < overlapEnd) bytes.copy(selected, overlapStart - start, overlapStart - offset, overlapEnd - offset);
+        offset += result.bytesRead;
+      }
+      if (offset !== stat.size || hash.digest("hex") !== artifact.expectedSha256) throw new Error("Evidence artifact hash changed after registration.");
+      return { blob: selected.toString("base64"), ...(artifact.mimeType ? { mimeType: artifact.mimeType } : {}), name: `${artifact.name}.part-${part}` };
     } catch (error) {
       if (error instanceof YifangyunError) throw error;
       await handle?.close().catch(() => undefined);
@@ -90,11 +155,24 @@ export class EvidenceArtifactRegistry {
   }
 
   async release(resourceUriOrToken: string): Promise<boolean> {
-    const token = resourceUriOrToken.startsWith("yfy://evidence/") ? resourceUriOrToken.slice("yfy://evidence/".length) : resourceUriOrToken;
+    const token = /^yfy:\/\/evidence\/([a-f0-9]{48})(?:\/.*)?$/.exec(resourceUriOrToken)?.[1] ?? resourceUriOrToken;
     const artifact = this.artifacts.get(token);
     if (!artifact) return false;
+    if (artifact.expiresAtMs <= Date.now()) {
+      await this.deleteArtifact(token, artifact);
+      return false;
+    }
     await this.deleteArtifact(token, artifact, "YFY_EVIDENCE_RELEASE_FAILED", "evidence_release");
     return true;
+  }
+
+  private async availableArtifact(token: string): Promise<EvidenceArtifact> {
+    const artifact = this.artifacts.get(token);
+    if (!artifact || artifact.expiresAtMs <= Date.now()) {
+      if (artifact) await this.deleteArtifact(token, artifact);
+      throw new YifangyunError("Evidence artifact is unavailable or expired.", { code: "YFY_EVIDENCE_ARTIFACT_NOT_FOUND", phase: "evidence_resource" });
+    }
+    return artifact;
   }
 
   async close(): Promise<void> {

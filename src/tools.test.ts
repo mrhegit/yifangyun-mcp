@@ -5,12 +5,13 @@ import path from "node:path";
 import test from "node:test";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { YifangyunError } from "./client.js";
+import { provenance } from "./domain/projectors.js";
 import type { AppRuntime } from "./runtime/runtime.js";
 import { registerAdminTools } from "./tools/adminTools.js";
-import { registerAuthorityEvidenceTools } from "./tools/authorityEvidenceTools.js";
-import { registerCoreTools, registerOrganizationTools } from "./tools/coreTools.js";
+import { registerWorkspaceContentTools } from "./tools/workspaceContentTools.js";
+import { registerDriveTools } from "./tools/driveTools.js";
 import { registerMutationTools } from "./tools/mutationTools.js";
-import { registerSnapshotTools } from "./tools/snapshotTools.js";
+import { registerInventoryTools } from "./tools/inventoryTools.js";
 import { registerTransferTools } from "./tools/transferTools.js";
 import type { ApiJsonResponse, JsonValue } from "./types.js";
 
@@ -46,51 +47,41 @@ function errorCode(result: ToolResult): string | undefined {
   return ((JSON.parse(text) as { error?: { code?: string } }).error?.code);
 }
 
-test("item search returns stable projection and hint-only authority", async () => {
-  const server = new FakeServer();
-  const runtime = {
-    config: { maxPageCapacity: 500, toolsets: ["core"] },
-    gateway: {
-      context: access,
-      getUser: async (endpoint: string) => response(endpoint, { files: [{ id: 1, name: "证书.pdf", type: "file", owned_by: { id: 9, name: "Owner", login: "secret" } }], folders: [], page_id: 0, page_count: 1, total_count: 1 })
-    },
-    access: { listContexts: () => [], listScopes: () => [] }
-  } as unknown as AppRuntime;
-  registerCoreTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_item_search", { query: "证书", item_type: "all", field: "all", root: { kind: "personal" }, precise: false, sort: "score", direction: "desc", page_id: 0, page_capacity: 50 });
-  assert.notEqual(result.isError, true);
-  assert.equal((result.structuredContent?.authority as Record<string, unknown>).level, "hint_only");
-  const page = result.structuredContent?.page as Record<string, unknown>;
-  assert.equal((page.requested as Record<string, unknown>).page_capacity, 50);
-  const candidate = (result.structuredContent?.candidates as Array<Record<string, unknown>>)[0];
-  assert.equal((candidate.item as Record<string, unknown>).name, "证书.pdf");
-  assert.ok(!Object.prototype.hasOwnProperty.call(candidate.item as object, "owned_by"));
+function errorCategory(result: ToolResult): string | undefined {
+  const text = result.content?.find((entry) => entry.type === "text")?.text;
+  if (!text) return undefined;
+  return ((JSON.parse(text) as { error?: { category?: string } }).error?.category);
+}
+
+test("provenance exposes a logical operation without transport paths", () => {
+  const value = provenance({ endpoint: "https://download.example/secret/path?token=value", fetchedAtIso: "2026-07-16T00:00:00.000Z", fetchedAtUnix: 1, sourceApiVersion: "v2", statusCode: 200 }, "private-context", "content_download");
+  assert.deepEqual(value, { source: "yifangyun_openapi", operation: "content_download", observed_at: "2026-07-16T00:00:00.000Z" });
+  assert.doesNotMatch(JSON.stringify(value), /download\.example|secret\/path|private-context/);
 });
 
-test("paginated tools return one consistent page contract", async () => {
+test("drive search hides Provider pagination behind one cursor", async () => {
   const server = new FakeServer();
-  let mode: "provider" | "fallback" = "provider";
+  const files = Array.from({ length: 3 }, (_, index) => ({ id: index + 1, name: `candidate-${index + 1}.pdf`, type: "file", owned_by: { id: 9, name: "Owner", login: "secret" } }));
   const runtime = {
-    config: { maxPageCapacity: 500, toolsets: ["core", "organization"] },
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["drive"] },
     gateway: {
       context: access,
-      getUser: async (endpoint: string) => mode === "provider"
-        ? response(endpoint, { share_links: [{ id: 1 }], page_id: 0, page_capacity: 2, page_count: 2, total_count: 3, has_more: false })
-        : response(endpoint, { users: [{ id: 1, name: "User" }] })
+      getUser: async (endpoint: string) => response(endpoint, { files, folders: [], page_id: 0, page_capacity: 100, page_count: 1, total_count: 3 })
     }
   } as unknown as AppRuntime;
-  registerCoreTools(server as unknown as McpServer, runtime);
-  registerOrganizationTools(server as unknown as McpServer, runtime);
-  const shares = await call(server, "yfy_share_list", { item_type: "file", item_id: "1", page_id: 0, page_capacity: 2 });
-  const sharePage = shares.structuredContent?.page as Record<string, unknown>;
-  assert.equal((sharePage.effective as Record<string, unknown>).page_capacity, 2);
-  assert.equal(sharePage.has_more, true);
-  assert.equal(sharePage.next_page_id, 1);
-  mode = "fallback";
-  const users = await call(server, "yfy_user_search", { page_id: 3, page_capacity: 25, include_contact: false });
-  const userPage = users.structuredContent?.page as Record<string, unknown>;
-  assert.equal((userPage.requested as Record<string, unknown>).page_id, 3);
-  assert.equal(userPage.has_more, false);
+  registerDriveTools(server as unknown as McpServer, runtime);
+  const first = await call(server, "yfy_search", { query: "candidate", in: "personal", limit: 2 });
+  assert.deepEqual(first.structuredContent?.coverage, { mode: "provider_index", exhaustive: false });
+  assert.equal((first.structuredContent?.hits as unknown[]).length, 2);
+  const page = first.structuredContent?.page as Record<string, unknown>;
+  assert.equal(page.returned_count, 2);
+  assert.equal(page.has_more, true);
+  assert.ok(!Object.prototype.hasOwnProperty.call(page, "page_id"));
+  assert.ok(!Object.prototype.hasOwnProperty.call(page, "page_capacity"));
+  const cursor = String(page.next_cursor);
+  const second = await call(server, "yfy_search", { cursor });
+  assert.deepEqual((second.structuredContent?.hits as Array<Record<string, unknown>>).map((hit) => (hit.item as Record<string, unknown>).ref), ["file:3"]);
+  assert.doesNotMatch(JSON.stringify(first.structuredContent), /login|secret/);
 });
 
 test("admin log pagination counts user activity rows", async () => {
@@ -108,96 +99,10 @@ test("admin log pagination counts user activity rows", async () => {
   assert.equal(page.has_more, true);
 });
 
-test("pagination ignores impossible Provider counts and continues conservatively", async () => {
+test("drive search enforces folder scope and exact names", async () => {
   const server = new FakeServer();
   const runtime = {
-    config: { maxPageCapacity: 500, toolsets: ["core"] },
-    gateway: {
-      context: access,
-      getUser: async (endpoint: string) => response(endpoint, { share_links: [{ id: 1 }], page_id: 0, page_capacity: 1, page_count: 0, total_count: 0, has_more: false })
-    }
-  } as unknown as AppRuntime;
-  registerCoreTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_share_list", { item_type: "file", item_id: "1", page_id: 0, page_capacity: 1 });
-  const page = result.structuredContent?.page as Record<string, unknown>;
-  assert.equal(page.continuation_basis, "inconsistent");
-  assert.equal(page.metadata_consistent, false);
-  assert.equal(page.has_more, true);
-});
-
-test("pagination terminates on an empty page beyond the Provider range", async () => {
-  const server = new FakeServer();
-  const runtime = {
-    config: { maxPageCapacity: 500, toolsets: ["core"] },
-    gateway: {
-      context: access,
-      getUser: async (endpoint: string) => response(endpoint, { files: [], folders: [], page_id: 2, page_capacity: 5, page_count: 2, total_count: 9 })
-    }
-  } as unknown as AppRuntime;
-  registerCoreTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_folder_list", { folder_id: "0", item_type: "all", view: "summary", page_id: 2, page_capacity: 5 });
-  const page = result.structuredContent?.page as Record<string, unknown>;
-  assert.equal((page.effective as Record<string, unknown>).page_id, 2);
-  assert.equal(page.has_more, false);
-  assert.equal(page.metadata_consistent, true);
-});
-
-test("pagination continues through an empty page when Provider counts show remaining items", async () => {
-  const server = new FakeServer();
-  const runtime = {
-    config: { maxPageCapacity: 500, toolsets: ["core"] },
-    gateway: {
-      context: access,
-      getUser: async (endpoint: string) => response(endpoint, { files: [], folders: [], page_id: 1, page_capacity: 5, page_count: 3, total_count: 12 })
-    }
-  } as unknown as AppRuntime;
-  registerCoreTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_folder_list", { folder_id: "0", item_type: "all", view: "summary", page_id: 1, page_capacity: 5 });
-  const page = result.structuredContent?.page as Record<string, unknown>;
-  assert.equal(page.continuation_basis, "page_count");
-  assert.equal(page.has_more, true);
-  assert.equal(page.next_page_id, 2);
-});
-
-test("item search reports the Provider capacity when it overrides the request", async () => {
-  const server = new FakeServer();
-  const runtime = {
-    config: { maxPageCapacity: 500, toolsets: ["core"] },
-    gateway: {
-      context: access,
-      getUser: async (endpoint: string) => response(endpoint, { files: [], folders: [], page_id: 0, page_capacity: 100, page_count: 1, total_count: 0 })
-    },
-    access: { listContexts: () => [], listScopes: () => [] }
-  } as unknown as AppRuntime;
-  registerCoreTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_item_search", { query: "证书", item_type: "all", field: "all", root: { kind: "personal" }, precise: false, sort: "score", direction: "desc", page_id: 0, page_capacity: 5 });
-  const page = result.structuredContent?.page as Record<string, unknown>;
-  assert.equal((page.requested as Record<string, unknown>).page_capacity, 5);
-  assert.equal((page.effective as Record<string, unknown>).page_capacity, 100);
-});
-
-test("item search bounds Agent context independently from Provider page capacity", async () => {
-  const server = new FakeServer();
-  const files = Array.from({ length: 6 }, (_, index) => ({ id: index + 1, name: `candidate-${index + 1}.pdf`, type: "file" }));
-  const runtime = {
-    config: { maxPageCapacity: 500, toolsets: ["core"] },
-    gateway: { context: access, getUser: async (endpoint: string) => response(endpoint, { files, folders: [], page_id: 0, page_capacity: 100, page_count: 1, total_count: 6 }) },
-    access: { listContexts: () => [], listScopes: () => [] }
-  } as unknown as AppRuntime;
-  registerCoreTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_item_search", { query: "candidate", root: { kind: "personal" }, max_results: 2, page_id: 0, page_capacity: 5 });
-  assert.equal((result.structuredContent?.candidates as unknown[]).length, 2);
-  assert.deepEqual(result.structuredContent?.candidate_summary, { eligible_count: 6, returned_count: 2, result_offset: 0, truncated: true, truncated_count: 4, next_request: { page_id: 0, result_offset: 2 } });
-  assert.equal(((result.structuredContent?.page as Record<string, unknown>).returned as Record<string, unknown>).truncated_count, 4);
-  const continued = await call(server, "yfy_item_search", { query: "candidate", root: { kind: "personal" }, max_results: 2, result_offset: 2, page_id: 0, page_capacity: 5 });
-  assert.deepEqual((continued.structuredContent?.candidates as Array<Record<string, unknown>>).map((candidate) => (candidate.item as Record<string, unknown>).id), ["3", "4"]);
-  assert.deepEqual(continued.structuredContent?.candidate_summary, { eligible_count: 6, returned_count: 2, result_offset: 2, truncated: true, truncated_count: 2, next_request: { page_id: 0, result_offset: 4 } });
-});
-
-test("item search enforces folder scope and precise file names after Provider search", async () => {
-  const server = new FakeServer();
-  const runtime = {
-    config: { maxPageCapacity: 500, toolsets: ["core"] },
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["drive"] },
     gateway: {
       context: access,
       getUser: async (endpoint: string) => endpoint.endsWith("/info") ? response(endpoint, { id: 10, name: "Target", type: "folder", space: { type: "personal" } }) : response(endpoint, {
@@ -208,21 +113,17 @@ test("item search enforces folder scope and precise file names after Provider se
         ],
         folders: [], page_id: 0, page_capacity: 100, page_count: 1, total_count: 3
       })
-    },
-    access: { listContexts: () => [], listScopes: () => [] }
+    }
   } as unknown as AppRuntime;
-  registerCoreTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_item_search", { query: "test.docx", item_type: "file", field: "file_name", root: { kind: "folder", folder_id: "10" }, precise: true, sort: "score", direction: "desc", page_id: 0, page_capacity: 5 });
-  assert.deepEqual((result.structuredContent?.candidates as Array<Record<string, unknown>>).map((candidate) => (candidate.item as Record<string, unknown>).id), ["1"]);
-  const page = result.structuredContent?.page as Record<string, unknown>;
-  assert.equal((page.returned as Record<string, unknown>).filtered_count, 2);
-  assert.equal(page.has_more, false);
+  registerDriveTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_search", { query: "test.docx", in: "folder:10", kind: "file", field: "name", exact_name: true, limit: 5 });
+  assert.deepEqual((result.structuredContent?.hits as Array<Record<string, unknown>>).map((hit) => (hit.item as Record<string, unknown>).ref), ["file:1"]);
 });
 
-test("batch item reads preserve successes when one Provider request fails", async () => {
+test("drive batch reads preserve successes when one Provider request fails", async () => {
   const server = new FakeServer();
   const runtime = {
-    config: { maxPageCapacity: 500, toolsets: ["core"] },
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["drive"] },
     gateway: {
       context: access,
       getUser: async (endpoint: string) => endpoint.includes("/2/")
@@ -230,8 +131,8 @@ test("batch item reads preserve successes when one Provider request fails", asyn
         : response(endpoint, { id: 1, name: "ok.pdf", type: "file" })
     }
   } as unknown as AppRuntime;
-  registerCoreTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_items_get", { file_ids: ["1", "2"], view: "summary" });
+  registerDriveTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_get_many", { refs: ["file:1", "file:2"], detail: "basic" });
   assert.equal(result.isError, undefined);
   assert.deepEqual(result.structuredContent?.summary, { requested_count: 2, success_count: 1, error_count: 1 });
   const results = result.structuredContent?.results as Array<Record<string, unknown>>;
@@ -240,28 +141,58 @@ test("batch item reads preserve successes when one Provider request fails", asyn
   assert.equal((results[1]?.error as Record<string, unknown>).category, "not_found");
 });
 
-test("scope check distinguishes query and assert semantics", async () => {
+test("current file versions omit historical VersionRef values", async () => {
   const server = new FakeServer();
   const runtime = {
-    config: { toolsets: ["authority"] },
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["drive"] },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => response(endpoint, { file_versions: [
+        { current: true, sha1: "a".repeat(40), size: 9, modified_at: 2 },
+        { id: 7, current: false, sha1: "b".repeat(40), size: 8, modified_at: 1 }
+      ] })
+    }
+  } as unknown as AppRuntime;
+  registerDriveTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_versions", { file: "file:10" });
+  assert.notEqual(result.isError, true, JSON.stringify(result.content));
+  const versions = result.structuredContent?.versions as Array<Record<string, unknown>>;
+  assert.equal(versions[0]?.current, true);
+  assert.equal(versions[0]?.ref, undefined);
+  assert.equal(versions[1]?.ref, "version:10:7");
+});
+
+test("workspace membership distinguishes query and assert semantics", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["workspace"] },
     access: { resolveScope: () => ({ ...access(), scope: { id: "tender", rootFolderId: "501", accessContext: "default", tags: [] } }) },
     gateway: { getUser: async (endpoint: string) => response(endpoint, { id: 10, name: "outside.pdf", type: "file", parent_folder_id: 2, path: [{ id: 2, name: "Other", type: "folder" }] }) }
   } as unknown as AppRuntime;
-  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const query = await call(server, "yfy_scope_check", { file_id: "10", scope_id: "tender", mode: "query" });
-  assert.equal(query.structuredContent?.in_scope, false);
+  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  const query = await call(server, "yfy_membership_check", { file: "file:10", workspace: "tender", mode: "query" });
+  assert.equal(query.structuredContent?.in_workspace, false);
   assert.equal(query.isError, undefined);
-  const assertion = await call(server, "yfy_scope_check", { file_id: "10", scope_id: "tender", mode: "assert" });
+  const assertion = await call(server, "yfy_membership_check", { file: "file:10", workspace: "tender", mode: "assert" });
   assert.equal(assertion.isError, true);
-  assert.equal(errorCode(assertion), "YFY_SCOPE_ASSERTION_FAILED");
+  assert.equal(errorCode(assertion), "YFY_WORKSPACE_MEMBERSHIP_FAILED");
+  assert.equal(errorCategory(assertion), "authorization");
 });
 
-test("snapshot query returns a signed context-bound cursor", async () => {
+test("inventory search returns a signed context-bound cursor", async () => {
   const server = new FakeServer();
   let receivedCursor: unknown;
   const runtime = {
-    config: { clientSecret: "secret", toolsets: ["snapshot"] },
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["inventory"] },
+    access: { resolveScope: () => ({ context: { id: "default" }, scope: { rootFolderId: "501" } }) },
     snapshots: {
+      create: async () => ({ reused: false, reuseReason: "new", state: {
+        accessContextId: "default", accessIdentityRef: "identity", artifactToken: "token", createdAt: "2026-07-16T00:00:00.000Z", expiresAt: "2026-07-17T00:00:00.000Z",
+        fileCount: 1, folderCount: 0, frontierCount: 0, incompleteReasons: [], observationStartedAt: "2026-07-16T00:00:00.000Z", observationUpdatedAt: "2026-07-16T00:00:00.000Z",
+        pageReceiptCount: 1, policy: { caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"], maxItemDepth: 20, maxItems: 50000, pageCapacity: 500 },
+        policyHash: "hash", receiptDigest: "digest", revision: 4, rootFolder: {}, rootFolderId: "501", rootObservationDigest: "root", scanId: "123e4567-e89b-12d3-a456-426614174000",
+        status: "complete", updatedAt: "2026-07-16T00:00:00.000Z"
+      } }),
       query: async (input: Record<string, unknown>) => {
         receivedCursor = input.cursor;
         return {
@@ -271,31 +202,74 @@ test("snapshot query returns a signed context-bound cursor", async () => {
           total: 2
         };
       },
-      summary: () => ({ completeness: { pagination_complete: true, safe_to_claim_absence: true, scope: "entire_observed_accessible_scope", consistency_level: "best_effort_complete_observation", incomplete_reasons: [] } })
+      summary: () => ({ terminal: true, completeness: { pagination_complete: true, safe_to_claim_absence: true, scope: "entire_observed_accessible_scope", consistency_level: "best_effort_complete_observation", incomplete_reasons: [] } })
     }
   } as unknown as AppRuntime;
-  registerSnapshotTools(server as unknown as McpServer, runtime);
-  const snapshotId = "123e4567-e89b-12d3-a456-426614174000";
-  const first = await call(server, "yfy_snapshot_query", { snapshot_id: snapshotId, mode: "search", queries: ["证书"], item_type: "all", limit: 1 });
-  const cursor = String(first.structuredContent?.next_cursor);
+  registerInventoryTools(server as unknown as McpServer, runtime);
+  const created = await call(server, "yfy_inventory_create", { workspace: "tender" });
+  const inventory = String(created.structuredContent?.inventory);
+  const first = await call(server, "yfy_inventory_search", { inventory, query: "证书", kind: "all", limit: 1 });
+  const cursor = String((first.structuredContent?.page as Record<string, unknown>).next_cursor);
   assert.ok(cursor.length > 20);
-  const second = await call(server, "yfy_snapshot_query", { snapshot_id: snapshotId, mode: "search", queries: ["证书"], item_type: "all", cursor, limit: 1 });
+  const second = await call(server, "yfy_inventory_search", { inventory, cursor });
   assert.notEqual(second.isError, true);
   assert.deepEqual(receivedCursor, { itemId: "10", revision: 4, sortPath: "Root/A", total: 2 });
-  const wrongQuery = await call(server, "yfy_snapshot_query", { snapshot_id: snapshotId, mode: "search", queries: ["合同"], item_type: "all", cursor, limit: 1 });
-  assert.equal(wrongQuery.isError, true);
-  assert.equal(errorCode(wrongQuery), "YFY_SNAPSHOT_CURSOR_INVALID");
-  const listed = await call(server, "yfy_snapshot_query", { snapshot_id: snapshotId, mode: "list", queries: ["ignored"], item_type: "all", limit: 1 });
-  const listCursor = String(listed.structuredContent?.next_cursor);
-  const continuedList = await call(server, "yfy_snapshot_query", { snapshot_id: snapshotId, mode: "list", item_type: "all", cursor: listCursor, limit: 1 });
-  assert.notEqual(continuedList.isError, true);
+});
+
+test("inventory cancel reports the terminal state won by a concurrent completion", async () => {
+  const server = new FakeServer();
+  const running = {
+    accessContextId: "default", accessIdentityRef: "identity", artifactToken: "token", createdAt: "2026-07-16T00:00:00.000Z", expiresAt: "2026-07-17T00:00:00.000Z",
+    fileCount: 0, folderCount: 0, frontierCount: 1, incompleteReasons: [], observationStartedAt: "2026-07-16T00:00:00.000Z", observationUpdatedAt: "2026-07-16T00:00:00.000Z",
+    pageReceiptCount: 0, policy: { caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"], maxItemDepth: 20, maxItems: 50000, pageCapacity: 500 },
+    policyHash: "hash", receiptDigest: "digest", revision: 1, rootFolder: {}, rootFolderId: "501", rootObservationDigest: "root", scanId: "123e4567-e89b-12d3-a456-426614174000",
+    status: "running", updatedAt: "2026-07-16T00:00:00.000Z"
+  };
+  const complete = { ...running, status: "complete", revision: 2 };
+  const runtime = {
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["inventory"] },
+    access: { resolveScope: () => ({ context: { id: "default" }, scope: { rootFolderId: "501" } }) },
+    snapshots: {
+      create: async () => ({ reused: false, reuseReason: "new", state: running }),
+      get: async () => running,
+      cancel: async () => complete,
+      summary: (state: Record<string, unknown>) => ({ terminal: state.status === "complete", completeness: { pagination_complete: true, safe_to_claim_absence: true, scope: "entire_observed_accessible_scope", consistency_level: "best_effort_complete_observation", incomplete_reasons: [] } })
+    }
+  } as unknown as AppRuntime;
+  registerInventoryTools(server as unknown as McpServer, runtime);
+  const created = await call(server, "yfy_inventory_create", { workspace: "scope" });
+  const inventory = String(created.structuredContent?.inventory);
+  const result = await call(server, "yfy_inventory_cancel", { inventory });
+  assert.equal((result.structuredContent?.cancellation as Record<string, unknown>).outcome, "already_terminal");
+  assert.equal(result.structuredContent?.status, "complete");
+});
+
+test("ordinary open does not require workspace ancestry metadata", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["drive"], maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, transport: "stdio" },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => endpoint.endsWith("/versions")
+        ? response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 9, modified_at: 1 }] })
+        : endpoint.endsWith("/download_v2")
+          ? response(endpoint, { download_url: "https://download.example/file" })
+          : response(endpoint, { id: 10, name: "ordinary.pdf", type: "file", size: 9, modified_at: 1, file_version_key: "v1" })
+    },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "ordinary.pdf", tempPath: "C:/temp/ordinary.pdf", sha1: "a".repeat(40), sha256: "b".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
+    evidence: { register: () => `yfy://evidence/${"5".repeat(48)}` }
+  } as unknown as AppRuntime;
+  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_open", { file: "file:10" });
+  assert.notEqual(result.isError, true, JSON.stringify(result.content));
+  assert.equal(((result.structuredContent?.assurance as Record<string, unknown>).checks as Record<string, unknown>).workspace_membership, "not_applicable");
 });
 
 test("evidence capture rejects a current file version key for historical content", async () => {
   const server = new FakeServer();
   const runtime = { config: { toolsets: ["evidence"] }, access: { resolveScope: scopedAccess } } as unknown as AppRuntime;
-  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_capture", { scope_id: "scope", file_id: "10", version: { kind: "historical", version_id: "7" }, expected: { file_version_key: "current-key" } });
+  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_capture", { workspace: "scope", file: "file:10", version: "version:10:7", expected: { file_version_key: "current-key" } });
   assert.equal(result.isError, true);
   assert.equal(errorCode(result), "YFY_INPUT_INVALID");
 });
@@ -319,8 +293,8 @@ test("evidence capture validates a historical version with the reverse-ordinal s
     client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/evidence.pdf", sha1: "b".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
     evidence: { register: () => `yfy://evidence/${"1".repeat(48)}` }
   } as unknown as AppRuntime;
-  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_capture", { scope_id: "scope", file_id: "10", version: { kind: "historical", version_id: "7" } });
+  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_capture", { workspace: "scope", file: "file:10", version: "version:10:7" });
   assert.notEqual(result.isError, true);
   assert.equal(requestedVersion, 1);
   assert.equal((result.structuredContent?.selection as Record<string, unknown>).download_strategy, "historical_reverse_ordinal");
@@ -345,8 +319,8 @@ test("evidence capture falls back to a validated historical version-id strategy"
       : ({ fileName: "evidence.pdf", tempPath: "C:/temp/current.pdf", sha1: "a".repeat(40), sha256: "d".repeat(64), sizeBytes: 10, meta: response("/download", {}).meta }) },
     evidence: { register: () => `yfy://evidence/${"2".repeat(48)}` }
   } as unknown as AppRuntime;
-  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_capture", { scope_id: "scope", file_id: "10", version: { kind: "historical", version_id: "7" } });
+  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_capture", { workspace: "scope", file: "file:10", version: "version:10:7" });
   assert.notEqual(result.isError, true, JSON.stringify(result.content));
   assert.deepEqual(requestedVersions, [2, 1, "7"]);
   assert.equal((result.structuredContent?.selection as Record<string, unknown>).download_strategy, "historical_version_id");
@@ -366,8 +340,8 @@ test("evidence capture returns provider-contract diagnostics when history is una
     } },
     client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/current.pdf", sha1: "a".repeat(40), sha256: "d".repeat(64), sizeBytes: 10, meta: response("/download", {}).meta }) }
   } as unknown as AppRuntime;
-  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_capture", { scope_id: "scope", file_id: "10", version: { kind: "historical", version_id: "7" } });
+  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_capture", { workspace: "scope", file: "file:10", version: "version:10:7" });
   assert.equal(result.isError, true);
   assert.equal(errorCode(result), "YFY_HISTORICAL_CAPTURE_UNAVAILABLE");
   assert.match(JSON.stringify(result.content), /provider_contract|attempts/);
@@ -387,8 +361,8 @@ test("historical evidence capture preserves authorization errors", async () => {
       return response(endpoint, { id: "10", name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
     } }
   } as unknown as AppRuntime;
-  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_capture", { scope_id: "scope", file_id: "10", version: { kind: "historical", version_id: "7" } });
+  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_capture", { workspace: "scope", file: "file:10", version: "version:10:7" });
   assert.equal(result.isError, true);
   assert.equal(errorCode(result), "YFY_PERMISSION_DENIED");
   assert.equal(downloadRequests, 1);
@@ -406,14 +380,14 @@ test("current evidence capture rejects disagreement with current file metadata",
     client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/metadata-mismatch.pdf", sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
     evidence: { register: () => { throw new Error("mismatched evidence must not be registered"); } }
   } as unknown as AppRuntime;
-  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_capture", { scope_id: "scope", file_id: "10" });
+  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_capture", { workspace: "scope", file: "file:10" });
   assert.equal(result.isError, true);
   assert.equal(errorCode(result), "YFY_EVIDENCE_DRIFT");
-  assert.match(JSON.stringify(result.content), /current_metadata_size_matches/);
+  assert.match(JSON.stringify(result.content), /current_metadata_size/);
 });
 
-test("current evidence capture returns one authority-bound artifact and expectation result", async () => {
+test("capture rolls back content when an expectation does not match", async () => {
   const server = new FakeServer();
   const runtime = {
     config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, transport: "stdio" },
@@ -426,18 +400,16 @@ test("current evidence capture returns one authority-bound artifact and expectat
       }
     },
     client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/evidence.pdf", sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
-    evidence: { register: () => `yfy://evidence/${"3".repeat(48)}` }
+    evidence: { register: () => { throw new Error("mismatched content must not be registered"); } }
   } as unknown as AppRuntime;
-  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_capture", { file_id: "10", scope_id: "scope", expected: { sha256: "d".repeat(64) } });
-  assert.notEqual(result.isError, true);
-  assert.equal((result.structuredContent?.selection as Record<string, unknown>).download_strategy, "current_ordinal");
-  assert.equal((result.structuredContent?.artifact as Record<string, unknown>).local_path, undefined);
-  assert.equal((result.structuredContent?.artifact as Record<string, unknown>).delivery, "mcp_resource");
-  assert.equal(((result.structuredContent?.expectation as Record<string, unknown>).matches), false);
+  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_capture", { file: "file:10", workspace: "scope", expected: { sha256: "d".repeat(64) } });
+  assert.equal(result.isError, true);
+  assert.equal(errorCode(result), "YFY_EXPECTATION_MISMATCH");
+  assert.match(JSON.stringify(result.content), /actual|expected|sha256/);
 });
 
-test("HTTP evidence deletes validated files that exceed the resource limit", async () => {
+test("large captured content returns a multipart resource without a local path", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-http-evidence-large-"));
   const tempPath = path.join(dir, "evidence.bin");
   await fs.writeFile(tempPath, "content");
@@ -449,16 +421,19 @@ test("HTTP evidence deletes validated files that exceed the resource limit", asy
       : endpoint.endsWith("/download_v2") ? response(endpoint, { download_url: "https://download.example/file" })
         : response(endpoint, { id: 10, name: "evidence.bin", type: "file", size: 7, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] }) },
     client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.bin", tempPath, sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 7, meta: response("/download", {}).meta }) },
-    evidence: { register: () => { throw new Error("oversized evidence must not be registered"); } }
+    evidence: { register: () => `yfy://evidence/${"4".repeat(48)}` }
   } as unknown as AppRuntime;
   try {
-    registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-    const result = await call(server, "yfy_evidence_capture", { scope_id: "scope", file_id: "10" });
+    registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_capture", { workspace: "scope", file: "file:10" });
     assert.notEqual(result.isError, true, JSON.stringify(result.content));
-    const artifact = result.structuredContent?.artifact as Record<string, unknown>;
-    assert.equal(artifact.delivery, "omitted");
-    assert.equal(artifact.resource_uri, undefined);
-    await assert.rejects(() => fs.stat(tempPath), { code: "ENOENT" });
+    const resource = result.structuredContent?.resource as Record<string, unknown>;
+    assert.equal(resource.delivery, "multipart_resource");
+    assert.match(String(resource.resource_uri), /\/manifest$/);
+    const link = result.content?.find((entry) => entry.type === "resource_link") as ({ mimeType?: string } | undefined);
+    assert.equal(link?.mimeType, "application/json");
+    assert.equal(resource.local_path, undefined);
+    assert.equal((await fs.stat(tempPath)).size, 7);
   } finally {
     await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }

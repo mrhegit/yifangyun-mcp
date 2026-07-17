@@ -11,6 +11,8 @@ export interface CreateSnapshotInput {
   includeFiles: boolean;
   includeFolders: boolean;
   matchFields: Array<"name" | "path">;
+  maxAgeSeconds?: number;
+  forceRefresh?: boolean;
   maxItemDepth: number;
   maxItems: number;
   pageCapacity: number;
@@ -37,7 +39,7 @@ export class SnapshotService {
     }
   }
 
-  async create(input: CreateSnapshotInput): Promise<{ reused: boolean; state: ScopeScanState }> {
+  async create(input: CreateSnapshotInput): Promise<{ reuseReason: "fresh_complete" | "running_join" | "new"; reused: boolean; state: ScopeScanState }> {
     const resolved = this.access.resolveContext(input.accessContextId);
     const policy: ScopeScanPolicy = {
       caseSensitive: input.caseSensitive,
@@ -52,6 +54,8 @@ export class SnapshotService {
       accessContextId: resolved.context.id,
       accessIdentityRef: resolved.identityRef,
       externalEnterpriseId: resolved.context.externalEnterpriseId,
+      forceRefresh: input.forceRefresh,
+      maxAgeSeconds: input.maxAgeSeconds ?? 300,
       policy,
       rootFolderId: input.rootFolderId,
       signal: input.signal,
@@ -79,17 +83,17 @@ export class SnapshotService {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const state = await this.get(input.scanId, input.accessContextId);
       if (input.cursor && input.cursor.revision !== state.revision) {
-        throw new YifangyunError("Snapshot changed after this cursor was issued.", {
-          code: "YFY_SNAPSHOT_CURSOR_STALE",
-          phase: "snapshot_query",
+        throw new YifangyunError("Inventory changed after this cursor was issued.", {
+          code: "YFY_INVENTORY_CURSOR_STALE",
+          phase: "inventory_query",
           scanId: state.scanId,
           agentDetails: { current_revision: state.revision, cursor_revision: input.cursor.revision, restart_required: true },
-          suggestedAction: "Repeat the same snapshot query without cursor to restart from the first stable page."
+          suggestedAction: "Repeat the same inventory query without cursor to restart from the first stable page."
         });
       }
       const queries = input.queries ?? [];
       if (input.mode === "search" && queries.length === 0) {
-        throw new YifangyunError("Snapshot search requires at least one query.", { code: "YFY_SNAPSHOT_QUERY_EMPTY", phase: "snapshot_query", scanId: state.scanId, suggestedAction: "Provide queries, or use mode=list to enumerate snapshot items." });
+        throw new YifangyunError("Inventory search requires at least one query.", { code: "YFY_INVENTORY_QUERY_EMPTY", phase: "inventory_query", scanId: state.scanId, suggestedAction: "Provide queries, or use mode=list to enumerate inventory items." });
       }
       const result = input.mode === "search"
         ? await this.engine.search(input.scanId, queries, input.type ?? "all", input.cursor, input.limit)
@@ -99,23 +103,23 @@ export class SnapshotService {
         return { ...result, ...(result.nextCursor ? { nextCursor: { ...result.nextCursor, revision: state.revision } } : {}), state };
       }
       if (input.cursor) {
-        throw new YifangyunError("Snapshot changed after this cursor was issued.", {
-          code: "YFY_SNAPSHOT_CURSOR_STALE",
-          phase: "snapshot_query",
+        throw new YifangyunError("Inventory changed after this cursor was issued.", {
+          code: "YFY_INVENTORY_CURSOR_STALE",
+          phase: "inventory_query",
           scanId: state.scanId,
           agentDetails: { current_revision: after.revision, cursor_revision: input.cursor.revision, restart_required: true },
-          suggestedAction: "Repeat the same snapshot query without cursor to restart from the first stable page."
+          suggestedAction: "Repeat the same inventory query without cursor to restart from the first stable page."
         });
       }
     }
-    throw new YifangyunError("Snapshot is changing too quickly to return a consistent page.", { code: "YFY_SNAPSHOT_QUERY_BUSY", phase: "snapshot_query", retryable: true, scanId: input.scanId, suggestedAction: "Retry after the snapshot reaches complete or partial status." });
+    throw new YifangyunError("Inventory is changing too quickly to return a consistent page.", { code: "YFY_INVENTORY_QUERY_BUSY", phase: "inventory_query", retryable: true, scanId: input.scanId, suggestedAction: "Retry after the inventory reaches complete or partial status." });
   }
 
   async cancel(scanId: string, accessContextId?: string): Promise<ScopeScanState> {
-    await this.get(scanId, accessContextId);
+    const state = await this.get(scanId, accessContextId);
+    if (["complete", "partial", "cancelled", "failed", "expired"].includes(state.status)) return state;
     this.controllers.get(scanId)?.abort("snapshot cancelled");
-    const cancelled = await this.engine.cancel(scanId);
-    return cancelled;
+    return this.engine.cancel(scanId);
   }
 
   summary(state: ScopeScanState): JsonObject {
@@ -181,7 +185,7 @@ export class SnapshotService {
       if (advanced.status === "paused_retryable") {
         retryCount += 1;
         if (retryCount > 3) {
-          await this.engine.fail(scanId, new YifangyunError("Snapshot retry budget was exhausted.", { code: "YFY_SNAPSHOT_RETRY_EXHAUSTED", phase: "snapshot_worker" }));
+          await this.engine.fail(scanId, new YifangyunError("Inventory retry budget was exhausted.", { code: "YFY_INVENTORY_RETRY_EXHAUSTED", phase: "inventory_worker" }));
           return;
         }
         await new Promise<void>((resolve) => {
@@ -205,9 +209,9 @@ export class SnapshotService {
     const requested = accessContextId ?? this.access.resolveContext().context.id;
     const resolved = this.access.resolveContext(requested);
     if (state.accessContextId !== resolved.context.id || state.accessIdentityRef !== resolved.identityRef) {
-      throw new YifangyunError("Snapshot belongs to a different access context.", {
-        code: "YFY_SNAPSHOT_ACCESS_DENIED",
-        phase: "snapshot_access",
+      throw new YifangyunError("Inventory belongs to a different access context.", {
+        code: "YFY_INVENTORY_ACCESS_DENIED",
+        phase: "inventory_access",
         scanId: state.scanId
       });
     }

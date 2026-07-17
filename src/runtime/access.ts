@@ -35,7 +35,7 @@ export class AccessRegistry {
       throw new YifangyunError(`Unknown access context: ${contextId}`, {
         code: "YFY_ACCESS_CONTEXT_NOT_FOUND",
         phase: "access_context",
-        suggestedAction: "Call yfy_context_get to list configured access contexts."
+        suggestedAction: "Call yfy_status to inspect the configured identity and places."
       });
     }
     return { context, identityRef: this.identityRef(context) };
@@ -44,10 +44,10 @@ export class AccessRegistry {
   resolveScope(id: string): ResolvedScope {
     const scope = this.scopes.get(id);
     if (!scope) {
-      throw new YifangyunError(`Unknown authority scope: ${id}`, {
-        code: "YFY_AUTHORITY_SCOPE_NOT_FOUND",
-        phase: "authority_scope",
-        suggestedAction: "Call yfy_context_get to list configured authority scopes."
+      throw new YifangyunError(`Unknown workspace: ${id}`, {
+        code: "YFY_WORKSPACE_NOT_FOUND",
+        phase: "workspace_resolution",
+        suggestedAction: "Call yfy_status to list configured workspaces."
       });
     }
     return { ...this.resolveContext(scope.accessContext), scope };

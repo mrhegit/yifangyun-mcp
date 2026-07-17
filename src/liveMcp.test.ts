@@ -23,7 +23,7 @@ function loadDotEnv(filePath: string): void {
   }
 }
 
-test("live MCP protocol exposes and executes the beta.4 evidence workflow", { skip: process.env.YFY_LIVE_MCP_TESTS !== "enabled" }, async () => {
+test("live MCP protocol exposes and executes the beta.5 capture workflow", { skip: process.env.YFY_LIVE_MCP_TESTS !== "enabled" }, async () => {
   const envPath = process.env.YFY_LIVE_ENV_PATH ?? path.resolve(process.cwd(), ".env");
   assert.ok(fs.existsSync(envPath), `Live env file not found: ${envPath}`);
   loadDotEnv(envPath);
@@ -34,9 +34,9 @@ test("live MCP protocol exposes and executes the beta.4 evidence workflow", { sk
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yfy-live-mcp-"));
   process.env.YFY_STATE_DB = path.join(dir, "state.sqlite");
   process.env.YFY_TEMP_DIR = path.join(dir, "temp");
-  process.env.YFY_TOOLSETS = "core,authority,snapshot,evidence,organization";
+  process.env.YFY_TOOLSETS = "drive,workspace,inventory,evidence,organization";
   process.env.YFY_WORKFLOW_PROFILES = "tender";
-  process.env.YFY_SCOPES_JSON = JSON.stringify([{ id: "live_scope", root_folder_id: rootFolderId, access_context: "default", tags: ["live-test"] }]);
+  process.env.YFY_WORKSPACES_JSON = JSON.stringify([{ id: "live_scope", root_folder_id: rootFolderId, access_context: "default", tags: ["live-test"] }]);
   const runtime = await AppRuntime.create(loadConfig());
   const server = new McpServer({ name: "live-yifangyun", version: SERVER_VERSION });
   const client = new Client({ name: "live-regression", version: "1.0.0" });
@@ -46,21 +46,20 @@ test("live MCP protocol exposes and executes the beta.4 evidence workflow", { sk
     await server.connect(serverTransport);
     await client.connect(clientTransport);
     const tools = await client.listTools();
-    for (const name of ["yfy_context_get", "yfy_root_list", "yfy_evidence_capture", "yfy_evidence_release"]) {
+    for (const name of ["yfy_status", "yfy_browse", "yfy_capture", "yfy_resource_release"]) {
       assert.ok(tools.tools.some((tool) => tool.name === name), `${name} should be exposed`);
     }
-    const context = await client.callTool({ name: "yfy_context_get", arguments: {} });
-    assert.equal((context.structuredContent as Record<string, unknown>).server instanceof Object, true);
-    assert.equal(((context.structuredContent as Record<string, unknown>).server as Record<string, unknown>).version, SERVER_VERSION);
-    const root = await client.callTool({ name: "yfy_root_list", arguments: { root: { kind: "scope", scope_id: "live_scope" }, page_id: 0, page_capacity: 5 } });
+    const status = await client.callTool({ name: "yfy_status", arguments: {} });
+    assert.equal(((status.structuredContent as Record<string, unknown>).server as Record<string, unknown>).version, SERVER_VERSION);
+    const root = await client.callTool({ name: "yfy_browse", arguments: { at: "workspace:live_scope", limit: 5 } });
     assert.notEqual(root.isError, true, JSON.stringify(root.content));
-    const locked = await client.callTool({ name: "yfy_evidence_capture", arguments: { file_id: fileId, scope_id: "live_scope", version: { kind: "current" } } });
+    const locked = await client.callTool({ name: "yfy_capture", arguments: { file: `file:${fileId}`, workspace: "live_scope" } });
     assert.notEqual(locked.isError, true, JSON.stringify(locked.content));
-    const artifact = (locked.structuredContent as Record<string, unknown>).artifact as Record<string, unknown>;
-    assert.match(String(artifact.sha256), /^[a-f\d]{64}$/);
-    const resourceUri = String(artifact.resource_uri);
+    const resource = (locked.structuredContent as Record<string, unknown>).resource as Record<string, unknown>;
+    assert.match(String(resource.sha256), /^[a-f\d]{64}$/);
+    const resourceUri = String(resource.resource_uri);
     assert.match(resourceUri, /^yfy:\/\/evidence\/[a-f\d]{48}$/);
-    const released = await client.callTool({ name: "yfy_evidence_release", arguments: { resource_uri: resourceUri } });
+    const released = await client.callTool({ name: "yfy_resource_release", arguments: { resource_uri: resourceUri } });
     assert.equal((released.structuredContent as Record<string, unknown>).status, "released");
   } finally {
     await client.close();

@@ -6,7 +6,7 @@ import type { AccessContext, AppConfig, AuthorityScope, Toolset, WorkflowProfile
 
 const PUBLIC_BASE_URL = "https://open.fangcloud.com";
 const PUBLIC_API_BASE_URL = `${PUBLIC_BASE_URL}/api`;
-const ToolsetSchema = z.enum(["core", "authority", "snapshot", "evidence", "organization", "collaboration", "mutation", "admin", "transfer"]);
+const ToolsetSchema = z.enum(["drive", "workspace", "inventory", "evidence", "organization", "collaboration", "mutation", "admin", "transfer"]);
 const WorkflowProfileSchema = z.enum(["tender"]);
 const AccessContextSchema = z.object({
   id: z.string().trim().min(1).regex(/^[a-zA-Z0-9_-]+$/),
@@ -114,7 +114,7 @@ function parseAccessContexts(defaultUserId: string): AccessContext[] {
 }
 
 function parseScopes(contexts: AccessContext[]): AuthorityScope[] {
-  const configured = parseJsonArray("YFY_SCOPES_JSON", z.array(AuthorityScopeSchema), []);
+  const configured = parseJsonArray("YFY_WORKSPACES_JSON", z.array(AuthorityScopeSchema), []);
   const contextIds = new Set(contexts.map((context) => context.id));
   const scopes: AuthorityScope[] = configured.map((value) => ({
     id: value.id,
@@ -125,11 +125,11 @@ function parseScopes(contexts: AccessContext[]): AuthorityScope[] {
   const scopeIds = new Set<string>();
   for (const scope of scopes) {
     if (scopeIds.has(scope.id)) {
-      throw new Error(`Duplicate authority scope id: ${scope.id}`);
+      throw new Error(`Duplicate workspace id: ${scope.id}`);
     }
     scopeIds.add(scope.id);
     if (!contextIds.has(scope.accessContext)) {
-      throw new Error(`Scope ${scope.id} references unknown access context ${scope.accessContext}.`);
+      throw new Error(`Workspace ${scope.id} references unknown access context ${scope.accessContext}.`);
     }
   }
   return scopes;
@@ -145,7 +145,7 @@ export function loadConfig(): AppConfig {
     throw new Error("YFY_ENTERPRISE_ID must contain digits only.");
   }
   const accessContexts = parseAccessContexts(defaultUserId);
-  const toolsets = (parseCsv("YFY_TOOLSETS") ?? ["core", "authority", "snapshot", "evidence", "organization"])
+  const toolsets = (parseCsv("YFY_TOOLSETS") ?? ["drive"])
     .map((value) => ToolsetSchema.parse(value)) as Toolset[];
   const tempDir = path.resolve(optionalEnv("YFY_TEMP_DIR") ?? path.join(os.tmpdir(), "yifangyun-mcp"));
   const stateDatabasePath = path.resolve(optionalEnv("YFY_STATE_DB") ?? path.join(tempDir, "state.sqlite"));
@@ -162,9 +162,9 @@ export function loadConfig(): AppConfig {
   if (!accessContexts.some((context) => context.id === defaultAccessContext)) {
     throw new Error(`YFY_DEFAULT_ACCESS_CONTEXT references unknown context ${defaultAccessContext}.`);
   }
-  const snapshotConcurrency = parsePositiveInt("YFY_SNAPSHOT_CONCURRENCY", 2);
+  const snapshotConcurrency = parsePositiveInt("YFY_INVENTORY_CONCURRENCY", 2);
   if (snapshotConcurrency > 8) {
-    throw new Error("YFY_SNAPSHOT_CONCURRENCY must be between 1 and 8.");
+    throw new Error("YFY_INVENTORY_CONCURRENCY must be between 1 and 8.");
   }
   const maxDownloadBytes = parsePositiveInt("YFY_MAX_DOWNLOAD_BYTES", 268435456);
   const maxEvidenceResourceBytes = parsePositiveInt("YFY_MAX_EVIDENCE_RESOURCE_BYTES", 16777216);
@@ -207,7 +207,7 @@ export function loadConfig(): AppConfig {
     retryBaseDelayMs: parsePositiveInt("YFY_RETRY_BASE_DELAY_MS", 500),
     retryMaxAttempts: parsePositiveInt("YFY_RETRY_MAX_ATTEMPTS", 3),
     snapshotConcurrency,
-    snapshotTtlSeconds: parsePositiveInt("YFY_SNAPSHOT_TTL_SECONDS", 604800),
+    snapshotTtlSeconds: parsePositiveInt("YFY_INVENTORY_TTL_SECONDS", 604800),
     stateDatabasePath,
     tempDir,
     tempFileTtlSeconds: parsePositiveInt("YFY_TEMP_FILE_TTL_SECONDS", 86400),
@@ -229,15 +229,15 @@ export function getConfigSummary(config: AppConfig): Record<string, string | num
   return {
     access_contexts: config.accessContexts.map((context) => context.id),
     api_base_url: config.apiBaseUrl,
-    authority_scopes: config.authorityScopes.map((scope) => scope.id),
+    workspaces: config.authorityScopes.map((scope) => scope.id),
     default_access_context: config.defaultAccessContext,
     max_download_bytes: config.maxDownloadBytes,
     max_evidence_resource_bytes: config.maxEvidenceResourceBytes ?? 16777216,
     max_page_capacity: config.maxPageCapacity,
     max_state_bytes: config.maxStateBytes ?? 2147483648,
     oauth_base_url: config.oauthBaseUrl,
-    snapshot_ttl_seconds: config.snapshotTtlSeconds ?? 604800,
-    snapshot_concurrency: config.snapshotConcurrency ?? 2,
+    inventory_ttl_seconds: config.snapshotTtlSeconds ?? 604800,
+    inventory_concurrency: config.snapshotConcurrency ?? 2,
     toolsets: config.toolsets,
     transport: config.transport ?? "stdio",
     workflow_profiles: config.workflowProfiles

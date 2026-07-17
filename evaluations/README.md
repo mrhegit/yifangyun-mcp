@@ -1,9 +1,7 @@
 # Agent Evaluations
 
-`authority_readonly.xml` 包含 10 个只读、独立、可字符串校验的问题，用于验证 Agent 是否能正确选择 1.0 Core、Authority、Snapshot 和 Evidence 工具。
+`general_workflows.xml` 覆盖 Drive、Workspace、Inventory、Capture、Resource 和写入工具选择，重点检查普通任务是否避免过度调用 Inventory/Capture。
 
-这些问题绑定固定 authority root `501000715605`。运行前应将其配置成命名 scope，并调用 `yfy_authority_validate` 确认环境仍指向预期业务路径；若 Provider 中固定资料被管理员迁移，应重新执行只读验证后更新答案。
+`authority_readonly.xml` 绑定固定 Workspace root `501000715605`，用于验证业务路径和完整性场景。运行前将该目录配置为命名 Workspace，并调用 `yfy_workspace_validate`。
 
-推荐同时记录准确率、平均工具调用数、任务耗时、错误码分布和是否错误地使用 hint-only 搜索声明不存在。
-
-`general_workflows.xml` 包含法务、采购、审计、合同和供应商资料场景，用于确认投标优化没有把 MCP 限制成单一业务工具。
+除工具选择准确率外，应记录完整工具 trace、参数、输出字节数、平均调用数、错误分类、cursor 可执行性，以及是否在 `safe_to_claim_absence=false` 时错误声明不存在。

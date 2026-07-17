@@ -200,13 +200,11 @@ export function projectGroup(value: JsonValue | undefined): JsonObject {
   return output;
 }
 
-export function provenance(meta: ApiResponseMeta, accessContext?: string): JsonObject {
+export function provenance(meta: ApiResponseMeta, _accessContext?: string, operation = "provider_request"): JsonObject {
   return {
     source: "yifangyun_openapi",
-    endpoint: meta.endpoint,
+    operation,
     observed_at: meta.fetchedAtIso,
-    status_code: meta.statusCode,
-    ...(meta.requestId ? { request_id: meta.requestId } : {}),
-    ...(accessContext ? { access_context: accessContext } : {})
+    ...(meta.requestId ? { request_id: meta.requestId } : {})
   };
 }

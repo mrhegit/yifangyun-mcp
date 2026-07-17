@@ -36,7 +36,27 @@
     <answer>file_manager</answer>
   </qa_pair>
   <qa_pair>
-    <question>需要证明某关键词在投标 scope 的可见子树中不存在。官方索引搜索不能完成该证明。只回答应首先调用的 1.0 snapshot 工具名。</question>
-    <answer>yfy_snapshot_create</answer>
+    <question>需要证明某关键词在投标 Workspace 的可见子树中不存在。官方索引搜索不能完成该证明。只回答应首先调用的 beta.5 Inventory 工具名。</question>
+    <answer>yfy_inventory_create</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>需要确认 file:501 是否属于投标 Workspace，但越界不能中断流程。只回答工具名和 mode。</question>
+    <answer>yfy_membership_check,query</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>需要验证投标 Workspace 的根目录、业务路径和首尾页可达性。只回答工具名。</question>
+    <answer>yfy_workspace_validate</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>已有完整且足够新的 Inventory，应选择 reuse_if_fresh 还是 force_refresh？只回答模式。</question>
+    <answer>reuse_if_fresh</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>审计要求重新观察当前 Workspace，不能复用旧 Inventory。只回答 freshness mode。</question>
+    <answer>force_refresh</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>yfy_capture 的 expected.sha256 不匹配时，是否应保留可读取 Resource？只回答是或否。</question>
+    <answer>否</answer>
   </qa_pair>
 </evaluation>

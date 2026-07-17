@@ -5,7 +5,7 @@
 ```text
 MCP Transport
   -> Tool Catalog
-    -> Core / Authority / Snapshot / Evidence / Organization
+    -> Drive / Workspace / Inventory / Evidence / Organization
     -> Optional Collaboration / Mutation / Admin / Transfer
       -> AppRuntime
         -> AccessRegistry
@@ -41,13 +41,13 @@ Tool Catalog 只暴露稳定领域模型。Provider 路径、参数、分页和�
 - 可选 external enterprise ID
 - HMAC identity ref
 
-identity ref 用于 snapshot 访问隔离和本地 evidence 目录命名，不包含原始凭据。
+identity ref 用于 Inventory 访问隔离和本地 content 目录命名，不包含原始凭据。
 
 当前 HTTP 部署仍是单配置主体模型：一个 MCP Server 进程使用一套企业凭据和静态 context 注册表。它不是面向不可信多租户的 OAuth delegation server。
 
-## Snapshot
+## Inventory
 
-SnapshotService 在后台自动推进 Provider 分页。Agent 不管理 revision、CAS 或 page checkpoint。
+内部 SnapshotService 在后台自动推进 Provider 分页，外部只暴露 Inventory Interface。Agent 不管理 revision、CAS、Provider page 或 checkpoint。
 
 SQLite 表：
 
@@ -65,7 +65,7 @@ Provider I/O 使用有界并发抓取。正式结果由单一提交器按 FIFO c
 
 文件型 SQLite 使用同主机进程锁，第二个进程不能同时打开同一个 `YFY_STATE_DB`。
 
-Snapshot 可检测：
+Inventory 可检测：
 
 - 分页元数据缺失
 - 空页面但还有下一页
@@ -79,9 +79,9 @@ Snapshot 可检测：
 
 `safe_to_claim_absence` 只适用于 observation window 内、当前 access context 可访问并完成分页的范围。
 
-## Evidence
+## Capture 与 Resource
 
-Evidence 工具默认不返回下载 URL。Provider URL 只在服务内部使用。
+Capture 工具默认不返回下载 URL。Provider URL 只在服务内部使用。
 
 安全措施：
 
@@ -97,7 +97,7 @@ Evidence 工具默认不返回下载 URL。Provider URL 只在服务内部使用
 - TTL 清理
 - drift 时删除候选文件
 
-成功 Evidence 在大小不超过 `YFY_MAX_EVIDENCE_RESOURCE_BYTES` 时注册随机、短期 `yfy://evidence/{token}` resource。读取 resource 会在分配内存前再次校验文件大小与 SHA-256。普通 stdio 和 HTTP 调用都只返回 resource；仅 stdio 超限 Artifact 返回显式 `local_file` delivery 和本地路径，同时保留可释放 URI。HTTP 超限结果在校验后删除。工具输出在交给 MCP SDK 前执行严格 schema 校验，失败时回滚 Artifact，避免孤儿文件；`transfer` toolset 是唯一直接返回 Provider 下载 URL 的接口。
+成功 Capture 注册随机、短期 `yfy://evidence/{token}` Resource。小文件读取时复核大小与 SHA-256；大文件返回 manifest 和有界 part URI，每个 part 读取时流式复核整文件 SHA-256。stdio 和 HTTP 都不返回本地路径。工具输出在交给 MCP SDK 前执行严格 schema 校验，失败或 expectation mismatch 时回滚临时内容；`transfer` toolset 是唯一直接返回 Provider 下载 URL 的接口。
 
 ## HTTP
 
@@ -111,7 +111,7 @@ Session 数量由 `YFY_HTTP_MAX_SESSIONS` 限制，无活动请求的 session �
 
 本地文件上传属于显式高权限能力，所有源路径必须位于 `YFY_UPLOAD_ROOT_DIR` 内，HTTP 和 stdio 结果均不回显服务器绝对源路径。
 
-Bearer 使用 timing-safe compare。Express 禁用 `X-Powered-By`。进程处理 SIGINT/SIGTERM 时停止 HTTP 接受请求、等待 snapshot worker 结束并关闭 SQLite。
+Bearer 使用 timing-safe compare。Express 禁用 `X-Powered-By`。进程处理 SIGINT/SIGTERM 时停止 HTTP 接受请求、等待 Inventory worker 结束并关闭 SQLite。
 
 ## Provider 请求
 
@@ -127,4 +127,4 @@ Bearer 使用 timing-safe compare。Express 禁用 `X-Powered-By`。进程处理
 
 SQLite 适合同一主机、单写入进程。多个 MCP 进程不得同时把同一个 SQLite 文件放在不支持文件锁的网络文件系统上。
 
-需要真正多租户或跨区域水平扩展时，应实现独立的 PostgreSQL SnapshotRepository 和请求主体认证 adapter。
+需要真正多租户或跨区域水平扩展时，应实现独立的 PostgreSQL Inventory repository 和请求主体认证 adapter。

@@ -7,7 +7,7 @@ export type IdLike = string | number;
 
 export type TokenSubjectType = "enterprise" | "user";
 
-export type Toolset = "core" | "authority" | "snapshot" | "evidence" | "organization" | "collaboration" | "mutation" | "admin" | "transfer";
+export type Toolset = "drive" | "workspace" | "inventory" | "evidence" | "organization" | "collaboration" | "mutation" | "admin" | "transfer";
 export type WorkflowProfile = "tender";
 
 export interface AccessContext {

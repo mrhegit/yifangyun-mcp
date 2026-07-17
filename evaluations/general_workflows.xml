@@ -1,42 +1,74 @@
 <evaluation>
   <qa_pair>
-    <question>法务知道合同在合同库中的精确相对路径，需要避免索引误匹配。只回答首选工具名。</question>
-    <answer>yfy_path_resolve</answer>
+    <question>法务知道合同在个人盘中的精确相对路径，需要避免索引误匹配。只回答首选工具名。</question>
+    <answer>yfy_resolve</answer>
   </qa_pair>
   <qa_pair>
-    <question>采购只需要从全公司索引中发现供应商证书候选，暂时不要求完整性证明。只回答首选工具名。</question>
-    <answer>yfy_item_search</answer>
+    <question>采购只需要从 Workspace 的 Provider 索引发现供应商证书候选，暂时不要求完整性证明。只回答首选工具名。</question>
+    <answer>yfy_search</answer>
   </qa_pair>
   <qa_pair>
-    <question>审计需要证明某关键词在一个已配置 scope 的可见子树中不存在。只回答首先创建观察任务的工具名。</question>
-    <answer>yfy_snapshot_create</answer>
+    <question>用户只想浏览个人盘第一页。只回答首选工具名。</question>
+    <answer>yfy_browse</answer>
   </qa_pair>
   <qa_pair>
-    <question>Snapshot 已完成，需要分页搜索其中多个关键词且不能重新请求 Provider 目录。只回答工具名。</question>
-    <answer>yfy_snapshot_query</answer>
+    <question>已取得 file:501，需要读取当前内容但不要求 Workspace 证明。只回答首选工具名。</question>
+    <answer>yfy_open</answer>
   </qa_pair>
   <qa_pair>
-    <question>需要查询文件是否属于合同归档 scope，但文件在 scope 外也应作为正常查询结果返回。只回答工具名和 mode，格式为 tool,mode。</question>
-    <answer>yfy_scope_check,query</answer>
+    <question>需要读取 file:501 的历史版本，首先应取得绑定文件身份的版本引用。只回答工具名。</question>
+    <answer>yfy_versions</answer>
   </qa_pair>
   <qa_pair>
-    <question>需要在文件越界时让 Agent 工作流立即失败。只回答工具名和 mode，格式为 tool,mode。</question>
-    <answer>yfy_scope_check,assert</answer>
+    <question>审计需要证明某关键词在已配置 Workspace 的可见子树中不存在。只回答首先创建观察任务的工具名。</question>
+    <answer>yfy_inventory_create</answer>
   </qa_pair>
   <qa_pair>
-    <question>需要下载当前原件、固定版本、计算 SHA-256，并在下载期间元数据变化时拒绝结果。只回答工具名。</question>
-    <answer>yfy_evidence_capture</answer>
+    <question>Inventory 已完成，需要搜索其中一个材料名称且不能重新请求 Provider 目录。只回答工具名。</question>
+    <answer>yfy_inventory_search</answer>
   </qa_pair>
   <qa_pair>
-    <question>需要在已配置 Authority Scope 内比较现有证据 SHA-256 与当前远端内容。只回答工具名。</question>
-    <answer>yfy_evidence_capture</answer>
+    <question>需要查询文件是否属于合同归档 Workspace，但越界也应作为正常结果返回。只回答工具名和 mode，格式为 tool,mode。</question>
+    <answer>yfy_membership_check,query</answer>
   </qa_pair>
   <qa_pair>
-    <question>需要查看当前 MCP 配置中有哪些 access context 和 authority scope，不应读取环境变量或凭据。只回答工具名。</question>
-    <answer>yfy_context_get</answer>
+    <question>需要在文件越界时让工作流立即失败。只回答工具名和 mode。</question>
+    <answer>yfy_membership_check,assert</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>需要在 Workspace 内固定当前原件、计算 SHA-256，并在下载期间元数据变化时拒绝结果。只回答工具名。</question>
+    <answer>yfy_capture</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>下游已处理完 yfy://evidence/.../manifest，需要删除临时内容。只回答工具名。</question>
+    <answer>yfy_resource_release</answer>
   </qa_pair>
   <qa_pair>
     <question>需要将本地修订稿上传为已有合同文件的新版本。只回答工具名。</question>
     <answer>yfy_file_version_upload</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>只知道一个部门 ID，需要浏览该部门空间中的文件。只回答首选 Drive 工具名。</question>
+    <answer>yfy_browse</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>已经得到 yfy_browse 返回的 next_action，需要继续下一页。只回答应如何处理 cursor：解析或原样执行 next_action。</question>
+    <answer>原样执行 next_action</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Provider 索引搜索返回空结果，是否可以证明 Workspace 中不存在该文件？只回答是或否。</question>
+    <answer>否</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>需要读取当前文件版本，yfy_open 的 version 参数应传 current ref 还是省略？只回答“传 ref”或“省略”。</question>
+    <answer>省略</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Inventory 结果为 partial 且没有命中目标，是否可以声明目标不存在？只回答是或否。</question>
+    <answer>否</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>需要同时读取 30 个已知 ItemRef，并保留部分成功结果。只回答首选工具名。</question>
+    <answer>yfy_get_many</answer>
   </qa_pair>
 </evaluation>

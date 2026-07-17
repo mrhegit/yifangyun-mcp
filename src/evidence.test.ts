@@ -15,7 +15,8 @@ test("evidence registry exposes short-lived bytes through an opaque resource tok
     const uri = await registry.register({ path: filePath, name: "evidence.txt", mimeType: "text/plain", expectedSize: 8, expectedSha256: crypto.createHash("sha256").update("evidence").digest("hex") });
     assert.match(uri, /^yfy:\/\/evidence\/[a-f0-9]{48}$/);
     const artifact = await registry.read(uri.split("/").at(-1)!);
-    assert.equal(Buffer.from(artifact.blob, "base64").toString("utf8"), "evidence");
+    assert.equal(artifact.kind, "text");
+    assert.equal(artifact.kind === "text" ? artifact.text : undefined, "evidence");
     assert.equal(artifact.mimeType, "text/plain");
   } finally {
     await registry.close();
@@ -31,6 +32,26 @@ test("evidence registry rejects oversized resources before allocating content", 
   try {
     const uri = await registry.register({ path: filePath, name: "large.bin", expectedSize: 32, expectedSha256: crypto.createHash("sha256").update(Buffer.alloc(32)).digest("hex") });
     await assert.rejects(() => registry.read(uri.split("/").at(-1)!), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_EVIDENCE_RESOURCE_TOO_LARGE"));
+  } finally {
+    await registry.close();
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("evidence registry exposes oversized resources as verified parts", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-evidence-parts-"));
+  const filePath = path.join(dir, "large.bin");
+  const bytes = Buffer.from("abcdefghijklmnopqrstuvwxyz", "utf8");
+  await fs.writeFile(filePath, bytes, { mode: 0o600 });
+  const registry = new EvidenceArtifactRegistry(60, 10);
+  try {
+    const uri = await registry.register({ path: filePath, name: "large.bin", expectedSize: bytes.length, expectedSha256: crypto.createHash("sha256").update(bytes).digest("hex") });
+    const token = uri.split("/").at(-1)!;
+    const manifest = await registry.manifest(token);
+    assert.equal(manifest.partCount, 3);
+    const parts = await Promise.all([0, 1, 2].map((part) => registry.readPart(token, part)));
+    assert.deepEqual(Buffer.concat(parts.map((part) => Buffer.from(part.blob, "base64"))), bytes);
+    assert.equal(await registry.release(`${uri}/manifest`), true);
   } finally {
     await registry.close();
     await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
@@ -78,6 +99,22 @@ test("evidence registry release deletes bytes and invalidates the token", async 
     assert.equal(await registry.release(uri), true);
     await assert.rejects(() => fs.stat(filePath), { code: "ENOENT" });
     assert.equal(await registry.release(uri), false);
+  } finally {
+    await registry.close();
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("evidence registry reports an expired resource as already unavailable", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-evidence-expired-release-"));
+  const filePath = path.join(dir, "evidence.txt");
+  await fs.writeFile(filePath, "evidence");
+  const registry = new EvidenceArtifactRegistry(1, 1024);
+  try {
+    const uri = await registry.register({ path: filePath, name: "evidence.txt", expectedSize: 8, expectedSha256: crypto.createHash("sha256").update("evidence").digest("hex") });
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    assert.equal(await registry.release(uri), false);
+    await assert.rejects(() => fs.stat(filePath), { code: "ENOENT" });
   } finally {
     await registry.close();
     await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });

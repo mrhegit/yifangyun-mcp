@@ -114,7 +114,7 @@ export interface ScopeScanRepository {
   commitPage(scanId: string, artifact: ScopePageArtifact, seenItems: ScopeSeenItem[], state: ScopeScanState, current: ScopeScanFrontier, append: ScopeScanFrontier[]): Promise<void>;
   create(state: ScopeScanState, frontier: ScopeScanFrontier[]): Promise<void>;
   findSeenItems(scanId: string, itemIds: string[]): Promise<Map<string, ScopeSeenItem>>;
-  findReusable(accessIdentityRef: string, rootFolderId: string, policyHash: string): Promise<ScopeScanState | undefined>;
+  findReusable(accessIdentityRef: string, rootFolderId: string, policyHash: string, updatedAfterMs: number): Promise<ScopeScanState | undefined>;
   hasPage(scanId: string, pageKey: string): Promise<boolean>;
   listItems(scanId: string, type: "file" | "folder" | "all", cursor: ScopeItemCursor | undefined, limit: number): Promise<ScopeItemPage>;
   listPages(scanId: string): Promise<ScopePageArtifact[]>;

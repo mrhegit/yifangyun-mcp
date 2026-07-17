@@ -2,13 +2,22 @@ import { z } from "zod";
 
 export const JsonObjectSchema = z.record(z.unknown());
 export const JsonValueSchema = z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(z.unknown()), z.record(z.unknown())]);
+export const PlaceRefSchema = z.string().trim().regex(/^(personal|collaboration|department:\d+|folder:\d+|workspace:[A-Za-z0-9._-]+)$/).describe("Copy a place ref returned by yfy_status, or use personal, collaboration, department:<id>, folder:<id>, or workspace:<id>.");
+export const ItemRefSchema = z.string().trim().regex(/^(file|folder):\d+$/).describe("Stable item ref returned by this server, such as file:501 or folder:502.");
+export const FileRefSchema = z.string().trim().regex(/^file:\d+$/).describe("Stable file ref returned by this server.");
+export const VersionRefSchema = z.string().trim().regex(/^version:\d+:\d+$/).describe("Historical version ref returned by yfy_versions. Omit it for the current version.");
+export const SimplePageSchema = z.object({
+  returned_count: z.number().int().nonnegative(),
+  has_more: z.boolean(),
+  next_cursor: z.string().optional()
+}).strict();
+export const NextActionSchema = z.object({ tool: z.string(), arguments: z.record(z.unknown()) }).strict();
+export const VerificationStatusSchema = z.enum(["pass", "not_applicable", "unavailable"]);
 export const ProvenanceSchema = z.object({
   source: z.literal("yifangyun_openapi"),
-  endpoint: z.string(),
+  operation: z.string(),
   observed_at: z.string(),
-  status_code: z.number().int(),
-  request_id: z.string().optional(),
-  access_context: z.string().optional()
+  request_id: z.string().optional()
 });
 export const PathEntrySchema = z.object({ id: z.string().optional(), name: z.string().optional(), type: z.string().optional() });
 export const UserSchema = z.object({ id: z.string().optional(), name: z.string().optional(), active: z.boolean().optional(), email: z.string().optional(), phone: z.string().optional() });
@@ -28,26 +37,6 @@ export const ItemSchema = z.object({
   space: z.object({ id: z.string().optional(), name: z.string().optional(), type: z.string().optional() }).optional(), comments_count: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(),
   sequence_id: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(), remark: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional()
 });
-export const RootRefSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("personal") }),
-  z.object({ kind: z.literal("collaboration") }),
-  z.object({ kind: z.literal("department"), department_id: z.string().trim().regex(/^\d+$/) }),
-  z.object({ kind: z.literal("folder"), folder_id: z.string().trim().regex(/^\d+$/) }),
-  z.object({ kind: z.literal("scope"), scope_id: z.string().trim().min(1) })
-]);
-export const CandidateSchema = z.object({
-  item: z.object({
-    id: z.string(), name: z.string(), type: z.enum(["file", "folder"]), parent_folder_id: z.string().optional(), path: z.string().optional()
-  }),
-  verification: z.object({ folder_scope: z.enum(["not_requested", "verified"]), exact_name: z.enum(["not_requested", "verified"]) })
-});
-export const VersionSelectorSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("current") }).describe("Capture the current version."),
-  z.object({
-    kind: z.literal("historical"),
-    version_id: z.string().trim().regex(/^\d+$/).describe("Historical provider_version_id returned by yfy_file_versions.")
-  }).describe("Capture one exact historical version by stable version ID.")
-]);
 export const VersionSelectionProofSchema = z.object({
   kind: z.enum(["current", "historical"]),
   generation: z.number().int().min(0),

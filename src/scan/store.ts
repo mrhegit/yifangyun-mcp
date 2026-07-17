@@ -7,7 +7,7 @@ import type { JsonObject } from "../types.js";
 import type { ScopeItemCursor, ScopeItemPage, ScopePageArtifact, ScopePageReceipt, ScopeScanFrontier, ScopeScanRepository, ScopeScanState, ScopeSeenItem } from "./types.js";
 
 type Row = Record<string, unknown>;
-const SNAPSHOT_SCHEMA_VERSION = 2;
+const SNAPSHOT_SCHEMA_VERSION = 3;
 
 function normalizeText(value: string, caseSensitive: boolean): string {
   const normalized = value.normalize("NFKC")
@@ -208,7 +208,7 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
   async load(scanId: string): Promise<ScopeScanState> {
     const row = this.database.prepare("SELECT state_json FROM snapshots WHERE scan_id = ?").get(scanId) as Row | undefined;
     if (!row) {
-      throw new YifangyunError("Snapshot was not found.", { code: "YFY_SNAPSHOT_NOT_FOUND", phase: "snapshot_store", scanId });
+      throw new YifangyunError("Inventory was not found.", { code: "YFY_INVENTORY_NOT_FOUND", phase: "inventory_store", scanId });
     }
     return parseJson<ScopeScanState>(row.state_json);
   }
@@ -322,7 +322,7 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
 
   async updateFrontier(scanId: string, cursor: ScopeScanFrontier): Promise<void> {
     const result = this.database.prepare("UPDATE snapshot_frontier SET attempt = ? WHERE scan_id = ? AND cursor_key = ?").run(cursor.attempt, scanId, frontierKey(cursor));
-    if (Number(result.changes) !== 1) throw new YifangyunError("Snapshot frontier cursor was not found.", { code: "YFY_SNAPSHOT_FRONTIER_CONFLICT", phase: "snapshot_store", scanId });
+    if (Number(result.changes) !== 1) throw new YifangyunError("Inventory frontier cursor was not found.", { code: "YFY_INVENTORY_FRONTIER_CONFLICT", phase: "inventory_store", scanId });
   }
 
   async removeFrontier(scanId: string, cursor: ScopeScanFrontier, state: ScopeScanState): Promise<void> {
@@ -331,7 +331,7 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
       const previous = this.database.prepare("SELECT state_json FROM snapshots WHERE scan_id = ?").get(scanId) as Row;
       const storage = this.scanStorage(scanId);
       const removed = this.database.prepare("DELETE FROM snapshot_frontier WHERE scan_id = ? AND cursor_key = ?").run(scanId, frontierKey(cursor));
-      if (Number(removed.changes) !== 1) throw new YifangyunError("Snapshot frontier cursor was not found.", { code: "YFY_SNAPSHOT_FRONTIER_CONFLICT", phase: "snapshot_store", scanId });
+      if (Number(removed.changes) !== 1) throw new YifangyunError("Inventory frontier cursor was not found.", { code: "YFY_INVENTORY_FRONTIER_CONFLICT", phase: "inventory_store", scanId });
       state.frontierCount = Math.max(0, state.frontierCount - 1);
       const stateJson = JSON.stringify(state);
       const delta = jsonBytes(stateJson) - jsonBytes(String(previous.state_json)) - frontierBytes(cursor);
@@ -377,13 +377,14 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
     return { receipts: rows.map((row) => parseJson<ScopePageReceipt>(row.receipt_json)), total: Number(totalRow.total) };
   }
 
-  async findReusable(accessIdentityRef: string, rootFolderId: string, policyHash: string): Promise<ScopeScanState | undefined> {
+  async findReusable(accessIdentityRef: string, rootFolderId: string, policyHash: string, updatedAfterMs: number): Promise<ScopeScanState | undefined> {
     const row = this.database.prepare(`
       SELECT state_json FROM snapshots
       WHERE access_identity_ref = ? AND root_folder_id = ? AND policy_hash = ?
-        AND status NOT IN ('cancelled', 'failed', 'expired') AND expires_at_ms > ?
+        AND (status IN ('running', 'paused_retryable') OR (status = 'complete' AND updated_at_ms >= ?))
+        AND expires_at_ms > ?
       ORDER BY updated_at_ms DESC LIMIT 1
-    `).get(accessIdentityRef, rootFolderId, policyHash, Date.now()) as Row | undefined;
+    `).get(accessIdentityRef, rootFolderId, policyHash, updatedAfterMs, Date.now()) as Row | undefined;
     return row ? parseJson<ScopeScanState>(row.state_json) : undefined;
   }
 
@@ -529,7 +530,7 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
       UPDATE snapshots SET status = ?, expires_at_ms = ?, updated_at_ms = ?, state_json = ? WHERE scan_id = ?
     `).run(state.status, Date.parse(state.expiresAt), Date.parse(state.updatedAt), stateJson, state.scanId);
     if (Number(result.changes) !== 1) {
-      throw new YifangyunError("Snapshot state disappeared during update.", { code: "YFY_SNAPSHOT_NOT_FOUND", phase: "snapshot_store", scanId: state.scanId });
+      throw new YifangyunError("Inventory state disappeared during update.", { code: "YFY_INVENTORY_NOT_FOUND", phase: "inventory_store", scanId: state.scanId });
     }
   }
 
@@ -556,11 +557,11 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
       LIMIT 1
     `).get());
     if ((hasSnapshotSchema && version !== SNAPSHOT_SCHEMA_VERSION) || (!hasSnapshotSchema && version !== 0 && version !== SNAPSHOT_SCHEMA_VERSION)) {
-      throw new YifangyunError("Snapshot database schema is incompatible with this server version.", {
+      throw new YifangyunError("Inventory database schema is incompatible with this server version.", {
         code: "YFY_STATE_SCHEMA_MISMATCH",
         details: { actual_schema_version: version, expected_schema_version: SNAPSHOT_SCHEMA_VERSION },
-        phase: "snapshot_store",
-        suggestedAction: "Configure a new YFY_STATE_DB path or remove the old database after confirming its snapshots are no longer needed."
+        phase: "inventory_store",
+        suggestedAction: "Configure a new YFY_STATE_DB path or remove the old database after confirming its inventories are no longer needed."
       });
     }
   }
@@ -602,7 +603,7 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
           }
         }
         if (ownerAlive || ageMs < 5000 || attempt > 1) {
-          throw new YifangyunError("Snapshot database is already open by another process.", { code: "YFY_STATE_DB_IN_USE", phase: "snapshot_store" });
+          throw new YifangyunError("Inventory database is already open by another process.", { code: "YFY_STATE_DB_IN_USE", phase: "inventory_store" });
         }
         const stalePath = `${lockPath}.${process.pid}.${crypto.randomUUID()}.stale`;
         try {
@@ -615,12 +616,12 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
         const moved = readFileSync(stalePath, "utf8");
         if (moved !== observed) {
           if (!existsSync(lockPath)) renameSync(stalePath, lockPath);
-          throw new YifangyunError("Snapshot database lock ownership changed during recovery.", { code: "YFY_STATE_DB_IN_USE", phase: "snapshot_store" });
+          throw new YifangyunError("Inventory database lock ownership changed during recovery.", { code: "YFY_STATE_DB_IN_USE", phase: "inventory_store" });
         }
         rmSync(stalePath, { force: true });
       }
     }
-    throw new YifangyunError("Snapshot database lock could not be acquired.", { code: "YFY_STATE_DB_IN_USE", phase: "snapshot_store" });
+    throw new YifangyunError("Inventory database lock could not be acquired.", { code: "YFY_STATE_DB_IN_USE", phase: "inventory_store" });
   }
 
   private releaseProcessLock(): void {
@@ -667,7 +668,7 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
   private scanStorage(scanId: string): number {
     const row = this.database.prepare("SELECT logical_bytes FROM snapshot_storage WHERE scan_id = ?").get(scanId) as Row | undefined;
     if (!row) {
-      throw new YifangyunError("Snapshot storage accounting is missing.", { code: "YFY_SNAPSHOT_STORAGE_CORRUPT", phase: "snapshot_store", scanId });
+      throw new YifangyunError("Inventory storage accounting is missing.", { code: "YFY_INVENTORY_STORAGE_CORRUPT", phase: "inventory_store", scanId });
     }
     return Number(row.logical_bytes);
   }
@@ -678,10 +679,10 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
 
   private assertCapacity(projectedBytes: number): void {
     if (projectedBytes > this.maxBytes) {
-      throw new YifangyunError("Snapshot storage quota would be exceeded.", {
-        code: "YFY_SNAPSHOT_STORAGE_INSUFFICIENT",
+      throw new YifangyunError("Inventory storage quota would be exceeded.", {
+        code: "YFY_INVENTORY_STORAGE_INSUFFICIENT",
         details: { max_state_bytes: this.maxBytes, projected_bytes: projectedBytes },
-        phase: "snapshot_store"
+        phase: "inventory_store"
       });
     }
   }

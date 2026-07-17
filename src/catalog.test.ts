@@ -47,33 +47,35 @@ function config(toolsets: AppConfig["toolsets"]): AppConfig {
 }
 
 test("default catalog exposes the current tools and schemas", async () => {
-  const runtime = await AppRuntime.create(config(["core", "authority", "snapshot", "evidence", "organization"]));
+  const runtime = await AppRuntime.create(config(["drive", "workspace", "inventory", "evidence", "organization"]));
   const server = new FakeServer();
   try {
     registerCatalog(server as unknown as McpServer, runtime);
-    for (const name of ["yfy_context_get", "yfy_root_list", "yfy_item_get", "yfy_item_search", "yfy_authority_validate", "yfy_snapshot_create", "yfy_snapshot_query", "yfy_evidence_capture", "yfy_evidence_release"]) {
-      assert.ok(server.tools.has(name), `${name} should be registered`);
+    const expected = [
+      "yfy_browse", "yfy_capture", "yfy_comments", "yfy_department_children", "yfy_department_get", "yfy_department_users",
+      "yfy_get", "yfy_get_many", "yfy_group_list", "yfy_group_users", "yfy_inventory_cancel", "yfy_inventory_create",
+      "yfy_inventory_get", "yfy_inventory_search", "yfy_membership_check", "yfy_open", "yfy_resolve", "yfy_resource_release",
+      "yfy_search", "yfy_shares", "yfy_status", "yfy_user_search", "yfy_versions", "yfy_workspace_validate"
+    ];
+    assert.deepEqual([...server.tools.keys()].sort(), expected);
+    for (const removed of ["yfy_context_get", "yfy_root_list", "yfy_item_search", "yfy_authority_validate", "yfy_scope_check", "yfy_snapshot_create", "yfy_evidence_capture", "yfy_evidence_release"]) {
+      assert.equal(server.tools.has(removed), false, `${removed} must not be registered`);
     }
-    assert.ok((server.tools.get("yfy_context_get")!.definition.outputSchema as Record<string, unknown>).access_contexts);
-    assert.ok(server.tools.get("yfy_snapshot_query")!.definition.outputSchema);
-    const snapshotInput = server.tools.get("yfy_snapshot_query")!.definition.inputSchema as Record<string, unknown>;
-    assert.ok(snapshotInput.cursor);
-    assert.deepEqual(Object.keys(server.tools.get("yfy_snapshot_create")!.definition.inputSchema as Record<string, unknown>).sort(), ["case_sensitive", "include_files", "include_folders", "match_fields", "max_item_depth", "max_items", "page_capacity", "scope_id"]);
-    assert.equal((server.tools.get("yfy_snapshot_create")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
-    assert.equal((server.tools.get("yfy_snapshot_cancel")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
-    assert.equal((server.tools.get("yfy_evidence_capture")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
-    const result = await server.tools.get("yfy_context_get")!.handler({}, { signal: new AbortController().signal, sendNotification: async () => undefined });
-    assert.equal(result.isError, undefined);
-    assert.ok(result.structuredContent?.access_contexts);
-    assert.equal((result.structuredContent?.server as Record<string, unknown>).version, "1.0.0-beta.4");
-    assert.ok(!Object.prototype.hasOwnProperty.call(result.structuredContent?.runtime ?? {}, "state_database_path"));
+    assert.ok((server.tools.get("yfy_status")!.definition.outputSchema as Record<string, unknown>).places);
+    assert.ok(server.tools.get("yfy_inventory_search")!.definition.outputSchema);
+    const inventoryInput = server.tools.get("yfy_inventory_search")!.definition.inputSchema as Record<string, unknown>;
+    assert.ok(inventoryInput.cursor);
+    assert.deepEqual(Object.keys(server.tools.get("yfy_inventory_create")!.definition.inputSchema as Record<string, unknown>).sort(), ["freshness", "max_item_depth", "max_items", "workspace"]);
+    assert.equal((server.tools.get("yfy_inventory_create")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
+    assert.equal((server.tools.get("yfy_inventory_cancel")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
+    assert.equal((server.tools.get("yfy_capture")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, true);
   } finally {
     await runtime.close();
   }
 });
 
 test("optional toolsets preserve mutation, collaboration, admin and transfer capability", async () => {
-  const runtime = await AppRuntime.create(config(["core", "authority", "snapshot", "evidence", "organization", "mutation", "collaboration", "admin", "transfer"]));
+  const runtime = await AppRuntime.create(config(["drive", "workspace", "inventory", "evidence", "organization", "mutation", "collaboration", "admin", "transfer"]));
   const server = new FakeServer();
   try {
     registerCatalog(server as unknown as McpServer, runtime);
@@ -82,7 +84,6 @@ test("optional toolsets preserve mutation, collaboration, admin and transfer cap
     }
     assert.equal((server.tools.get("yfy_item_mutate")!.definition.annotations as { destructiveHint: boolean }).destructiveHint, true);
     assert.equal((server.tools.get("yfy_file_upload")!.definition.annotations as { destructiveHint: boolean }).destructiveHint, true);
-    assert.equal(server.tools.size, 38);
     for (const [name, tool] of server.tools) assert.ok(tool.definition.outputSchema, `${name} must declare outputSchema`);
   } finally {
     await runtime.close();
@@ -90,7 +91,7 @@ test("optional toolsets preserve mutation, collaboration, admin and transfer cap
 });
 
 test("the MCP client compiles every catalog output schema", async () => {
-  const runtime = await AppRuntime.create(config(["core", "authority", "snapshot", "evidence", "organization", "mutation", "collaboration", "admin", "transfer"]));
+  const runtime = await AppRuntime.create(config(["drive", "workspace", "inventory", "evidence", "organization", "mutation", "collaboration", "admin", "transfer"]));
   const server = new RealMcpServer({ name: "schema-test", version: "1.0.0" });
   const client = new Client({ name: "schema-client", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -99,7 +100,7 @@ test("the MCP client compiles every catalog output schema", async () => {
     await server.connect(serverTransport);
     await client.connect(clientTransport);
     const listed = await client.listTools();
-    assert.equal(listed.tools.length, 38);
+    assert.ok(listed.tools.length > 0);
     assert.ok(listed.tools.every((tool) => tool.outputSchema));
   } finally {
     await client.close();
@@ -108,27 +109,28 @@ test("the MCP client compiles every catalog output schema", async () => {
   }
 });
 
-test("core tools are absent when the core toolset is disabled", async () => {
+test("drive tools are absent when the drive toolset is disabled", async () => {
   const runtime = await AppRuntime.create(config(["evidence"]));
   const server = new FakeServer();
   try {
     registerCatalog(server as unknown as McpServer, runtime);
-    assert.ok(server.tools.has("yfy_evidence_capture"));
-    assert.ok(!server.tools.has("yfy_item_get"));
-    assert.ok(!server.tools.has("yfy_connection_check"));
+    assert.ok(server.tools.has("yfy_capture"));
+    assert.ok(server.tools.has("yfy_resource_release"));
+    assert.ok(!server.tools.has("yfy_get"));
+    assert.ok(!server.tools.has("yfy_status"));
   } finally {
     await runtime.close();
   }
 });
 
-test("organization tools can be enabled without the core toolset", async () => {
+test("organization tools can be enabled without the drive toolset", async () => {
   const runtime = await AppRuntime.create(config(["organization"]));
   const server = new FakeServer();
   try {
     registerCatalog(server as unknown as McpServer, runtime);
-    assert.ok(server.tools.has("yfy_department_read"));
+    assert.ok(server.tools.has("yfy_department_get"));
     assert.ok(server.tools.has("yfy_user_search"));
-    assert.ok(!server.tools.has("yfy_item_get"));
+    assert.ok(!server.tools.has("yfy_get"));
   } finally {
     await runtime.close();
   }

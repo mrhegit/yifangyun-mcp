@@ -24,22 +24,22 @@ MCP 客户端配置示例：
   "mcpServers": {
     "yifangyun": {
       "command": "npx",
-      "args": ["-y", "yifangyun-mcp-server@1.0.0-beta.4"],
+      "args": ["-y", "yifangyun-mcp-server@1.0.0-beta.5"],
       "env": {
         "YFY_CLIENT_ID": "...",
         "YFY_CLIENT_SECRET": "...",
         "YFY_ENTERPRISE_ID": "115",
         "YFY_DEFAULT_USER_ID": "530",
-        "YFY_TOOLSETS": "core,authority,snapshot,evidence,organization",
+        "YFY_TOOLSETS": "drive",
         "YFY_WORKFLOW_PROFILES": "",
-        "YFY_SCOPES_JSON": "[]"
+        "YFY_WORKSPACES_JSON": "[]"
       }
     }
   }
 }
 ```
 
-此示例是通用模式。要使用 Authority Snapshot 或 Evidence Capture，需要配置 Scope；要注册 Tender Prompt，还需设置 `YFY_WORKFLOW_PROFILES=tender`。
+此示例是普通 Drive 模式。要使用 Workspace、Inventory 或 Capture，需要增加对应 toolset 和 `YFY_WORKSPACES_JSON`；Tender Prompt 还要求 `YFY_WORKFLOW_PROFILES=tender`。
 
 ## HTTP
 
@@ -66,14 +66,14 @@ YFY_HTTP_ALLOWED_ORIGINS=https://agent.example.com
 ```env
 YFY_STATE_DB=/var/lib/yifangyun-mcp/state.sqlite
 YFY_TEMP_DIR=/var/lib/yifangyun-mcp/temp
-YFY_SNAPSHOT_CONCURRENCY=2
+YFY_INVENTORY_CONCURRENCY=2
 ```
 
 备份 SQLite 时同时考虑 WAL 文件，推荐使用 SQLite backup API 或在服务停止后复制。
 同一个 `YFY_STATE_DB` 只允许一个 MCP 进程打开；需要水平扩展时必须使用独立数据库 adapter，不能让多个实例共享该 SQLite 文件。
 不要把 `YFY_STATE_DB` 放在 `YFY_TEMP_DIR/artifacts` 下，该目录属于 Evidence TTL 和配额清理范围。
 
-大型目录优先使用 Provider 允许的最大 `page_capacity`，再逐步提高 `YFY_SNAPSHOT_CONCURRENCY`。默认 2 路适合多数租户；提高到 4-8 前应观察 429、Provider 延迟和前台 Authority/Evidence 请求等待时间。
+大型目录可逐步提高 `YFY_INVENTORY_CONCURRENCY`。默认 2 路适合多数租户；提高到 4-8 前应观察 429、Provider 延迟和前台 Drive/Capture 请求等待时间。
 
 ## 权限
 
@@ -91,7 +91,7 @@ YFY_SNAPSHOT_CONCURRENCY=2
 - `/health`：进程和版本
 - `/metrics`：进程内计数和延迟聚合
 
-生产环境应采集结构化 stderr 日志，并对 Provider 失败、snapshot incomplete 和 evidence drift 设置告警。
+生产环境应采集结构化 stderr 日志，并对 Provider 失败、inventory incomplete 和 capture drift 设置告警。
 
 ## 发布包验证
 

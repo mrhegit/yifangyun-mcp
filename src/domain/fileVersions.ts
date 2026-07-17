@@ -92,7 +92,7 @@ export function selectFileVersion(versions: FileVersion[], selector: VersionSele
         available_version_ids: versions.flatMap((version) => version.provider_version_id ? [version.provider_version_id] : []),
         requested_version_id: selector.kind === "historical" ? selector.version_id : "current"
       },
-      suggestedAction: "重新调用 yfy_file_versions，并使用当前返回的历史 version_id。"
+      suggestedAction: "重新调用 yfy_versions，并复制当前返回的历史 version ref。"
     });
   }
   if ((selector.kind === "current") !== selected.current || (selected.current && selected.generation !== 0)) {

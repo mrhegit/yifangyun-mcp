@@ -42,96 +42,68 @@ test("live read-only catalog works against Yifangyun", { skip: process.env.YFY_L
   loadDotEnv(envPath);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yfy-v1-live-"));
   process.env.YFY_STATE_DB = path.join(dir, "state.sqlite");
-  process.env.YFY_TOOLSETS = "core,authority,snapshot,evidence,organization";
-  const rootFolderId = process.env.YFY_LIVE_SCOPE_ROOT_FOLDER_ID;
+  process.env.YFY_TOOLSETS = "drive,workspace,inventory,evidence,organization";
+  const rootFolderId = process.env.YFY_LIVE_WORKSPACE_ROOT_FOLDER_ID;
   process.env.YFY_WORKFLOW_PROFILES = rootFolderId ? "tender" : "";
   if (rootFolderId) {
-    process.env.YFY_SCOPES_JSON = JSON.stringify([{ id: "live_scope", root_folder_id: rootFolderId, access_context: "default", tags: ["live-test"] }]);
+    process.env.YFY_WORKSPACES_JSON = JSON.stringify([{ id: "live_scope", root_folder_id: rootFolderId, access_context: "default", tags: ["live-test"] }]);
   }
   const runtime = await AppRuntime.create(loadConfig());
   const server = new FakeServer();
   registerCatalog(server as unknown as McpServer, runtime);
   try {
-    const connection = await call(server, "yfy_connection_check");
-    assert.equal(connection.authenticated, true);
-    const context = await call(server, "yfy_context_get");
-    assert.ok(Array.isArray(context.access_contexts));
-    const personal = await call(server, "yfy_root_list", { root: { kind: "personal" }, page_id: 0, page_capacity: 5 });
-    const files = Array.isArray(personal.files) ? personal.files as Array<Record<string, unknown>> : [];
-    const folders = Array.isArray(personal.folders) ? personal.folders as Array<Record<string, unknown>> : [];
+    const status = await call(server, "yfy_status");
+    assert.equal(status.connected, true);
+    const personal = await call(server, "yfy_browse", { at: "personal", limit: 5 });
+    const items = Array.isArray(personal.items) ? personal.items as Array<Record<string, unknown>> : [];
+    const files = items.filter((item) => item.type === "file");
+    const folders = items.filter((item) => item.type === "folder");
     const candidate = files[0] ?? folders[0];
     const personalPage = personal.page as Record<string, unknown>;
-    assert.equal((personalPage.requested as Record<string, unknown>).page_id, 0);
     assert.equal(typeof personalPage.has_more, "boolean");
-    if (typeof personalPage.page_count === "number") {
-      const beyond = await call(server, "yfy_root_list", { root: { kind: "personal" }, page_id: personalPage.page_count, page_capacity: 5 });
-      assert.equal((beyond.page as Record<string, unknown>).has_more, false);
-    }
     const query = process.env.YFY_LIVE_SEARCH_QUERY ?? "test";
-    const search = await call(server, "yfy_item_search", {
-      query,
-      item_type: "all",
-      field: "all",
-      root: { kind: "personal" },
-      precise: false,
-      sort: "score",
-      direction: "desc",
-      page_id: 0,
-      page_capacity: 5
-    });
-    assert.deepEqual(search.authority, { level: "hint_only", safe_to_claim_absence: false });
-    const searchPage = search.page as Record<string, unknown>;
-    if (typeof searchPage.page_count === "number") {
-      const beyond = await call(server, "yfy_item_search", {
-        query, item_type: "all", field: "all", root: { kind: "personal" }, precise: false,
-        sort: "score", direction: "desc", page_id: searchPage.page_count, page_capacity: 5
-      });
-      assert.equal((beyond.page as Record<string, unknown>).has_more, false);
-    }
-    if (candidate?.id && candidate.type) {
-      const item = await call(server, "yfy_item_get", { item_type: candidate.type, item_id: String(candidate.id), view: "evidence" });
+    const search = await call(server, "yfy_search", { query, in: "personal", limit: 5 });
+    assert.deepEqual(search.coverage, { mode: "provider_index", exhaustive: false });
+    if (candidate?.ref && candidate.type) {
+      const item = await call(server, "yfy_get", { ref: String(candidate.ref) });
       assert.equal((item.item as Record<string, unknown>).id, String(candidate.id));
       if (typeof candidate.name === "string") {
-        const resolved = await call(server, "yfy_path_resolve", { path: candidate.name, root: { kind: "personal" } });
+        const resolved = await call(server, "yfy_resolve", { path: candidate.name, from: "personal" });
         assert.equal(resolved.resolved, true);
       }
-      await call(server, "yfy_share_list", { item_type: candidate.type, item_id: String(candidate.id), page_id: 0, page_capacity: 5 });
+      await call(server, "yfy_shares", { item: String(candidate.ref), limit: 5 });
       if (candidate.type === "file") {
-        const batch = await call(server, "yfy_items_get", { file_ids: [String(candidate.id)], view: "summary" });
+        const batch = await call(server, "yfy_get_many", { refs: [String(candidate.ref)] });
         assert.equal((batch.summary as Record<string, unknown>).success_count, 1);
-        await call(server, "yfy_file_versions", { file_id: String(candidate.id) });
-        await call(server, "yfy_file_comments", { file_id: String(candidate.id) });
+        await call(server, "yfy_versions", { file: String(candidate.ref) });
+        await call(server, "yfy_comments", { file: String(candidate.ref) });
       }
     }
     const folderCandidate = folders.find((entry) => entry.id && entry.type === "folder");
     if (folderCandidate?.id) {
-      const children = await call(server, "yfy_folder_list", { folder_id: String(folderCandidate.id), item_type: "file", view: "evidence", page_id: 0, page_capacity: 5 });
-      const child = Array.isArray(children.files) ? (children.files as Array<Record<string, unknown>>)[0] : undefined;
+      const children = await call(server, "yfy_browse", { at: String(folderCandidate.ref), kind: "file", limit: 5 });
+      const child = Array.isArray(children.items) ? (children.items as Array<Record<string, unknown>>)[0] : undefined;
       if (child?.name) {
-        const scoped = await call(server, "yfy_item_search", {
-          query: String(child.name), item_type: "file", field: "file_name", root: { kind: "folder", folder_id: String(folderCandidate.id) }, precise: true,
-          sort: "score", direction: "desc", page_id: 0, page_capacity: 5
-        });
-        const scopedCandidates = Array.isArray(scoped.candidates) ? scoped.candidates as Array<Record<string, unknown>> : [];
-        assert.ok(scopedCandidates.every((candidate) => (candidate.item as Record<string, unknown>).name === child.name));
-        assert.ok(scopedCandidates.every((candidate) => ((candidate.verification as Record<string, unknown>).folder_scope === "verified")));
+        const scoped = await call(server, "yfy_search", { query: String(child.name), in: String(folderCandidate.ref), kind: "file", field: "name", exact_name: true, limit: 5 });
+        const hits = Array.isArray(scoped.hits) ? scoped.hits as Array<Record<string, unknown>> : [];
+        assert.ok(hits.every((hit) => (hit.item as Record<string, unknown>).name === child.name));
       }
     }
     if (rootFolderId) {
-      await call(server, "yfy_authority_validate", { scope_id: "live_scope" });
+      await call(server, "yfy_workspace_validate", { workspace: "live_scope" });
     }
-    if (rootFolderId && process.env.YFY_LIVE_SNAPSHOT_TESTS === "enabled") {
-      const started = await call(server, "yfy_snapshot_create", { scope_id: "live_scope", max_item_depth: 1, max_items: 100, page_capacity: 20 });
-      const snapshotId = String(started.snapshot_id);
+    if (rootFolderId && process.env.YFY_LIVE_INVENTORY_TESTS === "enabled") {
+      const started = await call(server, "yfy_inventory_create", { workspace: "live_scope", max_item_depth: 1, max_items: 100, freshness: { max_age_seconds: 0, mode: "force_refresh" } });
+      const inventory = String(started.inventory);
       let status = String(started.status);
       for (let attempt = 0; attempt < 20 && ["running", "paused_retryable"].includes(status); attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 250));
-        const current = await call(server, "yfy_snapshot_get", { snapshot_id: snapshotId });
+        const current = await call(server, "yfy_inventory_get", { inventory });
         status = String(current.status);
       }
-      const finalState = await call(server, "yfy_snapshot_get", { snapshot_id: snapshotId });
-      assert.ok(["complete", "partial"].includes(String(finalState.status)), `Unexpected live snapshot status: ${finalState.status}`);
-      await call(server, "yfy_snapshot_query", { snapshot_id: snapshotId, mode: "search", queries: ["验收证书"], item_type: "all", limit: 10 });
+      const finalState = await call(server, "yfy_inventory_get", { inventory });
+      assert.ok(["complete", "partial"].includes(String(finalState.status)), `Unexpected live inventory status: ${finalState.status}`);
+      await call(server, "yfy_inventory_search", { inventory, query: "验收证书", kind: "all", limit: 10 });
     }
   } finally {
     await runtime.close();
