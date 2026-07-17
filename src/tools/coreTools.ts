@@ -236,19 +236,34 @@ export function registerCoreTools(server: McpServer, runtime: AppRuntime): void 
 
   registerTool(server, "yfy_item_search", {
     title: "Search Yifangyun Items",
-    description: "Search the official Yifangyun index for candidate discovery. Empty results cannot prove absence.",
+    description: "Discover candidates through the official Provider index. Results are hints only: empty results never prove absence. Use max_results to bound Agent context, exact path resolution for known paths, and snapshots for exhaustive scope work.",
     inputSchema: {
-      query: z.string().trim().min(1).max(200),
+      query: z.string().trim().min(1).max(200).describe("Provider search text."),
       item_type: z.enum(["file", "folder", "all"]).default("all"),
       field: z.enum(["file_name", "content", "creator", "tag", "all"]).default("all"),
       root: RootRefSchema.default({ kind: "personal" }),
       precise: z.boolean().default(false),
       sort: z.enum(["name", "date", "size", "score"]).default("score"),
       direction: z.enum(["asc", "desc"]).default("desc"),
+      max_results: z.number().int().min(1).max(100).default(25).describe("Maximum candidates returned to the Agent from this Provider page."),
+      result_offset: z.number().int().min(0).default(0).describe("Local offset within the eligible candidates on this Provider page. Use candidate_summary.next_request to continue a truncated page."),
       access_context: AccessContextSchema,
       ...PageInputShape
     },
-    outputSchema: { candidates: z.array(CandidateSchema), page: PageSchema, authority: z.object({ level: z.literal("hint_only"), safe_to_claim_absence: z.literal(false) }), provenance: ProvenanceSchema }
+    outputSchema: {
+      candidates: z.array(CandidateSchema),
+      candidate_summary: z.object({
+        eligible_count: z.number().int().nonnegative(),
+        returned_count: z.number().int().nonnegative(),
+        result_offset: z.number().int().nonnegative(),
+        truncated: z.boolean(),
+        truncated_count: z.number().int().nonnegative(),
+        next_request: z.object({ page_id: z.number().int().nonnegative(), result_offset: z.number().int().positive() }).optional()
+      }),
+      page: PageSchema,
+      authority: z.object({ level: z.literal("hint_only"), safe_to_claim_absence: z.literal(false) }),
+      provenance: ProvenanceSchema
+    }
   }, { readOnly: true }, async (args, extra) => {
     const root = await searchRoot(runtime, args.root as RootRef, contextId(args.access_context), extra.signal);
     const capacity = pageCapacity(runtime, args.page_capacity);
@@ -270,7 +285,7 @@ export function registerCoreTools(server: McpServer, runtime: AppRuntime): void 
     const rawItems = [...arrayValue(source.files), ...arrayValue(source.folders)];
     let filteredCount = 0;
     let invalidCount = 0;
-    const candidates = rawItems.flatMap((entry) => {
+    const eligibleCandidates = rawItems.flatMap((entry) => {
       const item = projectItem(entry, "evidence");
       if (folderId) {
         const ancestors = Array.isArray(item.ancestor_folder_ids) ? item.ancestor_folder_ids : [];
@@ -281,9 +296,22 @@ export function registerCoreTools(server: McpServer, runtime: AppRuntime): void 
       const chain = Array.isArray(item.path_chain) ? item.path_chain.flatMap((part) => typeof part === "object" && part !== null && !Array.isArray(part) && typeof part.name === "string" ? [part.name] : []) : [];
       return [{ item: { id: item.id, name: item.name, type: item.type, ...(typeof item.parent_folder_id === "string" ? { parent_folder_id: item.parent_folder_id } : {}), ...(chain.length > 0 ? { path: chain.join("/") } : {}) }, verification: { folder_scope: folderId ? "verified" : "not_requested", exact_name: exactFileName ? "verified" : "not_requested" } }];
     });
+    const maxResults = Number(args.max_results ?? 25);
+    const resultOffset = Number(args.result_offset ?? 0);
+    const candidates = eligibleCandidates.slice(resultOffset, resultOffset + maxResults);
+    const nextOffset = resultOffset + candidates.length;
+    const truncatedCount = Math.max(0, eligibleCandidates.length - nextOffset);
     return {
       candidates,
-      page: projectPage(response.data, { itemCount: candidates.length, providerCount: rawItems.length, filteredCount, invalidCount, pageCapacity: capacity, requestedPageCapacity: Number(args.page_capacity), pageId: Number(args.page_id) }),
+      candidate_summary: {
+        eligible_count: eligibleCandidates.length,
+        returned_count: candidates.length,
+        result_offset: resultOffset,
+        truncated: truncatedCount > 0,
+        truncated_count: truncatedCount,
+        ...(truncatedCount > 0 ? { next_request: { page_id: Number(args.page_id), result_offset: nextOffset } } : {})
+      },
+      page: projectPage(response.data, { itemCount: candidates.length, providerCount: rawItems.length, filteredCount, invalidCount, truncatedCount, pageCapacity: capacity, requestedPageCapacity: Number(args.page_capacity), pageId: Number(args.page_id) }),
       authority: { level: "hint_only", safe_to_claim_absence: false },
       provenance: provenance(response.meta, root.accessContext)
     };

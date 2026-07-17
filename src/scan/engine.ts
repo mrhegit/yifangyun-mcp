@@ -237,7 +237,12 @@ export class ScopeScanEngine {
               continue;
             }
             const itemPath = `${cursor.pathDisplay}/${asText(item.name) ?? itemId}`;
-            const annotated: JsonObject = { ...item, depth: cursor.depth + 1, path_display: itemPath };
+            const itemDepth = cursor.depth + 1;
+            if (itemDepth > nextState.policy.maxItemDepth) {
+              addReason(nextState, "MAX_DEPTH_REACHED");
+              continue;
+            }
+            const annotated: JsonObject = { ...item, depth: itemDepth, path_display: itemPath };
             const currentDigest = itemDigest(annotated);
             const itemKey = `${itemType}:${itemId}`;
             const previous = persistedSeen.get(itemKey) ?? pageSeen.get(itemKey);
@@ -259,10 +264,8 @@ export class ScopeScanEngine {
               if (nextState.policy.includeFolders) {
                 folders.push(annotated);
               }
-              if (cursor.depth < nextState.policy.maxDepth) {
-                childCursors.push({ attempt: 0, depth: cursor.depth + 1, folderId: itemId, pageId: 0, pathDisplay: itemPath });
-              } else {
-                addReason(nextState, "MAX_DEPTH_REACHED");
+              if (itemDepth <= nextState.policy.maxItemDepth) {
+                childCursors.push({ attempt: 0, depth: itemDepth, folderId: itemId, pageId: 0, pathDisplay: itemPath });
               }
             } else {
               nextState.fileCount += 1;
@@ -466,16 +469,18 @@ export class ScopeScanEngine {
       completeness: {
         pagination_complete: paginationComplete,
         safe_to_claim_absence: safeToClaimAbsence,
-        scope: safeToClaimAbsence ? "within_observed_accessible_scope" : "none",
+        scope: safeToClaimAbsence ? "entire_observed_accessible_scope" : "observed_subset_only",
         consistency_level: paginationComplete ? "best_effort_complete_observation" : "partial_observation",
         incomplete_reasons: state.incompleteReasons
       },
+      terminal: ["complete", "partial", "cancelled", "failed", "expired"].includes(state.status),
+      limits: { max_item_depth: state.policy.maxItemDepth, max_items: state.policy.maxItems },
       observation_window: { started_at: state.observationStartedAt, updated_at: state.observationUpdatedAt },
       created_at: state.createdAt,
       updated_at: state.updatedAt,
       expires_at: state.expiresAt,
       artifact_uri: `yfy://snapshot/${state.scanId}/${state.artifactToken}/${state.accessContextId}/manifest`,
-      ...(state.status === "running" || state.status === "paused_retryable" ? { suggested_action: "Call yfy_snapshot_get to monitor progress, or yfy_snapshot_cancel to stop the task." } : {})
+      ...(state.status === "running" || state.status === "paused_retryable" ? { next_action: { tool: "yfy_snapshot_get", arguments: { snapshot_id: state.scanId, access_context: state.accessContextId }, stop_when_terminal: true } } : {})
     };
   }
 

@@ -1,6 +1,6 @@
 # 工具参考
 
-工具是否注册由 `YFY_TOOLSETS` 决定；Authority、Snapshot 和 Current Lock 还依赖 `YFY_SCOPES_JSON`。配置组合、权限边界和完整示例见 [配置指南](configuration.md)。
+工具是否注册由 `YFY_TOOLSETS` 决定；Authority、Snapshot 和 Evidence Capture 还依赖 `YFY_SCOPES_JSON`。配置组合、权限边界和完整示例见 [配置指南](configuration.md)。
 
 ## 返回契约
 
@@ -27,6 +27,7 @@
     "message":"Permission denied.",
     "retryable":false,
     "phase":"provider_request",
+    "diagnostics":{"restart_required":true},
     "suggested_action":"..."
   }
 }
@@ -74,7 +75,7 @@
 | `yfy_file_comments` | 评论列表 |
 | `yfy_share_list` | 分享元数据，URL 和密码始终脱敏 |
 
-`yfy_item_search` 接受统一 `root`，只返回紧凑 `candidates`。文件夹或 scope 搜索会根据 `parent_folder_id` 和祖先链二次过滤；`precise=true` 且 `field=file_name` 时执行精确名称匹配。`page.total_count` 始终是 Provider 过滤前候选总数，实际过滤数见 `page.returned.filtered_count`。
+`yfy_item_search` 接受统一 `root`，只返回紧凑 `candidates`。`max_results` 独立限制单次返回给 Agent 的候选数；Provider 本页仍有合格候选时，先按 `candidate_summary.next_request` 使用相同 `page_id` 和新的 `result_offset` 续取，再进入 Provider 下一页。文件夹或 scope 搜索会根据 `parent_folder_id` 和祖先链二次过滤；`precise=true` 且 `field=file_name` 时执行精确名称匹配。
 
 `yfy_items_get` 返回输入顺序稳定的 `results[]`。单个文件失败不会丢失其他成功项，汇总位于 `summary`。
 
@@ -94,7 +95,7 @@
 | `yfy_snapshot_query` | `mode=search/list`，直接查询 SQLite 索引；有后续结果时返回 opaque `next_cursor` |
 | `yfy_snapshot_cancel` | 取消后台任务 |
 
-`yfy_snapshot_create` 只接受命名 `scope_id`。根目录和访问身份由已配置的 Authority Scope 派生，Agent 不能直接指定任意根目录。
+`yfy_snapshot_create` 只接受命名 `scope_id`。根目录和访问身份由已配置的 Authority Scope 派生，Agent 不能直接指定任意根目录。创建时不绑定查询词，同一 Snapshot 可被多次复用。`max_item_depth` 是相对 Scope 根目录的最大返回深度，直接子项深度为 1，结果不会包含超过该值的条目。
 
 续页时原样回传 `next_cursor` 到 `cursor`。Cursor 使用服务端签名，并绑定 snapshot、revision、mode、item type 和查询词；Agent 不需要解析内部排序键，深页查询不会随已跳过行数线性变慢。后台扫描使 revision 变化时会返回 `YFY_SNAPSHOT_CURSOR_STALE`，此时从无 cursor 的第一页重新查询。
 
@@ -108,7 +109,7 @@ Snapshot 在每页原子提交时增量维护完整 receipt digest；manifest �
 {
   "pagination_complete": true,
   "safe_to_claim_absence": true,
-  "scope": "within_observed_accessible_scope",
+  "scope": "entire_observed_accessible_scope",
   "consistency_level": "best_effort_complete_observation",
   "incomplete_reasons": []
 }
@@ -118,14 +119,12 @@ Snapshot 在每页原子提交时增量维护完整 receipt digest；manifest �
 
 | 工具 | 说明 |
 |---|---|
-| `yfy_evidence_download` | 使用 `current` 或 `history/generations_back` selector 下载并校验内容 |
-| `yfy_evidence_lock_current` | 范围证明、显式下载版本 0、下载后版本历史和元数据复核 |
-| `yfy_evidence_verify` | 下载指定版本并比较 SHA-1、SHA-256、size、modified time 和 version key |
+| `yfy_evidence_capture` | 在 Scope 内捕获当前版或精确历史 `version_id`，统一执行范围、版本、元数据、哈希和期望值校验 |
 | `yfy_evidence_release` | 删除短期本地 Artifact 并使 resource URI 失效 |
 
-版本详情的 `provider_version_id` 只用于版本详情接口，绝不传给下载接口。下载使用 `provider_download_version`：`0` 表示当前版，`1` 表示上一版。服务端会在请求 Provider 前拒绝越界代数，防止 Provider 静默回退当前版。
+历史版本必须先通过 `yfy_file_versions` 取得 `provider_version_id`，再传入 `{kind:"historical",version_id:"..."}`。实现内部会隐藏不同部署的历史计数差异，可尝试反向 ordinal、正向 ordinal 和 Provider version ID；只有下载内容的 SHA-1 与大小同时匹配所选版本时才成功，不会以当前版或相邻版本替代。
 
-远程 HTTP Agent 应读取结果中的 `resource_uri` / `resource_link`，HTTP 结果不暴露服务器 `temp_path`；stdio 客户端仍可使用本地路径。超过 `YFY_MAX_EVIDENCE_RESOURCE_BYTES` 的 HTTP 结果会在完成哈希和元数据校验后立即删除本地文件，并通过 `resource_omitted` 与 `artifact_disposition=deleted_after_validation` 说明原因。
+`artifact.delivery=mcp_resource` 时读取 `resource_uri` / `resource_link`；普通 stdio 结果也不暴露本地路径。只有文件超过 MCP resource 上限且运行于 stdio 时，才返回 `delivery=local_file`、`local_path` 和仍可用于释放的 `resource_uri`。HTTP 超限结果在校验后删除，并返回 `delivery=omitted`。
 
 ## Organization
 

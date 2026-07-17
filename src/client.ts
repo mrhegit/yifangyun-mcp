@@ -60,6 +60,7 @@ interface DownloadOptions {
 }
 
 export class YifangyunError extends Error {
+  readonly agentDetails?: JsonObject;
   readonly code: string;
   readonly details?: JsonObject;
   readonly phase?: string;
@@ -72,6 +73,7 @@ export class YifangyunError extends Error {
   constructor(
     message: string,
     options: {
+      agentDetails?: JsonObject;
       details?: JsonObject;
       code?: string;
       phase?: string;
@@ -84,6 +86,7 @@ export class YifangyunError extends Error {
   ) {
     super(message);
     this.name = "YifangyunError";
+    this.agentDetails = options.agentDetails;
     this.code = options.code ?? "YFY_UNEXPECTED_ERROR";
     this.details = options.details;
     this.phase = options.phase;

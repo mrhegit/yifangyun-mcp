@@ -2,7 +2,7 @@
 
 亿方云 OpenAPI 的通用 Cloud Authority 与 Evidence MCP Server，针对投标资料查找、完整性判断、范围证明和原件固化进行了重点优化，同时可复用于法务、采购、审计、合规和档案业务。
 
-当前版本：`1.0.0-beta.3`。
+当前版本：`1.0.0-beta.4`。
 
 ## 1.0 设计
 
@@ -23,8 +23,8 @@
 | 需求 | 推荐配置 | 结果 |
 |---|---|---|
 | 只浏览和搜索云盘 | `YFY_TOOLSETS=core` | 不下载、不扫描、不修改云端内容 |
-| 搜索并下载校验文件 | `YFY_TOOLSETS=core,evidence` | 增加当前/历史版本下载、SHA-1/SHA-256 和验证 |
-| 做范围证明和完整性判断 | `YFY_TOOLSETS=core,authority,snapshot,evidence`，并配置 Scope | 增加 Scope 断言、SQLite Snapshot 和 Current Lock |
+| 搜索并捕获校验文件 | `YFY_TOOLSETS=core,evidence`，并配置 Scope | 增加 Authority-bound 当前/历史 Evidence Capture、SHA-1/SHA-256 和验证 |
+| 做范围证明和完整性判断 | `YFY_TOOLSETS=core,authority,snapshot,evidence`，并配置 Scope | 增加 Scope 断言、SQLite Snapshot 和 Evidence Capture |
 | 使用投标专用 Prompt | 五个默认 Toolset、至少一个 Scope、`YFY_WORKFLOW_PROFILES=tender` | 增加投标审计、原件固化和版本比较工作流模板 |
 | 修改云端内容 | 显式增加 `mutation`、`collaboration` 或 `admin` | 开启云端写能力，应隔离部署并限制 Agent 权限 |
 
@@ -34,7 +34,7 @@
 - Authority Scope 决定权威工作流允许在哪个目录和身份范围内运行。
 - Workflow Profile 只注册专用 Prompt 和 Guidance，不授予新的亿方云权限。
 
-Scope 只约束 Authority、Snapshot 和 Current Lock 等 Scope-bound 流程，不会自动限制所有 Core 读取工具。需要目录边界时必须显式使用 Scope 相关工具。
+Scope 只约束 Authority、Snapshot 和 Evidence Capture 等 Scope-bound 流程，不会自动限制所有 Core 读取工具。需要目录边界时必须显式使用 Scope 相关工具。
 
 完整选项、默认值和配置示例见 [配置指南](docs/configuration.md)。
 
@@ -56,9 +56,7 @@ Scope 只约束 Authority、Snapshot 和 Current Lock 等 Scope-bound 流程，�
 | `yfy_snapshot_get` | 查询快照状态和完整性 |
 | `yfy_snapshot_query` | 查询 SQLite 快照索引 |
 | `yfy_snapshot_cancel` | 取消快照 |
-| `yfy_evidence_download` | 按当前版或历史代数下载并校验证据 |
-| `yfy_evidence_lock_current` | 在 Authority Scope 内锁定当前原件 |
-| `yfy_evidence_verify` | 验证元数据或内容证据 |
+| `yfy_evidence_capture` | 在 Authority Scope 内捕获当前版或精确历史版，并统一验证范围、版本、元数据和内容 |
 | `yfy_evidence_release` | 释放本地短期证据资源 |
 
 ## Toolsets
@@ -113,9 +111,9 @@ YFY_SCOPES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_c
 ### 原件固化
 
 1. `yfy_path_resolve` 或 `yfy_item_search`
-2. `yfy_scope_check(mode="assert")`
-3. `yfy_evidence_lock_current`
-4. 保存 file ID、path proof、`provider_download_version`、SHA-256、size 和 observation time
+2. `yfy_evidence_capture(scope_id, file_id, version)`；工具内部会在下载前后验证 Scope
+3. 保存 file ID、path proof、稳定版本 ID、SHA-256、size、observation time 和 `resource_uri`
+4. 下游处理完成后调用 `yfy_evidence_release`
 
 ## 最小配置
 
@@ -128,7 +126,7 @@ YFY_SCOPES_JSON=[]
 YFY_WORKFLOW_PROFILES=
 ```
 
-这是通用模式。默认 Toolset 为 `core,authority,snapshot,evidence,organization`，但没有 Scope 时不能创建 Authority Snapshot 或执行 Current Lock。
+这是通用模式。默认 Toolset 为 `core,authority,snapshot,evidence,organization`，但没有 Scope 时不能创建 Authority Snapshot 或执行 Evidence Capture。
 
 启用投标专用工作流：
 
@@ -138,7 +136,7 @@ YFY_WORKFLOW_PROFILES=tender
 YFY_SCOPES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_context":"default","tags":["tender","public-material"]}]
 ```
 
-Scope 不会授予云盘权限，只会把 Authority、Snapshot 和 Current Lock 等 Scope-bound 流程限制在指定业务目录。
+Scope 不会授予云盘权限，只会把 Authority、Snapshot 和 Evidence Capture 等 Scope-bound 流程限制在指定业务目录。
 
 ## 运行
 

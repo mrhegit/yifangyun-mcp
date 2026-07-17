@@ -22,6 +22,7 @@ export interface ToolDefinition {
 export interface ToolRegistrationOptions {
   destructive?: boolean;
   idempotent?: boolean;
+  onInvalidOutput?: (result: Record<string, unknown>) => Promise<void>;
   openWorld?: boolean;
   readOnly: boolean;
 }
@@ -36,6 +37,8 @@ function normalizedErrorCode(error: YifangyunError, providerCode?: string): stri
 }
 
 function errorCategory(error: YifangyunError, normalizedCode: string): string {
+  if (["YFY_SNAPSHOT_QUERY_EMPTY", "YFY_SNAPSHOT_CURSOR_INVALID"].includes(normalizedCode)) return "invalid_input";
+  if (["YFY_SNAPSHOT_QUERY_TOO_SHORT", "YFY_SNAPSHOT_QUERY_TOO_BROAD"].includes(normalizedCode)) return "capacity_limit";
   if (normalizedCode.includes("CANCEL")) return "cancelled";
   if (normalizedCode.includes("TIMEOUT")) return "timeout";
   if (normalizedCode.includes("NOT_FOUND") || error.statusCode === 404) return "not_found";
@@ -44,6 +47,9 @@ function errorCategory(error: YifangyunError, normalizedCode: string): string {
   if (error.statusCode === 429) return "rate_limited";
   if (error.statusCode !== undefined && error.statusCode >= 500) return "provider_unavailable";
   if (normalizedCode.includes("INPUT") || normalizedCode.includes("PATH_INVALID")) return "invalid_input";
+  if (normalizedCode.includes("STALE") || normalizedCode.includes("REVISION_CONFLICT")) return "stale_state";
+  if (normalizedCode.includes("TOO_LARGE") || normalizedCode.includes("QUOTA") || normalizedCode.includes("CAPACITY") || normalizedCode.includes("STORAGE_INSUFFICIENT")) return "capacity_limit";
+  if (normalizedCode.includes("CONTENT_MISMATCH") || normalizedCode.includes("FALLBACK_DETECTED") || normalizedCode.includes("HISTORICAL_CAPTURE")) return "provider_contract";
   if (normalizedCode.includes("CONFLICT") || normalizedCode.includes("DRIFT") || normalizedCode.includes("CONTENT_MISMATCH") || normalizedCode.includes("ARTIFACT_INTEGRITY") || normalizedCode.includes("IDENTITY_AMBIGUOUS")) return "conflict";
   if (normalizedCode.includes("PROVIDER") || normalizedCode.includes("VERSION_ORDER") || normalizedCode.includes("METADATA_INCOMPLETE") || normalizedCode.includes("FALLBACK_DETECTED")) return "provider_contract";
   return "internal";
@@ -65,6 +71,7 @@ export function serializeError(error: unknown): JsonObject {
     ...(yfy.retryable && yfy.retryAfterMs !== undefined ? { retry_after_ms: yfy.retryAfterMs } : {}),
     ...(yfy.scanId ? { operation_id: yfy.scanId } : {}),
     ...(yfy.suggestedAction ? { suggested_action: yfy.suggestedAction } : {}),
+    ...(yfy.agentDetails ? { diagnostics: yfy.agentDetails } : {}),
     ...(yfy.statusCode !== undefined || providerCode || requestId ? { provider: {
       ...(yfy.statusCode !== undefined ? { status_code: yfy.statusCode } : {}),
       ...(providerCode ? { code: providerCode } : {}),
@@ -88,6 +95,9 @@ export function registerTool(
   options: ToolRegistrationOptions,
   handler: ToolHandler
 ): void {
+  const outputValidator = definition.outputSchema instanceof z.ZodObject
+    ? definition.outputSchema.strict()
+    : z.object(definition.outputSchema).strict();
   server.registerTool(name, {
     ...definition,
     outputSchema: definition.outputSchema,
@@ -100,15 +110,31 @@ export function registerTool(
   }, async (args, extra) => {
     try {
       const result = await handler(args as Record<string, unknown>, extra as ToolExtra);
-      const evidence = result.evidence && typeof result.evidence === "object" && !Array.isArray(result.evidence) ? result.evidence as Record<string, unknown> : undefined;
-      const resourceUri = typeof evidence?.resource_uri === "string" ? evidence.resource_uri : undefined;
-      const serialized = JSON.stringify(result);
+      const validated = outputValidator.safeParse(result);
+      if (!validated.success) {
+        await options.onInvalidOutput?.(result).catch(() => undefined);
+        logEvent("error", "tool_output_schema_invalid", { issues: validated.error.issues.map((issue) => ({ code: issue.code, path: issue.path.join(".") })), tool: name });
+        throw new YifangyunError("The tool produced a result that violates its declared output contract.", {
+          code: "YFY_TOOL_OUTPUT_INVALID",
+          phase: "tool_output_validation",
+          suggestedAction: "Upgrade or fix the MCP server before retrying. Do not treat this call as valid business data."
+        });
+      }
+      const output = validated.data as Record<string, unknown>;
+      const artifact = output.artifact && typeof output.artifact === "object" && !Array.isArray(output.artifact) ? output.artifact as Record<string, unknown> : undefined;
+      const legacyEvidence = output.evidence && typeof output.evidence === "object" && !Array.isArray(output.evidence) ? output.evidence as Record<string, unknown> : undefined;
+      const resourceUri = typeof artifact?.resource_uri === "string" ? artifact.resource_uri : typeof legacyEvidence?.resource_uri === "string" ? legacyEvidence.resource_uri : undefined;
+      const resourceReadable = artifact?.delivery === undefined || artifact.delivery === "mcp_resource";
+      const serialized = JSON.stringify(output);
+      const text = serialized.length <= 12_000
+        ? serialized
+        : JSON.stringify({ status: "success", tool: name, structured_content_only: true, top_level_fields: Object.keys(output) });
       return {
         content: [
-          { type: "text" as const, text: serialized },
-          ...(resourceUri ? [{ type: "resource_link" as const, uri: resourceUri, name: typeof evidence?.file_name === "string" ? evidence.file_name : "Yifangyun evidence", mimeType: "application/octet-stream" }] : [])
+          { type: "text" as const, text },
+          ...(resourceUri && resourceReadable ? [{ type: "resource_link" as const, uri: resourceUri, name: typeof artifact?.file_name === "string" ? artifact.file_name : typeof legacyEvidence?.file_name === "string" ? legacyEvidence.file_name : "Yifangyun evidence", mimeType: typeof artifact?.media_type === "string" ? artifact.media_type : "application/octet-stream" }] : [])
         ],
-        structuredContent: result
+        structuredContent: output
       };
     } catch (error) {
       if (!(error instanceof YifangyunError)) {

@@ -82,7 +82,7 @@ export function projectItem(value: JsonValue | undefined, view: "summary" | "evi
   return output;
 }
 
-export function projectPage(value: JsonValue | undefined, fallback: { fileCount?: number; filteredCount?: number; folderCount?: number; invalidCount?: number; itemCount: number; pageCapacity: number; pageId: number; providerCount?: number; requestedPageCapacity?: number }): JsonObject {
+export function projectPage(value: JsonValue | undefined, fallback: { fileCount?: number; filteredCount?: number; folderCount?: number; invalidCount?: number; itemCount: number; pageCapacity: number; pageId: number; providerCount?: number; requestedPageCapacity?: number; truncatedCount?: number }): JsonObject {
   const source = objectValue(value) ?? {};
   const pageId = typeof source.page_id === "number" && Number.isSafeInteger(source.page_id) && source.page_id >= 0 ? source.page_id : fallback.pageId;
   const pageCapacity = typeof source.page_capacity === "number" && Number.isSafeInteger(source.page_capacity) && source.page_capacity > 0 ? source.page_capacity : fallback.pageCapacity;
@@ -126,7 +126,8 @@ export function projectPage(value: JsonValue | undefined, fallback: { fileCount?
       ...(fallback.fileCount !== undefined ? { file_count: fallback.fileCount } : {}),
       ...(fallback.folderCount !== undefined ? { folder_count: fallback.folderCount } : {}),
       filtered_count: fallback.filteredCount ?? 0,
-      invalid_count: fallback.invalidCount ?? 0
+      invalid_count: fallback.invalidCount ?? 0,
+      ...(fallback.truncatedCount !== undefined ? { truncated_count: fallback.truncatedCount } : {})
     },
     ...(pageCount !== undefined ? { page_count: pageCount } : {}),
     ...(totalCount !== undefined ? { total_count: totalCount } : {}),

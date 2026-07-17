@@ -7,10 +7,9 @@ export interface ScopeScanPolicy {
   includeFiles: boolean;
   includeFolders: boolean;
   matchFields: Array<"name" | "path">;
-  maxDepth: number;
+  maxItemDepth: number;
   maxItems: number;
   pageCapacity: number;
-  queries: string[];
 }
 
 export interface ScopeScanFrontier {

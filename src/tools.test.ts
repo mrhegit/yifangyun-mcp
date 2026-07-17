@@ -31,6 +31,10 @@ function access() {
   return { context: { id: "default", userId: "530" }, identityRef: "identity" };
 }
 
+function scopedAccess() {
+  return { ...access(), scope: { id: "scope", rootFolderId: "501", accessContext: "default", tags: [] } };
+}
+
 async function call(server: FakeServer, name: string, args: Record<string, unknown>, signal = new AbortController().signal) {
   const handler = server.tools.get(name)!;
   return handler(args, { signal, sendNotification: async () => undefined });
@@ -172,6 +176,24 @@ test("item search reports the Provider capacity when it overrides the request", 
   assert.equal((page.effective as Record<string, unknown>).page_capacity, 100);
 });
 
+test("item search bounds Agent context independently from Provider page capacity", async () => {
+  const server = new FakeServer();
+  const files = Array.from({ length: 6 }, (_, index) => ({ id: index + 1, name: `candidate-${index + 1}.pdf`, type: "file" }));
+  const runtime = {
+    config: { maxPageCapacity: 500, toolsets: ["core"] },
+    gateway: { context: access, getUser: async (endpoint: string) => response(endpoint, { files, folders: [], page_id: 0, page_capacity: 100, page_count: 1, total_count: 6 }) },
+    access: { listContexts: () => [], listScopes: () => [] }
+  } as unknown as AppRuntime;
+  registerCoreTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_item_search", { query: "candidate", root: { kind: "personal" }, max_results: 2, page_id: 0, page_capacity: 5 });
+  assert.equal((result.structuredContent?.candidates as unknown[]).length, 2);
+  assert.deepEqual(result.structuredContent?.candidate_summary, { eligible_count: 6, returned_count: 2, result_offset: 0, truncated: true, truncated_count: 4, next_request: { page_id: 0, result_offset: 2 } });
+  assert.equal(((result.structuredContent?.page as Record<string, unknown>).returned as Record<string, unknown>).truncated_count, 4);
+  const continued = await call(server, "yfy_item_search", { query: "candidate", root: { kind: "personal" }, max_results: 2, result_offset: 2, page_id: 0, page_capacity: 5 });
+  assert.deepEqual((continued.structuredContent?.candidates as Array<Record<string, unknown>>).map((candidate) => (candidate.item as Record<string, unknown>).id), ["3", "4"]);
+  assert.deepEqual(continued.structuredContent?.candidate_summary, { eligible_count: 6, returned_count: 2, result_offset: 2, truncated: true, truncated_count: 2, next_request: { page_id: 0, result_offset: 4 } });
+});
+
 test("item search enforces folder scope and precise file names after Provider search", async () => {
   const server = new FakeServer();
   const runtime = {
@@ -249,7 +271,7 @@ test("snapshot query returns a signed context-bound cursor", async () => {
           total: 2
         };
       },
-      summary: () => ({ completeness: { pagination_complete: true } })
+      summary: () => ({ completeness: { pagination_complete: true, safe_to_claim_absence: true, scope: "entire_observed_accessible_scope", consistency_level: "best_effort_complete_observation", incomplete_reasons: [] } })
     }
   } as unknown as AppRuntime;
   registerSnapshotTools(server as unknown as McpServer, runtime);
@@ -263,47 +285,27 @@ test("snapshot query returns a signed context-bound cursor", async () => {
   const wrongQuery = await call(server, "yfy_snapshot_query", { snapshot_id: snapshotId, mode: "search", queries: ["合同"], item_type: "all", cursor, limit: 1 });
   assert.equal(wrongQuery.isError, true);
   assert.equal(errorCode(wrongQuery), "YFY_SNAPSHOT_CURSOR_INVALID");
+  const listed = await call(server, "yfy_snapshot_query", { snapshot_id: snapshotId, mode: "list", queries: ["ignored"], item_type: "all", limit: 1 });
+  const listCursor = String(listed.structuredContent?.next_cursor);
+  const continuedList = await call(server, "yfy_snapshot_query", { snapshot_id: snapshotId, mode: "list", item_type: "all", cursor: listCursor, limit: 1 });
+  assert.notEqual(continuedList.isError, true);
 });
 
-test("evidence verify rejects an empty comparison", async () => {
+test("evidence capture rejects a current file version key for historical content", async () => {
   const server = new FakeServer();
-  const runtime = {
-    config: { toolsets: ["evidence"] },
-    access: { resolveContext: access }
-  } as unknown as AppRuntime;
+  const runtime = { config: { toolsets: ["evidence"] }, access: { resolveScope: scopedAccess } } as unknown as AppRuntime;
   registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_verify", { file_id: "10" });
+  const result = await call(server, "yfy_evidence_capture", { scope_id: "scope", file_id: "10", version: { kind: "historical", version_id: "7" }, expected: { file_version_key: "current-key" } });
   assert.equal(result.isError, true);
   assert.equal(errorCode(result), "YFY_INPUT_INVALID");
 });
 
-test("evidence verify rejects empty expected strings without fail-open", async () => {
-  const server = new FakeServer();
-  const runtime = {
-    config: { toolsets: ["evidence"] },
-    access: { resolveContext: access }
-  } as unknown as AppRuntime;
-  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_verify", { file_id: "10", expected_sha256: "" });
-  assert.equal(result.isError, true);
-  assert.equal(errorCode(result), "YFY_INPUT_INVALID");
-});
-
-test("evidence verify rejects a current file version key for historical content", async () => {
-  const server = new FakeServer();
-  const runtime = { config: { toolsets: ["evidence"] }, access: { resolveContext: access } } as unknown as AppRuntime;
-  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_verify", { file_id: "10", version: { kind: "history", generations_back: 1 }, expected_file_version_key: "current-key" });
-  assert.equal(result.isError, true);
-  assert.equal(errorCode(result), "YFY_INPUT_INVALID");
-});
-
-test("evidence download selects and validates a historical generation", async () => {
+test("evidence capture validates a historical version with the reverse-ordinal strategy", async () => {
   const server = new FakeServer();
   let requestedVersion: unknown;
   const runtime = {
-    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, transport: "stdio" },
-    access: { resolveContext: access },
+    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, transport: "stdio" },
+    access: { resolveScope: scopedAccess },
     gateway: {
       getUser: async (endpoint: string, _context: string, params: Record<string, unknown>) => {
         if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [
@@ -311,66 +313,111 @@ test("evidence download selects and validates a historical generation", async ()
           { id: 7, current: false, sha1: "b".repeat(40), size: 9, modified_at: 1 }
         ] });
         if (endpoint.endsWith("/download_v2")) { requestedVersion = params.version; return response(endpoint, { download_url: "https://download.example/file" }); }
-        return response(endpoint, { id: 10, name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1" });
+        return response(endpoint, { id: 10, name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
       }
     },
     client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/evidence.pdf", sha1: "b".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
-    evidence: { register: () => "yfy://evidence/test" }
+    evidence: { register: () => `yfy://evidence/${"1".repeat(48)}` }
   } as unknown as AppRuntime;
   registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_download", { file_id: "10", version: { kind: "history", generations_back: 1 } });
+  const result = await call(server, "yfy_evidence_capture", { scope_id: "scope", file_id: "10", version: { kind: "historical", version_id: "7" } });
   assert.notEqual(result.isError, true);
   assert.equal(requestedVersion, 1);
-  assert.equal((result.structuredContent?.selection as Record<string, unknown>).provider_download_version, 1);
+  assert.equal((result.structuredContent?.selection as Record<string, unknown>).download_strategy, "historical_reverse_ordinal");
 });
 
-test("evidence download rejects an out-of-range generation before requesting a ticket", async () => {
+test("evidence capture falls back to a validated historical version-id strategy", async () => {
   const server = new FakeServer();
-  let ticketCalls = 0;
+  const requestedVersions: unknown[] = [];
+  let selectedVersion: unknown;
   const runtime = {
-    config: { toolsets: ["evidence"] },
-    access: { resolveContext: access },
+    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, transport: "stdio" },
+    access: { resolveScope: scopedAccess },
     gateway: {
-      getUser: async (endpoint: string) => {
-        if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 10 }] });
-        if (endpoint.endsWith("/download_v2")) ticketCalls += 1;
-        return response(endpoint, { id: "10", name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1" });
+      getUser: async (endpoint: string, _context: string, params: Record<string, unknown>) => {
+        if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 10 }, { id: 7, current: false, sha1: "b".repeat(40), size: 9 }, { id: 8, current: false, sha1: "e".repeat(40), size: 8 }] });
+        if (endpoint.endsWith("/download_v2")) { selectedVersion = params.version; requestedVersions.push(params.version); return response(endpoint, { download_url: "https://download.example/file" }); }
+        return response(endpoint, { id: "10", name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
       }
-    }
+    },
+    client: { downloadFromUrlToTemp: async () => selectedVersion === "7"
+      ? ({ fileName: "evidence.pdf", tempPath: "C:/temp/history.pdf", sha1: "b".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta })
+      : ({ fileName: "evidence.pdf", tempPath: "C:/temp/current.pdf", sha1: "a".repeat(40), sha256: "d".repeat(64), sizeBytes: 10, meta: response("/download", {}).meta }) },
+    evidence: { register: () => `yfy://evidence/${"2".repeat(48)}` }
   } as unknown as AppRuntime;
   registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_download", { file_id: "10", version: { kind: "history", generations_back: 2 } });
-  assert.equal(result.isError, true);
-  assert.equal(errorCode(result), "YFY_VERSION_NOT_FOUND");
-  assert.equal(ticketCalls, 0);
+  const result = await call(server, "yfy_evidence_capture", { scope_id: "scope", file_id: "10", version: { kind: "historical", version_id: "7" } });
+  assert.notEqual(result.isError, true, JSON.stringify(result.content));
+  assert.deepEqual(requestedVersions, [2, 1, "7"]);
+  assert.equal((result.structuredContent?.selection as Record<string, unknown>).download_strategy, "historical_version_id");
 });
 
-test("evidence download rejects a historical generation with indistinguishable content", async () => {
+test("evidence capture returns provider-contract diagnostics when history is unavailable", async () => {
   const server = new FakeServer();
-  let ticketCalls = 0;
   const runtime = {
-    config: { toolsets: ["evidence"] }, access: { resolveContext: access },
+    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, transport: "stdio" }, access: { resolveScope: scopedAccess },
     gateway: { getUser: async (endpoint: string) => {
       if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [
         { current: true, sha1: "a".repeat(40), size: 10 },
-        { current: false, sha1: "a".repeat(40), size: 10 }
+        { id: 7, current: false, sha1: "b".repeat(40), size: 9 }
       ] });
-      if (endpoint.endsWith("/download_v2")) ticketCalls += 1;
-      return response(endpoint, { id: "10", name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1" });
+      if (endpoint.endsWith("/download_v2")) return response(endpoint, { download_url: "https://download.example/file" });
+      return response(endpoint, { id: "10", name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
+    } },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/current.pdf", sha1: "a".repeat(40), sha256: "d".repeat(64), sizeBytes: 10, meta: response("/download", {}).meta }) }
+  } as unknown as AppRuntime;
+  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_evidence_capture", { scope_id: "scope", file_id: "10", version: { kind: "historical", version_id: "7" } });
+  assert.equal(result.isError, true);
+  assert.equal(errorCode(result), "YFY_HISTORICAL_CAPTURE_UNAVAILABLE");
+  assert.match(JSON.stringify(result.content), /provider_contract|attempts/);
+});
+
+test("historical evidence capture preserves authorization errors", async () => {
+  const server = new FakeServer();
+  let downloadRequests = 0;
+  const runtime = {
+    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, transport: "stdio" }, access: { resolveScope: scopedAccess },
+    gateway: { getUser: async (endpoint: string) => {
+      if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 10 }, { id: 7, current: false, sha1: "b".repeat(40), size: 9 }] });
+      if (endpoint.endsWith("/download_v2")) {
+        downloadRequests += 1;
+        throw new YifangyunError("forbidden", { code: "YFY_PERMISSION_DENIED", statusCode: 403 });
+      }
+      return response(endpoint, { id: "10", name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
     } }
   } as unknown as AppRuntime;
   registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_download", { file_id: "10", version: { kind: "history", generations_back: 1 } });
+  const result = await call(server, "yfy_evidence_capture", { scope_id: "scope", file_id: "10", version: { kind: "historical", version_id: "7" } });
   assert.equal(result.isError, true);
-  assert.equal(errorCode(result), "YFY_VERSION_CONTENT_IDENTITY_AMBIGUOUS");
-  assert.equal(ticketCalls, 0);
+  assert.equal(errorCode(result), "YFY_PERMISSION_DENIED");
+  assert.equal(downloadRequests, 1);
 });
 
-test("current evidence lock succeeds without a Provider current version id", async () => {
+test("current evidence capture rejects disagreement with current file metadata", async () => {
   const server = new FakeServer();
   const runtime = {
-    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, transport: "stdio" },
-    access: { resolveScope: () => ({ ...access(), scope: { id: "scope", rootFolderId: "501", accessContext: "default", tags: [] } }) },
+    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, transport: "stdio" }, access: { resolveScope: scopedAccess },
+    gateway: { getUser: async (endpoint: string) => {
+      if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 9 }] });
+      if (endpoint.endsWith("/download_v2")) return response(endpoint, { download_url: "https://download.example/file" });
+      return response(endpoint, { id: "10", name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
+    } },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/metadata-mismatch.pdf", sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
+    evidence: { register: () => { throw new Error("mismatched evidence must not be registered"); } }
+  } as unknown as AppRuntime;
+  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_evidence_capture", { scope_id: "scope", file_id: "10" });
+  assert.equal(result.isError, true);
+  assert.equal(errorCode(result), "YFY_EVIDENCE_DRIFT");
+  assert.match(JSON.stringify(result.content), /current_metadata_size_matches/);
+});
+
+test("current evidence capture returns one authority-bound artifact and expectation result", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, transport: "stdio" },
+    access: { resolveScope: scopedAccess },
     gateway: {
       getUser: async (endpoint: string) => {
         if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 9, modified_at: 1 }] });
@@ -379,49 +426,15 @@ test("current evidence lock succeeds without a Provider current version id", asy
       }
     },
     client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/evidence.pdf", sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
-    evidence: { register: () => "yfy://evidence/test" }
+    evidence: { register: () => `yfy://evidence/${"3".repeat(48)}` }
   } as unknown as AppRuntime;
   registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_lock_current", { file_id: "10", scope_id: "scope" });
+  const result = await call(server, "yfy_evidence_capture", { file_id: "10", scope_id: "scope", expected: { sha256: "d".repeat(64) } });
   assert.notEqual(result.isError, true);
-  assert.equal((result.structuredContent?.selection as Record<string, unknown>).provider_download_version, 0);
-});
-
-test("evidence verify returns a mismatch without treating it as a tool error", async () => {
-  const server = new FakeServer();
-  const runtime = {
-    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, transport: "stdio" },
-    access: { resolveContext: access },
-    gateway: {
-      getUser: async (endpoint: string) => endpoint.endsWith("/versions")
-        ? response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 9, modified_at: 1 }] })
-        : endpoint.endsWith("/download_v2") ? response(endpoint, { download_url: "https://download.example/file" })
-          : response(endpoint, { id: 10, name: "evidence.pdf", type: "file", size: 9, modified_at: 1, file_version_key: "v1" })
-    },
-    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/evidence.pdf", sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
-    evidence: { register: () => "yfy://evidence/test" }
-  } as unknown as AppRuntime;
-  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_verify", { file_id: "10", version: { kind: "current" }, expected_sha256: "d".repeat(64) });
-  assert.equal(result.isError, undefined, JSON.stringify(result.content));
-  assert.equal(result.structuredContent?.matches, false);
-});
-
-test("evidence verify compares hexadecimal hashes case-insensitively", async () => {
-  const server = new FakeServer();
-  const runtime = {
-    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, transport: "stdio" }, access: { resolveContext: access },
-    gateway: { getUser: async (endpoint: string) => endpoint.endsWith("/versions")
-      ? response(endpoint, { file_versions: [{ current: true, sha1: "A".repeat(40), size: 9, modified_at: 1 }] })
-      : endpoint.endsWith("/download_v2") ? response(endpoint, { download_url: "https://download.example/file" })
-        : response(endpoint, { id: 10, name: "evidence.pdf", type: "file", size: 9, modified_at: 1, file_version_key: "v1" }) },
-    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/evidence.pdf", sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
-    evidence: { register: () => "yfy://evidence/test" }
-  } as unknown as AppRuntime;
-  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_verify", { file_id: "10", expected_sha1: "A".repeat(40), expected_sha256: "C".repeat(64) });
-  assert.equal(result.isError, undefined, JSON.stringify(result.content));
-  assert.equal(result.structuredContent?.matches, true);
+  assert.equal((result.structuredContent?.selection as Record<string, unknown>).download_strategy, "current_ordinal");
+  assert.equal((result.structuredContent?.artifact as Record<string, unknown>).local_path, undefined);
+  assert.equal((result.structuredContent?.artifact as Record<string, unknown>).delivery, "mcp_resource");
+  assert.equal(((result.structuredContent?.expectation as Record<string, unknown>).matches), false);
 });
 
 test("HTTP evidence deletes validated files that exceed the resource limit", async () => {
@@ -430,55 +443,28 @@ test("HTTP evidence deletes validated files that exceed the resource limit", asy
   await fs.writeFile(tempPath, "content");
   const server = new FakeServer();
   const runtime = {
-    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1, transport: "http" }, access: { resolveContext: access },
+    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1, tempFileTtlSeconds: 60, transport: "http" }, access: { resolveScope: scopedAccess },
     gateway: { getUser: async (endpoint: string) => endpoint.endsWith("/versions")
       ? response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 7, modified_at: 1 }] })
       : endpoint.endsWith("/download_v2") ? response(endpoint, { download_url: "https://download.example/file" })
-        : response(endpoint, { id: 10, name: "evidence.bin", type: "file", size: 7, modified_at: 1, file_version_key: "v1" }) },
+        : response(endpoint, { id: 10, name: "evidence.bin", type: "file", size: 7, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] }) },
     client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.bin", tempPath, sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 7, meta: response("/download", {}).meta }) },
     evidence: { register: () => { throw new Error("oversized evidence must not be registered"); } }
   } as unknown as AppRuntime;
   try {
     registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-    const result = await call(server, "yfy_evidence_download", { file_id: "10" });
+    const result = await call(server, "yfy_evidence_capture", { scope_id: "scope", file_id: "10" });
     assert.notEqual(result.isError, true, JSON.stringify(result.content));
-    const evidence = result.structuredContent?.evidence as Record<string, unknown>;
-    assert.equal(evidence.temp_path, undefined);
-    assert.equal(evidence.artifact_disposition, "deleted_after_validation");
+    const artifact = result.structuredContent?.artifact as Record<string, unknown>;
+    assert.equal(artifact.delivery, "omitted");
+    assert.equal(artifact.resource_uri, undefined);
     await assert.rejects(() => fs.stat(tempPath), { code: "ENOENT" });
   } finally {
     await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }
 });
 
-test("HTTP evidence cleanup failures are redacted and retained for registry cleanup", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-http-evidence-cleanup-"));
-  const artifactDirectory = path.join(dir, "artifact-directory");
-  await fs.mkdir(artifactDirectory);
-  const server = new FakeServer();
-  let registeredPath: string | undefined;
-  const runtime = {
-    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1, transport: "http" }, access: { resolveContext: access },
-    gateway: { getUser: async (endpoint: string) => endpoint.endsWith("/versions")
-      ? response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 7, modified_at: 1 }] })
-      : endpoint.endsWith("/download_v2") ? response(endpoint, { download_url: "https://download.example/file" })
-        : response(endpoint, { id: 10, name: "evidence.bin", type: "file", size: 7, modified_at: 1, file_version_key: "v1" }) },
-    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.bin", tempPath: artifactDirectory, sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 7, meta: response("/download", {}).meta }) },
-    evidence: { register: async (artifact: { path: string }) => { registeredPath = artifact.path; return "yfy://evidence/retained"; } }
-  } as unknown as AppRuntime;
-  try {
-    registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-    const result = await call(server, "yfy_evidence_download", { file_id: "10" });
-    assert.equal(result.isError, true);
-    assert.equal(errorCode(result), "YFY_EVIDENCE_CLEANUP_FAILED");
-    assert.equal(registeredPath, artifactDirectory);
-    assert.doesNotMatch(JSON.stringify(result.content), /artifact-directory|yfy-http-evidence-cleanup/);
-  } finally {
-    await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
-  }
-});
-
-test("transfer tickets only claim selector prevalidation", async () => {
+test("transfer tickets are current-only and claim metadata-only validation", async () => {
   const server = new FakeServer();
   const runtime = {
     config: { toolsets: ["transfer"] }, access: { resolveContext: access },
@@ -489,8 +475,7 @@ test("transfer tickets only claim selector prevalidation", async () => {
   registerTransferTools(server as unknown as McpServer, runtime);
   const result = await call(server, "yfy_transfer_ticket_get", { file_id: "10" });
   assert.notEqual(result.isError, true, JSON.stringify(result.content));
-  assert.equal(result.structuredContent?.validation_level, "selector_prevalidated");
-  assert.equal((result.structuredContent?.selection as Record<string, unknown>).validation_level, "selector_prevalidated");
+  assert.equal((result.structuredContent?.selection as Record<string, unknown>).validation_level, "metadata_only");
 });
 
 test("mutation and admin grouped tools build official requests", async () => {

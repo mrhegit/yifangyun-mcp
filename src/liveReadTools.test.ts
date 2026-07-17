@@ -121,7 +121,7 @@ test("live read-only catalog works against Yifangyun", { skip: process.env.YFY_L
       await call(server, "yfy_authority_validate", { scope_id: "live_scope" });
     }
     if (rootFolderId && process.env.YFY_LIVE_SNAPSHOT_TESTS === "enabled") {
-      const started = await call(server, "yfy_snapshot_create", { scope_id: "live_scope", queries: ["验收证书"], max_depth: 0, max_items: 100, page_capacity: 20 });
+      const started = await call(server, "yfy_snapshot_create", { scope_id: "live_scope", max_item_depth: 1, max_items: 100, page_capacity: 20 });
       const snapshotId = String(started.snapshot_id);
       let status = String(started.status);
       for (let attempt = 0; attempt < 20 && ["running", "paused_retryable"].includes(status); attempt += 1) {

@@ -11,10 +11,9 @@ export interface CreateSnapshotInput {
   includeFiles: boolean;
   includeFolders: boolean;
   matchFields: Array<"name" | "path">;
-  maxDepth: number;
+  maxItemDepth: number;
   maxItems: number;
   pageCapacity: number;
-  queries: string[];
   rootFolderId: string;
   signal?: AbortSignal;
 }
@@ -45,10 +44,9 @@ export class SnapshotService {
       includeFiles: input.includeFiles,
       includeFolders: input.includeFolders,
       matchFields: input.matchFields,
-      maxDepth: input.maxDepth,
+      maxItemDepth: input.maxItemDepth,
       maxItems: input.maxItems,
-      pageCapacity: input.pageCapacity,
-      queries: input.queries
+      pageCapacity: input.pageCapacity
     };
     const started = await this.engine.start({
       accessContextId: resolved.context.id,
@@ -81,11 +79,17 @@ export class SnapshotService {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const state = await this.get(input.scanId, input.accessContextId);
       if (input.cursor && input.cursor.revision !== state.revision) {
-        throw new YifangyunError("Snapshot changed after this cursor was issued.", { code: "YFY_SNAPSHOT_CURSOR_STALE", phase: "snapshot_query", scanId: state.scanId, suggestedAction: "Restart the query without a cursor." });
+        throw new YifangyunError("Snapshot changed after this cursor was issued.", {
+          code: "YFY_SNAPSHOT_CURSOR_STALE",
+          phase: "snapshot_query",
+          scanId: state.scanId,
+          agentDetails: { current_revision: state.revision, cursor_revision: input.cursor.revision, restart_required: true },
+          suggestedAction: "Repeat the same snapshot query without cursor to restart from the first stable page."
+        });
       }
-      const queries = input.queries?.length ? input.queries : state.policy.queries;
+      const queries = input.queries ?? [];
       if (input.mode === "search" && queries.length === 0) {
-        throw new YifangyunError("Snapshot has no stored queries and no queries were provided.", { code: "YFY_SNAPSHOT_QUERY_EMPTY", phase: "snapshot_query", scanId: state.scanId });
+        throw new YifangyunError("Snapshot search requires at least one query.", { code: "YFY_SNAPSHOT_QUERY_EMPTY", phase: "snapshot_query", scanId: state.scanId, suggestedAction: "Provide queries, or use mode=list to enumerate snapshot items." });
       }
       const result = input.mode === "search"
         ? await this.engine.search(input.scanId, queries, input.type ?? "all", input.cursor, input.limit)
@@ -95,7 +99,13 @@ export class SnapshotService {
         return { ...result, ...(result.nextCursor ? { nextCursor: { ...result.nextCursor, revision: state.revision } } : {}), state };
       }
       if (input.cursor) {
-        throw new YifangyunError("Snapshot changed after this cursor was issued.", { code: "YFY_SNAPSHOT_CURSOR_STALE", phase: "snapshot_query", scanId: state.scanId, suggestedAction: "Restart the query without a cursor." });
+        throw new YifangyunError("Snapshot changed after this cursor was issued.", {
+          code: "YFY_SNAPSHOT_CURSOR_STALE",
+          phase: "snapshot_query",
+          scanId: state.scanId,
+          agentDetails: { current_revision: after.revision, cursor_revision: input.cursor.revision, restart_required: true },
+          suggestedAction: "Repeat the same snapshot query without cursor to restart from the first stable page."
+        });
       }
     }
     throw new YifangyunError("Snapshot is changing too quickly to return a consistent page.", { code: "YFY_SNAPSHOT_QUERY_BUSY", phase: "snapshot_query", retryable: true, scanId: input.scanId, suggestedAction: "Retry after the snapshot reaches complete or partial status." });

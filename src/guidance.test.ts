@@ -18,8 +18,15 @@ test("tender prompt accepts MCP string arguments", async () => {
   registerGuidance(server as unknown as McpServer, runtime);
   const handler = server.prompts.get("yfy_tender_material_audit");
   assert.ok(handler);
-  const result = await handler({ scope_id: "tender", required_materials: "证书", max_depth: "5", max_items: "100" });
+  const result = await handler({ scope_id: "tender", required_materials: "qualification certificate", max_item_depth: "5", max_items: "100" });
   assert.ok(result);
+  assert.match(JSON.stringify(result), /Hard rules/);
+  assert.match(JSON.stringify(result), /max_item_depth=5/);
+  const compare = server.prompts.get("yfy_tender_compare_versions");
+  assert.ok(compare);
+  const comparison = await compare({ file_id: "501", scope_id: "tender", expected_sha256: "a".repeat(64) });
+  assert.match(JSON.stringify(comparison), /Authority scope: tender/);
+  assert.match(JSON.stringify(comparison), /yfy_evidence_capture/);
 });
 
 test("tender prompts are absent when the profile is not configured", () => {
@@ -32,9 +39,9 @@ test("tender prompts are absent when the profile is not configured", () => {
 test("server instructions only recommend available and ready capabilities", () => {
   const evidenceOnly = { config: { toolsets: ["evidence"], workflowProfiles: [], authorityScopes: [] } } as unknown as AppRuntime;
   const instructions = serverInstructions(evidenceOnly);
-  assert.doesNotMatch(instructions, /yfy_context_get|snapshot|yfy_evidence_lock_current/);
+  assert.doesNotMatch(instructions, /yfy_context_get|snapshot|yfy_evidence_capture/);
   const ready = { config: { toolsets: ["core", "snapshot", "evidence"], workflowProfiles: [], authorityScopes: [{ id: "scope" }] } } as unknown as AppRuntime;
   assert.match(serverInstructions(ready), /yfy_context_get/);
-  assert.match(serverInstructions(ready), /snapshots/);
-  assert.match(serverInstructions(ready), /yfy_evidence_lock_current/);
+  assert.match(serverInstructions(ready), /snapshot/);
+  assert.match(serverInstructions(ready), /yfy_evidence_capture/);
 });

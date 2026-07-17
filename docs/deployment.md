@@ -24,7 +24,7 @@ MCP 客户端配置示例：
   "mcpServers": {
     "yifangyun": {
       "command": "npx",
-      "args": ["-y", "yifangyun-mcp-server@1.0.0-beta.3"],
+      "args": ["-y", "yifangyun-mcp-server@1.0.0-beta.4"],
       "env": {
         "YFY_CLIENT_ID": "...",
         "YFY_CLIENT_SECRET": "...",
@@ -39,7 +39,7 @@ MCP 客户端配置示例：
 }
 ```
 
-此示例是通用模式。要使用 Authority Snapshot 或 Current Lock，需要配置 Scope；要注册 Tender Prompt，还需设置 `YFY_WORKFLOW_PROFILES=tender`。
+此示例是通用模式。要使用 Authority Snapshot 或 Evidence Capture，需要配置 Scope；要注册 Tender Prompt，还需设置 `YFY_WORKFLOW_PROFILES=tender`。
 
 ## HTTP
 

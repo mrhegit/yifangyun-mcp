@@ -5,8 +5,8 @@ import { arrayValue, idValue, objectValue } from "./projectors.js";
 
 export interface FileVersion {
   current: boolean;
-  download_version: number;
-  downloadable: boolean;
+  evidence_ready: boolean;
+  generation: number;
   modified_at_iso?: string;
   modified_at_unix?: number;
   name?: string;
@@ -16,7 +16,8 @@ export interface FileVersion {
   size_bytes?: number;
 }
 
-export type VersionSelector = { kind: "current" } | { generations_back: number; kind: "history" };
+export type VersionSelector = { kind: "current" } | { kind: "historical"; version_id: string };
+export type EvidenceDownloadStrategy = "current_ordinal" | "historical_reverse_ordinal" | "historical_ordinal" | "historical_version_id";
 
 export function normalizeFileVersions(value: JsonValue | undefined): { fingerprint: string; versions: FileVersion[] } {
   const source = objectValue(value) ?? {};
@@ -35,9 +36,9 @@ export function normalizeFileVersions(value: JsonValue | undefined): { fingerpri
     const size = typeof item.size === "number" && Number.isSafeInteger(item.size) && item.size >= 0 ? item.size : undefined;
     const sha1 = typeof item.sha1 === "string" && /^[a-f\d]{40}$/i.test(item.sha1) ? item.sha1.toLowerCase() : undefined;
     return {
-      download_version: index,
+      generation: index,
       current: item.current === true,
-      downloadable: sha1 !== undefined && size !== undefined,
+      evidence_ready: sha1 !== undefined && size !== undefined,
       ...(idValue(item.id) ? { provider_version_id: idValue(item.id)! } : {}),
       ...(typeof item.name === "string" ? { name: item.name } : {}),
       ...(sha1 ? { sha1 } : {}),
@@ -54,9 +55,23 @@ export function normalizeFileVersions(value: JsonValue | undefined): { fingerpri
       details: { current_indexes: currentIndexes, version_count: versions.length }
     });
   }
+  const versionIdCounts = new Map<string, number>();
+  for (const version of versions) {
+    if (version.provider_version_id) {
+      versionIdCounts.set(version.provider_version_id, (versionIdCounts.get(version.provider_version_id) ?? 0) + 1);
+    }
+  }
+  const duplicateVersionIds = [...versionIdCounts].filter(([, count]) => count > 1).map(([versionId]) => versionId);
+  if (duplicateVersionIds.length > 0) {
+    throw new YifangyunError("Provider version history contains duplicate version IDs.", {
+      code: "YFY_DOWNLOAD_VERSION_ORDER_AMBIGUOUS",
+      phase: "version_normalization",
+      agentDetails: { duplicate_version_ids: duplicateVersionIds }
+    });
+  }
   const fingerprint = crypto.createHash("sha256").update(JSON.stringify(versions.map((version) => ({
     current: version.current,
-    download_version: version.download_version,
+    generation: version.generation,
     modified_at_unix: version.modified_at_unix ?? null,
     provider_version_id: version.provider_version_id ?? null,
     sha1: version.sha1 ?? null,
@@ -66,38 +81,44 @@ export function normalizeFileVersions(value: JsonValue | undefined): { fingerpri
 }
 
 export function selectFileVersion(versions: FileVersion[], selector: VersionSelector): FileVersion {
-  const downloadVersion = selector.kind === "current" ? 0 : selector.generations_back;
-  const selected = versions[downloadVersion];
+  const selected = selector.kind === "current"
+    ? versions[0]
+    : versions.find((version) => version.provider_version_id === selector.version_id);
   if (!selected) {
-    throw new YifangyunError("Requested file version is outside the available history.", {
+    throw new YifangyunError("请求的文件版本不在当前版本历史中。", {
       code: "YFY_VERSION_NOT_FOUND",
       phase: "version_selection",
-      details: { available_versions: versions.length, requested_download_version: downloadVersion }
+      agentDetails: {
+        available_version_ids: versions.flatMap((version) => version.provider_version_id ? [version.provider_version_id] : []),
+        requested_version_id: selector.kind === "historical" ? selector.version_id : "current"
+      },
+      suggestedAction: "重新调用 yfy_file_versions，并使用当前返回的历史 version_id。"
     });
   }
-  if (selected.download_version !== downloadVersion || (downloadVersion === 0) !== selected.current) {
-    throw new YifangyunError("Provider version order is ambiguous.", {
+  if ((selector.kind === "current") !== selected.current || (selected.current && selected.generation !== 0)) {
+    throw new YifangyunError("Provider 版本顺序存在歧义。", {
       code: "YFY_DOWNLOAD_VERSION_ORDER_AMBIGUOUS",
       phase: "version_selection",
-      details: { requested_download_version: downloadVersion, selected_download_version: selected.download_version, selected_current: selected.current }
+      details: { selected_current: selected.current, selected_generation: selected.generation }
     });
   }
-  if (!selected.downloadable) {
-    throw new YifangyunError("Requested file version lacks SHA-1 or size metadata required for safe download.", {
+  if (!selected.evidence_ready) {
+    throw new YifangyunError("请求的文件版本缺少安全取证所需的 SHA-1 或大小元数据。", {
       code: "YFY_VERSION_METADATA_INCOMPLETE",
       phase: "version_selection",
-      details: { download_version: selected.download_version }
+      agentDetails: { generation: selected.generation, provider_version_id: selected.provider_version_id ?? null },
+      suggestedAction: "只能对 evidence_ready=true 的版本执行取证。"
     });
   }
   return selected;
 }
 
-export function versionSelectionProof(version: FileVersion, selector: VersionSelector, validationLevel: "content_and_metadata" | "selector_prevalidated"): JsonObject {
+export function versionSelectionProof(version: FileVersion, selector: VersionSelector, downloadStrategy: EvidenceDownloadStrategy): JsonObject {
   return {
     kind: selector.kind,
-    provider_download_version: version.download_version,
-    ...(selector.kind === "history" ? { generations_back: selector.generations_back } : {}),
+    generation: version.generation,
     ...(version.provider_version_id ? { provider_version_id: version.provider_version_id } : {}),
-    validation_level: validationLevel
+    download_strategy: downloadStrategy,
+    validation_level: "content_and_metadata"
   };
 }

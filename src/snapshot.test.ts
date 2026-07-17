@@ -33,10 +33,9 @@ const policy: ScopeScanPolicy = {
   includeFiles: true,
   includeFolders: true,
   matchFields: ["name", "path"],
-  maxDepth: 5,
+  maxItemDepth: 5,
   maxItems: 1000,
-  pageCapacity: 2,
-  queries: ["验收证书"]
+  pageCapacity: 2
 };
 
 function provider(): ScopeScanProvider {
@@ -60,7 +59,7 @@ test("background snapshot completes and queries indexed SQLite items", async () 
   const service = new SnapshotService(new ScopeScanEngine(store, provider()), store, new AccessRegistry(appConfig));
   await service.initialize();
   try {
-    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"], maxDepth: 5, maxItems: 1000, pageCapacity: 2, queries: ["验收证书"], rootFolderId: "1" });
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"], maxItemDepth: 5, maxItems: 1000, pageCapacity: 2, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
     const completed = await service.get(started.state.scanId);
     assert.equal(completed.status, "complete");
@@ -82,13 +81,32 @@ test("background snapshot completes and queries indexed SQLite items", async () 
   }
 });
 
+test("max_item_depth never stores deeper items and keeps absence claims disabled", async () => {
+  const store = new SqliteScopeScanStore(":memory:", 3600, 10_000_000);
+  const service = new SnapshotService(new ScopeScanEngine(store, provider()), store, new AccessRegistry(config(":memory:")));
+  await service.initialize();
+  try {
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"], maxItemDepth: 1, maxItems: 1000, pageCapacity: 2, rootFolderId: "1" });
+    await service.waitForIdle(started.state.scanId);
+    const completed = await service.get(started.state.scanId);
+    assert.equal(completed.status, "partial");
+    assert.ok(completed.incompleteReasons.includes("MAX_DEPTH_REACHED"));
+    const listed = await service.query({ scanId: completed.scanId, mode: "list", type: "all", limit: 100 });
+    assert.ok(listed.items.every((item) => typeof item.depth === "number" && item.depth <= 1));
+    assert.ok(!listed.items.some((item) => item.id === "12"));
+    assert.equal((service.summary(completed).completeness as Record<string, unknown>).safe_to_claim_absence, false);
+  } finally {
+    await service.close();
+  }
+});
+
 test("concurrent equivalent snapshot creation reuses one operation", async () => {
   const store = new SqliteScopeScanStore(":memory:", 3600, 10_000_000);
   const appConfig = config(":memory:");
   const service = new SnapshotService(new ScopeScanEngine(store, provider()), store, new AccessRegistry(appConfig));
   await service.initialize();
   try {
-    const input = { accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"] as Array<"name" | "path">, maxDepth: 5, maxItems: 1000, pageCapacity: 2, queries: ["验收证书"], rootFolderId: "1" };
+    const input = { accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"] as Array<"name" | "path">, maxItemDepth: 5, maxItems: 1000, pageCapacity: 2, rootFolderId: "1" };
     const [left, right] = await Promise.all([service.create(input), service.create(input)]);
     assert.equal(left.state.scanId, right.state.scanId);
     assert.ok(left.reused || right.reused);
@@ -167,7 +185,7 @@ test("bounded concurrent page fetch preserves canonical receipt order", async ()
   const service = new SnapshotService(new ScopeScanEngine(store, concurrentProvider), store, new AccessRegistry(config(":memory:")), 4);
   await service.initialize();
   try {
-    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxDepth: 0, maxItems: 100, pageCapacity: 1, queries: [], rootFolderId: "1" });
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: 100, pageCapacity: 1, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
     const manifest = await service.manifest(started.state.scanId);
     const receipts = manifest.receipts as Array<Record<string, unknown>>;
@@ -195,7 +213,7 @@ test("snapshot status and cancellation remain responsive during slow Provider I/
   const service = new SnapshotService(new ScopeScanEngine(store, slowProvider), store, new AccessRegistry(config(":memory:")), 2);
   await service.initialize();
   try {
-    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxDepth: 1, maxItems: 100, pageCapacity: 10, queries: [], rootFolderId: "1" });
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: 100, pageCapacity: 10, rootFolderId: "1" });
     await startedRequest;
     const status = await Promise.race([
       service.get(started.state.scanId),
@@ -221,7 +239,7 @@ test("snapshot worker persists a failed state when page commit exceeds quota", a
   const service = new SnapshotService(new ScopeScanEngine(store, quotaProvider), store, new AccessRegistry(config(":memory:")));
   await service.initialize();
   try {
-    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxDepth: 1, maxItems: 100, pageCapacity: 100, queries: [], rootFolderId: "1" });
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: 100, pageCapacity: 100, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
     const failed = await service.get(started.state.scanId);
     assert.equal(failed.status, "failed");
@@ -241,7 +259,7 @@ test("file-backed snapshot reserves WAL and index growth before committing a pag
   const service = new SnapshotService(new ScopeScanEngine(store, provider()), store, new AccessRegistry(config(databasePath)));
   await service.initialize();
   try {
-    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxDepth: 1, maxItems: 100, pageCapacity: 2, queries: [], rootFolderId: "1" });
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: 100, pageCapacity: 2, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
     const failed = await service.get(started.state.scanId);
     assert.equal(failed.status, "failed");
@@ -263,7 +281,7 @@ test("duplicate items do not consume max_items capacity", async () => {
   const service = new SnapshotService(new ScopeScanEngine(store, duplicateProvider), store, new AccessRegistry(config(":memory:")));
   await service.initialize();
   try {
-    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxDepth: 0, maxItems: 2, pageCapacity: 2, queries: [], rootFolderId: "1" });
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: 2, pageCapacity: 2, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
     const state = await service.get(started.state.scanId);
     assert.equal(state.fileCount, 2);
@@ -283,7 +301,7 @@ test("inconsistent pagination metadata cannot produce a complete snapshot", asyn
   const service = new SnapshotService(new ScopeScanEngine(store, inconsistentProvider), store, new AccessRegistry(config(":memory:")));
   await service.initialize();
   try {
-    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxDepth: 0, maxItems: 100, pageCapacity: 100, queries: [], rootFolderId: "1" });
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: 100, pageCapacity: 100, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
     const state = await service.get(started.state.scanId);
     assert.equal(state.status, "partial");
@@ -302,7 +320,7 @@ test("has_more false cannot prove completion when page counts show remaining pag
   const service = new SnapshotService(new ScopeScanEngine(store, inconsistentProvider), store, new AccessRegistry(config(":memory:")));
   await service.initialize();
   try {
-    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxDepth: 0, maxItems: 100, pageCapacity: 1, queries: [], rootFolderId: "1" });
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: 100, pageCapacity: 1, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
     const state = await service.get(started.state.scanId);
     assert.equal(state.status, "partial");
@@ -322,7 +340,7 @@ test("a final page must account for the Provider total count", async () => {
   const service = new SnapshotService(new ScopeScanEngine(store, inconsistentProvider), store, new AccessRegistry(config(":memory:")));
   await service.initialize();
   try {
-    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxDepth: 0, maxItems: 100, pageCapacity: 100, queries: [], rootFolderId: "1" });
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: 100, pageCapacity: 100, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
     const state = await service.get(started.state.scanId);
     assert.equal(state.status, "partial");
@@ -342,7 +360,7 @@ test("a non-empty page cannot claim page_count zero", async () => {
   const service = new SnapshotService(new ScopeScanEngine(store, inconsistentProvider), store, new AccessRegistry(config(":memory:")));
   await service.initialize();
   try {
-    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxDepth: 0, maxItems: 100, pageCapacity: 1, queries: [], rootFolderId: "1" });
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: 100, pageCapacity: 1, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
     const state = await service.get(started.state.scanId);
     assert.equal(state.status, "partial");
@@ -363,7 +381,7 @@ test("a Provider next_page_id cannot skip an unobserved page", async () => {
   const service = new SnapshotService(new ScopeScanEngine(store, skippingProvider), store, new AccessRegistry(config(":memory:")));
   await service.initialize();
   try {
-    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxDepth: 0, maxItems: 100, pageCapacity: 1, queries: [], rootFolderId: "1" });
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: 100, pageCapacity: 1, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
     const state = await service.get(started.state.scanId);
     assert.equal(state.status, "partial");
@@ -451,7 +469,8 @@ test("omitting access_context cannot read another context snapshot", async () =>
   const service = new SnapshotService(new ScopeScanEngine(store, provider()), store, new AccessRegistry(appConfig));
   await service.initialize();
   try {
-    const started = await service.create({ accessContextId: "other", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxDepth: 1, maxItems: 100, pageCapacity: 2, queries: [], rootFolderId: "1" });
+    const started = await service.create({ accessContextId: "other", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: 100, pageCapacity: 2, rootFolderId: "1" });
+    assert.deepEqual((service.summary(started.state).next_action as Record<string, unknown>).arguments, { snapshot_id: started.state.scanId, access_context: "other" });
     await assert.rejects(() => service.get(started.state.scanId), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_SNAPSHOT_ACCESS_DENIED"));
     assert.equal((await service.get(started.state.scanId, "other")).accessContextId, "other");
   } finally {
@@ -483,7 +502,7 @@ test("case-sensitive snapshot search filters FTS case-folding false positives", 
   const service = new SnapshotService(new ScopeScanEngine(store, caseProvider), store, new AccessRegistry(config(":memory:")));
   await service.initialize();
   try {
-    const started = await service.create({ accessContextId: "default", caseSensitive: true, includeFiles: true, includeFolders: true, matchFields: ["name"], maxDepth: 0, maxItems: 100, pageCapacity: 10, queries: [], rootFolderId: "1" });
+    const started = await service.create({ accessContextId: "default", caseSensitive: true, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: 100, pageCapacity: 10, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
     const lower = await service.query({ scanId: started.state.scanId, mode: "search", queries: ["abc"], type: "all", limit: 10 });
     const exact = await service.query({ scanId: started.state.scanId, mode: "search", queries: ["AbC"], type: "all", limit: 10 });
@@ -512,7 +531,7 @@ test("SQLite snapshot handles 50000 synthetic files", { skip: process.env.YFY_RU
   await service.initialize();
   try {
     const startedAt = performance.now();
-    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"], maxDepth: 1, maxItems: 50000, pageCapacity, queries: ["file-99"], rootFolderId: "1" });
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"], maxItemDepth: 1, maxItems: 50000, pageCapacity, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
     const completed = await service.get(started.state.scanId);
     assert.equal(completed.status, "complete");
@@ -564,7 +583,7 @@ test("SQLite frontier handles a wide folder tree without state JSON rewrites", {
   await service.initialize();
   try {
     const startedAt = performance.now();
-    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"], maxDepth: 1, maxItems: 2000, pageCapacity, queries: [], rootFolderId: "1" });
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"], maxItemDepth: 1, maxItems: 2000, pageCapacity, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
     const completed = await service.get(started.state.scanId);
     assert.equal(completed.status, "complete");

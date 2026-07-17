@@ -42,21 +42,28 @@ export const CandidateSchema = z.object({
   verification: z.object({ folder_scope: z.enum(["not_requested", "verified"]), exact_name: z.enum(["not_requested", "verified"]) })
 });
 export const VersionSelectorSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("current") }),
-  z.object({ kind: z.literal("history"), generations_back: z.number().int().min(1).max(10000) })
+  z.object({ kind: z.literal("current") }).describe("Capture the current version."),
+  z.object({
+    kind: z.literal("historical"),
+    version_id: z.string().trim().regex(/^\d+$/).describe("Historical provider_version_id returned by yfy_file_versions.")
+  }).describe("Capture one exact historical version by stable version ID.")
 ]);
 export const VersionSelectionProofSchema = z.object({
-  kind: z.enum(["current", "history"]), provider_download_version: z.number().int().min(0), generations_back: z.number().int().min(1).optional(),
-  provider_version_id: z.string().optional(), validation_level: z.enum(["selector_prevalidated", "content_and_metadata"])
+  kind: z.enum(["current", "historical"]),
+  generation: z.number().int().min(0),
+  provider_version_id: z.string().optional(),
+  download_strategy: z.enum(["current_ordinal", "historical_reverse_ordinal", "historical_ordinal", "historical_version_id"]),
+  validation_level: z.literal("content_and_metadata")
 });
 export const FileVersionSchema = z.object({
-  download_version: z.number().int().min(0), provider_version_id: z.string().optional(), current: z.boolean(), name: z.string().optional(),
+  generation: z.number().int().min(0), provider_version_id: z.string().optional(), current: z.boolean(), name: z.string().optional(),
   sha1: z.string().regex(/^[a-f\d]{40}$/i).optional(), size_bytes: z.number().int().nonnegative().optional(), modified_at_unix: z.number().int().nonnegative().optional(),
-  modified_at_iso: z.string().optional(), remark: z.string().optional(), downloadable: z.boolean()
+  modified_at_iso: z.string().optional(), remark: z.string().optional(), evidence_ready: z.boolean()
 });
 export const DomainErrorSchema = z.object({
-  code: z.string(), category: z.enum(["invalid_input", "authentication", "authorization", "not_found", "rate_limited", "timeout", "provider_unavailable", "provider_contract", "cancelled", "conflict", "internal"]),
+  code: z.string(), category: z.enum(["invalid_input", "authentication", "authorization", "not_found", "rate_limited", "timeout", "provider_unavailable", "provider_contract", "stale_state", "capacity_limit", "cancelled", "conflict", "internal"]),
   message: z.string(), retryable: z.boolean(), phase: z.string().optional(), retry_after_ms: z.number().int().nonnegative().optional(), suggested_action: z.string().optional(),
+  diagnostics: z.record(JsonValueSchema).optional(),
   provider: z.object({ status_code: z.number().int().optional(), code: z.string().optional(), request_id: z.string().optional() }).optional()
 });
 export const PageInputShape = {
@@ -66,7 +73,7 @@ export const PageInputShape = {
 export const PageSchema = z.object({
   requested: z.object({ page_id: z.number().int().min(0), page_capacity: z.number().int().min(1) }),
   effective: z.object({ page_id: z.number().int().min(0), page_capacity: z.number().int().min(1), page_capacity_source: z.enum(["provider", "request_sent"]) }),
-  returned: z.object({ provider_count: z.number().int().min(0), item_count: z.number().int().min(0), file_count: z.number().int().min(0).optional(), folder_count: z.number().int().min(0).optional(), filtered_count: z.number().int().min(0), invalid_count: z.number().int().min(0) }),
+  returned: z.object({ provider_count: z.number().int().min(0), item_count: z.number().int().min(0), file_count: z.number().int().min(0).optional(), folder_count: z.number().int().min(0).optional(), filtered_count: z.number().int().min(0), invalid_count: z.number().int().min(0), truncated_count: z.number().int().min(0).optional() }),
   page_count: z.number().int().min(0).optional(),
   total_count: z.number().int().min(0).optional(),
   has_more: z.boolean(),

@@ -2,13 +2,13 @@ import { promises as fs } from "node:fs";
 import { ResourceTemplate, type McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { YifangyunError } from "../client.js";
-import { normalizeFileVersions, selectFileVersion, versionSelectionProof, type FileVersion, type VersionSelector } from "../domain/fileVersions.js";
-import { arrayValue, idValue, objectValue, projectDepartment, projectItem, projectPath, provenance } from "../domain/projectors.js";
+import { normalizeFileVersions, selectFileVersion, versionSelectionProof, type EvidenceDownloadStrategy, type FileVersion, type VersionSelector } from "../domain/fileVersions.js";
+import { idValue, objectValue, projectDepartment, projectItem, provenance } from "../domain/projectors.js";
 import { metrics } from "../observability.js";
 import type { AppRuntime } from "../runtime/runtime.js";
 import type { JsonObject } from "../types.js";
 import { registerTool } from "./tooling.js";
-import { VersionSelectorSchema } from "./schemas.js";
+import { FileVersionSchema, ItemSchema, ProvenanceSchema, VersionSelectionProofSchema, VersionSelectorSchema } from "./schemas.js";
 
 const IdSchema = z.string().trim().regex(/^\d+$/);
 
@@ -38,34 +38,85 @@ function inScope(file: JsonObject, rootFolderId: string): { ancestorIds: string[
   return { ancestorIds, matched: ancestorIds.includes(rootFolderId) || file.parent_folder_id === rootFolderId };
 }
 
-async function attachEvidenceResource(runtime: AppRuntime, evidence: JsonObject): Promise<void> {
+function normalizedMediaType(contentType: unknown, detectedContentType: unknown): string {
+  const providerType = typeof contentType === "string" ? contentType.split(";", 1)[0]!.trim().toLowerCase() : "";
+  if (/^[\w.+-]+\/[\w.+-]+$/.test(providerType) && providerType !== "application/octet-stream") return providerType;
+  const detectedType = typeof detectedContentType === "string" ? detectedContentType.split(";", 1)[0]!.trim().toLowerCase() : "";
+  return /^[\w.+-]+\/[\w.+-]+$/.test(detectedType) ? detectedType : "application/octet-stream";
+}
+
+async function removeEvidenceTemp(tempPath: string): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await fs.rm(tempPath, { force: true });
+      return;
+    } catch (error) {
+      const retryable = Boolean(error && typeof error === "object" && "code" in error && (error.code === "EPERM" || error.code === "EBUSY"));
+      if (!retryable || attempt === 2) {
+        throw new YifangyunError("Validated evidence could not be removed from temporary storage.", {
+          code: "YFY_EVIDENCE_CLEANUP_FAILED",
+          phase: "evidence_cleanup",
+          retryable
+        });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)));
+    }
+  }
+}
+
+function canTryAnotherHistoricalSelector(error: unknown): boolean {
+  return error instanceof YifangyunError
+    && (error.code === "YFY_DOWNLOAD_TICKET_INVALID"
+      || (error.code === "YFY_PROVIDER_HTTP_ERROR" && [400, 404, 422].includes(error.statusCode ?? 0)));
+}
+
+async function attachEvidenceArtifact(runtime: AppRuntime, evidence: JsonObject): Promise<JsonObject> {
   const sizeBytes = typeof evidence.size_bytes === "number" ? evidence.size_bytes : Number.MAX_SAFE_INTEGER;
   const maxResourceBytes = runtime.config.maxEvidenceResourceBytes ?? 16777216;
+  const mediaType = normalizedMediaType(evidence.content_type, evidence.detected_content_type);
+  const common: JsonObject = {
+    file_id: String(evidence.file_id),
+    file_name: String(evidence.file_name),
+    sha1: String(evidence.sha1),
+    sha256: String(evidence.sha256),
+    size_bytes: sizeBytes,
+    media_type: mediaType,
+    ...(typeof evidence.detected_content_type === "string" ? { detected_media_type: String(evidence.detected_content_type).split(";", 1)[0]!.trim().toLowerCase() } : {})
+  };
   if (sizeBytes > maxResourceBytes) {
-    evidence.resource_omitted = { code: "YFY_EVIDENCE_RESOURCE_TOO_LARGE", max_resource_bytes: maxResourceBytes, size_bytes: sizeBytes };
     if (runtime.config.transport === "http") {
-      try {
-        await fs.rm(String(evidence.temp_path), { force: true });
-      } catch {
-        await runtime.evidence.register({
-          path: String(evidence.temp_path), name: String(evidence.file_name), expectedSize: sizeBytes,
-          expectedSha256: String(evidence.sha256), mimeType: "application/octet-stream"
-        });
-        evidence.__registry_owned = true;
-        throw new YifangyunError("Validated evidence could not be removed from temporary storage.", { code: "YFY_EVIDENCE_CLEANUP_FAILED", phase: "evidence_cleanup", retryable: true });
-      }
-      evidence.artifact_disposition = "deleted_after_validation";
+      await removeEvidenceTemp(String(evidence.temp_path));
+      return { ...common, delivery: "omitted", omission: { code: "YFY_EVIDENCE_RESOURCE_TOO_LARGE", max_resource_bytes: maxResourceBytes } };
     }
-  } else {
-    evidence.resource_uri = await runtime.evidence.register({
+    const resourceUri = await runtime.evidence.register({
       path: String(evidence.temp_path),
       name: String(evidence.file_name),
       expectedSize: sizeBytes,
       expectedSha256: String(evidence.sha256),
-      mimeType: "application/octet-stream"
+      mimeType: mediaType
     });
+    return {
+      ...common,
+      delivery: "local_file",
+      resource_uri: resourceUri,
+      local_path: String(evidence.temp_path),
+      expires_at: new Date(Date.now() + (runtime.config.tempFileTtlSeconds ?? 86400) * 1000).toISOString(),
+      resource_limit_bytes: maxResourceBytes
+    };
   }
-  if (runtime.config.transport === "http") delete evidence.temp_path;
+  const resourceUri = await runtime.evidence.register({
+    path: String(evidence.temp_path),
+    name: String(evidence.file_name),
+    expectedSize: sizeBytes,
+    expectedSha256: String(evidence.sha256),
+    mimeType: mediaType
+  });
+  return {
+    ...common,
+    delivery: "mcp_resource",
+    resource_uri: resourceUri,
+    expires_at: new Date(Date.now() + (runtime.config.tempFileTtlSeconds ?? 86400) * 1000).toISOString()
+  };
 }
 
 function assertEvidenceAnchors(file: JsonObject): void {
@@ -99,24 +150,9 @@ async function observeVersions(runtime: AppRuntime, fileId: string, accessContex
   return { ...normalizeFileVersions(response.data), response };
 }
 
-function assertVerificationAnchors(file: JsonObject): void {
-  const missing: string[] = [];
-  if (typeof file.size_bytes !== "number" || !Number.isSafeInteger(file.size_bytes) || file.size_bytes < 0) missing.push("size_bytes");
-  if (typeof file.modified_at_unix !== "number" || !Number.isSafeInteger(file.modified_at_unix) || file.modified_at_unix < 0) missing.push("modified_at_unix");
-  if (typeof file.file_version_key !== "string" || file.file_version_key.length === 0) missing.push("file_version_key");
-  if (missing.length > 0) {
-    throw new YifangyunError("Provider metadata is incomplete for content verification.", {
-      code: "YFY_EVIDENCE_METADATA_INCOMPLETE",
-      details: { missing_fields: missing },
-      phase: "evidence_metadata",
-      suggestedAction: "Retry after the Provider exposes version, modified time and size metadata."
-    });
-  }
-}
-
-async function download(runtime: AppRuntime, input: { accessContext: string; downloadVersion: number; externalEnterpriseId?: string; file: JsonObject; fileId: string; identityRef: string; onProgress?: (bytes: number, totalBytes?: number) => void; signal?: AbortSignal }) {
+async function downloadAttempt(runtime: AppRuntime, input: { accessContext: string; downloadSelector: number | string; externalEnterpriseId?: string; file: JsonObject; fileId: string; identityRef: string; onProgress?: (bytes: number, totalBytes?: number) => void; signal?: AbortSignal; strategy: EvidenceDownloadStrategy }) {
   const ticket = await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(input.fileId)}/download_v2`, input.accessContext, {
-    version: input.downloadVersion,
+    version: input.downloadSelector,
     external_enterprise_id: input.externalEnterpriseId
   }, input.signal);
   const ticketData = objectValue(ticket.data);
@@ -133,7 +169,6 @@ async function download(runtime: AppRuntime, input: { accessContext: string; dow
   return {
     evidence: {
       file_id: input.fileId,
-      provider_download_version: input.downloadVersion,
       file_name: downloaded.fileName,
       temp_path: downloaded.tempPath,
       sha1: downloaded.sha1,
@@ -142,8 +177,82 @@ async function download(runtime: AppRuntime, input: { accessContext: string; dow
       ...(downloaded.contentType ? { content_type: downloaded.contentType } : {}),
       ...(downloaded.detectedContentType ? { detected_content_type: downloaded.detectedContentType } : {})
     } as JsonObject,
-    observations: [provenance(ticket.meta, input.accessContext), provenance(downloaded.meta, input.accessContext)]
+    observations: [provenance(ticket.meta, input.accessContext), provenance(downloaded.meta, input.accessContext)],
+    strategy: input.strategy
   };
+}
+
+async function downloadSelectedVersion(runtime: AppRuntime, input: {
+  accessContext: string;
+  externalEnterpriseId?: string;
+  file: JsonObject;
+  fileId: string;
+  identityRef: string;
+  onProgress?: (bytes: number, totalBytes?: number) => void;
+  selected: FileVersion;
+  selector: VersionSelector;
+  signal?: AbortSignal;
+  versions: FileVersion[];
+}) {
+  const candidates: Array<{ selector: number | string; strategy: EvidenceDownloadStrategy }> = input.selector.kind === "current"
+    ? [{ selector: 0, strategy: "current_ordinal" as const }]
+    : [
+      { selector: input.versions.length - input.selected.generation, strategy: "historical_reverse_ordinal" as const },
+      { selector: input.selected.generation, strategy: "historical_ordinal" as const },
+      { selector: input.selected.provider_version_id!, strategy: "historical_version_id" as const }
+    ].filter((candidate, index, values) => values.findIndex((value) => String(value.selector) === String(candidate.selector)) === index);
+  const attempts: JsonObject[] = [];
+  for (const candidate of candidates) {
+    let downloaded: Awaited<ReturnType<typeof downloadAttempt>> | undefined;
+    try {
+      downloaded = await downloadAttempt(runtime, {
+        accessContext: input.accessContext,
+        downloadSelector: candidate.selector,
+        externalEnterpriseId: input.externalEnterpriseId,
+        file: input.file,
+        fileId: input.fileId,
+        identityRef: input.identityRef,
+        onProgress: input.onProgress,
+        signal: input.signal,
+        strategy: candidate.strategy
+      });
+      if (downloaded.evidence.sha1 === input.selected.sha1 && downloaded.evidence.size_bytes === input.selected.size_bytes) return downloaded;
+      const matchingVersions = input.versions.filter((version) => version.sha1 === downloaded!.evidence.sha1 && version.size_bytes === downloaded!.evidence.size_bytes);
+      attempts.push({
+        strategy: candidate.strategy,
+        actual_sha1: String(downloaded.evidence.sha1),
+        actual_size_bytes: Number(downloaded.evidence.size_bytes),
+        matched_version_ids: matchingVersions.flatMap((version) => version.provider_version_id ? [version.provider_version_id] : []),
+        returned_current: matchingVersions.some((version) => version.current)
+      });
+    } catch (error) {
+      if (input.selector.kind === "current" || !canTryAnotherHistoricalSelector(error)) throw error;
+      attempts.push({ strategy: candidate.strategy, error_code: error instanceof YifangyunError ? error.code : "YFY_UNEXPECTED_ERROR" });
+    } finally {
+      if (downloaded && (downloaded.evidence.sha1 !== input.selected.sha1 || downloaded.evidence.size_bytes !== input.selected.size_bytes)) {
+        await removeEvidenceTemp(String(downloaded.evidence.temp_path));
+      }
+    }
+  }
+  if (input.selector.kind === "historical") {
+    throw new YifangyunError("Provider 无法返回与所选历史版本元数据一致的内容。", {
+      code: "YFY_HISTORICAL_CAPTURE_UNAVAILABLE",
+      phase: "evidence_download_validation",
+      agentDetails: {
+        expected_sha1: input.selected.sha1 ?? null,
+        expected_size_bytes: input.selected.size_bytes ?? null,
+        provider_version_id: input.selected.provider_version_id ?? null,
+        attempts
+      },
+      suggestedAction: "不要使用其他版本替代。可重新读取版本列表后重试，或报告该历史原件当前无法由 Provider 可靠导出。"
+    });
+  }
+  throw new YifangyunError("Provider 返回的当前文件内容与版本元数据不一致。", {
+    code: "YFY_EVIDENCE_CONTENT_MISMATCH",
+    phase: "evidence_download_validation",
+    agentDetails: { expected_sha1: input.selected.sha1 ?? null, expected_size_bytes: input.selected.size_bytes ?? null, attempts },
+    suggestedAction: "重新读取文件元数据和版本列表后重试；不要使用本次下载内容。"
+  });
 }
 
 export function registerAuthorityEvidenceTools(server: McpServer, runtime: AppRuntime): void {
@@ -229,93 +338,159 @@ function registerAuthorityTools(server: McpServer, runtime: AppRuntime): void {
 }
 
 async function captureVersionEvidence(runtime: AppRuntime, input: {
-  accessContext: string;
-  externalEnterpriseId?: string;
   fileId: string;
-  identityRef: string;
-  lockScopeId?: string;
   onProgress?: (bytes: number, totalBytes?: number) => void;
+  scopeId: string;
   selector: VersionSelector;
   signal?: AbortSignal;
 }) {
-  const infoResponse = await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(input.fileId)}/info_v2`, input.accessContext, input.externalEnterpriseId
-    ? { external_enterprise_id: input.externalEnterpriseId }
-    : {}, input.signal);
-  const before = projectItem(infoResponse.data, "evidence");
-  const versionsBefore = await observeVersions(runtime, input.fileId, input.accessContext, input.signal);
+  const scopedBefore = await getScopedFile(runtime, input.fileId, input.scopeId, input.signal);
+  const before = scopedBefore.file;
+  assertEvidenceAnchors(before);
+  if (!scopedBefore.membership.matched) {
+    throw new YifangyunError("文件不属于指定 Authority Scope。", {
+      code: "YFY_SCOPE_ASSERTION_FAILED",
+      phase: "evidence_scope",
+      agentDetails: { file_id: input.fileId, scope_id: input.scopeId, ancestor_folder_ids: scopedBefore.membership.ancestorIds }
+    });
+  }
+  const versionsBefore = await observeVersions(runtime, input.fileId, scopedBefore.scope.context.id, input.signal);
   const selected = selectFileVersion(versionsBefore.versions, input.selector);
-  if (input.selector.kind === "history") {
-    const duplicateContentVersions = versionsBefore.versions.filter((version) => version.download_version !== selected.download_version && version.sha1 === selected.sha1 && version.size_bytes === selected.size_bytes);
+  if (input.selector.kind === "historical") {
+    const duplicateContentVersions = versionsBefore.versions.filter((version) => version.generation !== selected.generation && version.sha1 === selected.sha1 && version.size_bytes === selected.size_bytes);
     if (duplicateContentVersions.length > 0) {
-      throw new YifangyunError("The requested historical generation cannot be distinguished from another version by content metadata.", {
+      throw new YifangyunError("所选历史版本与其他版本具有相同的内容身份，无法仅凭字节证明具体代次。", {
         code: "YFY_VERSION_CONTENT_IDENTITY_AMBIGUOUS",
         phase: "version_selection",
-        details: { provider_download_version: selected.download_version, indistinguishable_download_versions: duplicateContentVersions.map((version) => version.download_version) },
-        suggestedAction: "Use the current version when only the bytes are required, or choose a historical generation with distinct SHA-1 and size metadata."
+        agentDetails: { provider_version_id: selected.provider_version_id ?? null, indistinguishable_version_ids: duplicateContentVersions.flatMap((version) => version.provider_version_id ? [version.provider_version_id] : []) },
+        suggestedAction: "选择 SHA-1 或大小不同的历史版本；如果只需要字节，可捕获当前版，但不要声称它代表指定历史代次。"
       });
     }
   }
-  const observations: JsonObject[] = [provenance(infoResponse.meta, input.accessContext), provenance(versionsBefore.response.meta, input.accessContext)];
-  let scopeProof: JsonObject | undefined;
-  if (input.lockScopeId) {
-    assertEvidenceAnchors(before);
-    const scope = runtime.access.resolveScope(input.lockScopeId);
-    const membership = inScope(before, scope.scope.rootFolderId);
-    if (!membership.matched) throw new YifangyunError("File is outside the configured authority scope.", { code: "YFY_SCOPE_ASSERTION_FAILED", phase: "evidence_scope" });
-    scopeProof = { scope_id: scope.scope.id, root_folder_id: scope.scope.rootFolderId, ancestor_folder_ids: membership.ancestorIds, in_scope: true };
-  }
-  const downloaded = await download(runtime, {
-    accessContext: input.accessContext,
-    downloadVersion: selected.download_version,
-    externalEnterpriseId: input.externalEnterpriseId,
+  const observations: JsonObject[] = [
+    provenance(scopedBefore.response.meta, scopedBefore.scope.context.id),
+    provenance(versionsBefore.response.meta, scopedBefore.scope.context.id)
+  ];
+  const downloaded = await downloadSelectedVersion(runtime, {
+    accessContext: scopedBefore.scope.context.id,
+    externalEnterpriseId: scopedBefore.scope.context.externalEnterpriseId,
     file: before,
     fileId: input.fileId,
-    identityRef: input.identityRef,
+    identityRef: scopedBefore.scope.identityRef,
     onProgress: input.onProgress,
-    signal: input.signal
+    selected,
+    selector: input.selector,
+    signal: input.signal,
+    versions: versionsBefore.versions
   });
   observations.push(...downloaded.observations);
   try {
-    if (downloaded.evidence.sha1 !== selected.sha1 || downloaded.evidence.size_bytes !== selected.size_bytes) {
-      const current = versionsBefore.versions[0]!;
-      const fallbackToCurrent = input.selector.kind === "history" && downloaded.evidence.sha1 === current.sha1 && downloaded.evidence.size_bytes === current.size_bytes;
-      throw new YifangyunError(fallbackToCurrent ? "Provider silently returned the current file instead of the requested historical version." : "Downloaded content does not match the selected file version.", {
-        code: fallbackToCurrent ? "YFY_DOWNLOAD_VERSION_FALLBACK_DETECTED" : "YFY_EVIDENCE_CONTENT_MISMATCH",
-        phase: "evidence_download_validation",
-        details: { expected_sha1: selected.sha1!, actual_sha1: String(downloaded.evidence.sha1), expected_size_bytes: selected.size_bytes!, actual_size_bytes: Number(downloaded.evidence.size_bytes), provider_download_version: selected.download_version }
+    const versionsAfter = await observeVersions(runtime, input.fileId, scopedBefore.scope.context.id, input.signal);
+    observations.push(provenance(versionsAfter.response.meta, scopedBefore.scope.context.id));
+    if (versionsBefore.fingerprint !== versionsAfter.fingerprint) {
+      throw new YifangyunError("取证期间文件版本历史发生变化。", { code: "YFY_EVIDENCE_DRIFT", phase: "evidence_version_recheck", retryable: true, suggestedAction: "重新读取版本列表并重新捕获。" });
+    }
+    const scopedAfter = await getScopedFile(runtime, input.fileId, input.scopeId, input.signal);
+    assertEvidenceAnchors(scopedAfter.file);
+    observations.push(provenance(scopedAfter.response.meta, scopedAfter.scope.context.id));
+    const beforeSha1 = typeof before.sha1 === "string" && /^[a-f\d]{40}$/i.test(before.sha1) ? before.sha1.toLowerCase() : undefined;
+    const afterSha1 = typeof scopedAfter.file.sha1 === "string" && /^[a-f\d]{40}$/i.test(scopedAfter.file.sha1) ? scopedAfter.file.sha1.toLowerCase() : undefined;
+    const integrity: JsonObject = {
+      content_sha1: true,
+      content_size: true,
+      version_history_stable: true,
+      file_version_key_stable: before.file_version_key === scopedAfter.file.file_version_key,
+      modified_at_stable: before.modified_at_unix === scopedAfter.file.modified_at_unix,
+      size_stable: before.size_bytes === scopedAfter.file.size_bytes,
+      metadata_sha1_stable: beforeSha1 === afterSha1,
+      current_metadata_size_matches: input.selector.kind === "historical" || (before.size_bytes === selected.size_bytes && scopedAfter.file.size_bytes === selected.size_bytes),
+      current_metadata_sha1_matches: input.selector.kind === "historical" || ([beforeSha1, afterSha1].filter((value): value is string => value !== undefined).every((value) => value === selected.sha1)),
+      path_stable: JSON.stringify(before.path_chain) === JSON.stringify(scopedAfter.file.path_chain),
+      scope_stable: scopedAfter.membership.matched
+    };
+    if (!Object.values(integrity).every((value) => value === true)) {
+      throw new YifangyunError("取证期间文件元数据或 Authority Scope 发生变化。", {
+        code: "YFY_EVIDENCE_DRIFT",
+        phase: "evidence_recheck",
+        retryable: true,
+        agentDetails: integrity,
+        suggestedAction: "重新解析文件路径并重新捕获；不要使用本次 Artifact。"
       });
     }
-    const versionsAfter = await observeVersions(runtime, input.fileId, input.accessContext, input.signal);
-    observations.push(provenance(versionsAfter.response.meta, input.accessContext));
-    if (versionsBefore.fingerprint !== versionsAfter.fingerprint) {
-      throw new YifangyunError("File version history changed while evidence was being captured.", { code: "YFY_EVIDENCE_DRIFT", phase: "evidence_version_recheck", retryable: true });
-    }
-    let file = before;
-    let driftChecks: JsonObject | undefined;
-    if (input.selector.kind === "current" || input.lockScopeId) {
-      const finalResponse = await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(input.fileId)}/info_v2`, input.accessContext, input.externalEnterpriseId
-        ? { external_enterprise_id: input.externalEnterpriseId }
-        : {}, input.signal);
-      const after = projectItem(finalResponse.data, "evidence");
-      observations.push(provenance(finalResponse.meta, input.accessContext));
-      if (input.lockScopeId) assertEvidenceAnchors(after); else assertVerificationAnchors(after);
-      driftChecks = {
-        version_history: true,
-        file_version_key: before.file_version_key === after.file_version_key,
-        modified_at_unix: before.modified_at_unix === after.modified_at_unix,
-        size_bytes: before.size_bytes === after.size_bytes && after.size_bytes === downloaded.evidence.size_bytes,
-        ...(input.lockScopeId ? { path_chain: JSON.stringify(before.path_chain) === JSON.stringify(after.path_chain), scope_unchanged: inScope(after, runtime.access.resolveScope(input.lockScopeId).scope.rootFolderId).matched } : {})
-      };
-      if (!Object.values(driftChecks).every((value) => value === true)) throw new YifangyunError("File changed while evidence was being captured.", { code: "YFY_EVIDENCE_DRIFT", phase: "evidence_recheck", retryable: true, details: driftChecks });
-      file = after;
-    }
-    const selection = versionSelectionProof(selected, input.selector, "content_and_metadata");
-    downloaded.evidence.selection = selection;
-    await attachEvidenceResource(runtime, downloaded.evidence);
-    return { file, version: selected as unknown as JsonObject, selection, evidence: downloaded.evidence, ...(scopeProof ? { scope_proof: scopeProof } : {}), ...(driftChecks ? { drift_checks: driftChecks } : {}), provenance: observations };
+    const selection = versionSelectionProof(selected, input.selector, downloaded.strategy);
+    const artifact = await attachEvidenceArtifact(runtime, downloaded.evidence);
+    return {
+      file: scopedAfter.file,
+      version: selected as unknown as JsonObject,
+      selection,
+      authority: {
+        scope_id: scopedAfter.scope.scope.id,
+        root_folder_id: scopedAfter.scope.scope.rootFolderId,
+        ancestor_folder_ids: scopedAfter.membership.ancestorIds,
+        in_scope: true
+      },
+      integrity,
+      artifact,
+      provenance: observations
+    };
   } catch (error) {
-    if (downloaded.evidence.__registry_owned !== true && typeof downloaded.evidence.temp_path === "string") await fs.rm(downloaded.evidence.temp_path, { force: true }).catch(() => undefined);
+    if (typeof downloaded.evidence.temp_path === "string") {
+      await removeEvidenceTemp(downloaded.evidence.temp_path);
+    }
     throw error;
+  }
+}
+
+const EvidenceArtifactBaseShape = {
+  file_id: z.string(),
+  file_name: z.string(),
+  sha1: z.string().regex(/^[a-f\d]{40}$/i),
+  sha256: z.string().regex(/^[a-f\d]{64}$/i),
+  size_bytes: z.number().int().nonnegative(),
+  media_type: z.string(),
+  detected_media_type: z.string().optional()
+};
+const EvidenceResourceUriSchema = z.string().regex(/^yfy:\/\/evidence\/[a-f0-9]{48}$/);
+const EvidenceArtifactSchema = z.discriminatedUnion("delivery", [
+  z.object({ ...EvidenceArtifactBaseShape, delivery: z.literal("mcp_resource"), resource_uri: EvidenceResourceUriSchema, expires_at: z.string() }),
+  z.object({ ...EvidenceArtifactBaseShape, delivery: z.literal("local_file"), resource_uri: EvidenceResourceUriSchema, local_path: z.string(), expires_at: z.string(), resource_limit_bytes: z.number().int().positive() }),
+  z.object({ ...EvidenceArtifactBaseShape, delivery: z.literal("omitted"), omission: z.object({ code: z.literal("YFY_EVIDENCE_RESOURCE_TOO_LARGE"), max_resource_bytes: z.number().int().positive() }) })
+]);
+
+const ExpectationSchema = z.object({
+  matches: z.boolean(),
+  checks: z.record(z.boolean())
+});
+
+const EvidenceCaptureResultSchema = z.object({
+  file: ItemSchema,
+  version: FileVersionSchema,
+  selection: VersionSelectionProofSchema,
+  authority: z.object({ scope_id: z.string(), root_folder_id: z.string(), ancestor_folder_ids: z.array(z.string()), in_scope: z.literal(true) }),
+  integrity: z.object({
+    content_sha1: z.literal(true),
+    content_size: z.literal(true),
+    version_history_stable: z.literal(true),
+    file_version_key_stable: z.literal(true),
+    modified_at_stable: z.literal(true),
+    size_stable: z.literal(true),
+    metadata_sha1_stable: z.literal(true),
+    current_metadata_size_matches: z.literal(true),
+    current_metadata_sha1_matches: z.literal(true),
+    path_stable: z.literal(true),
+    scope_stable: z.literal(true)
+  }),
+  artifact: EvidenceArtifactSchema,
+  expectation: ExpectationSchema.optional(),
+  provenance: z.array(ProvenanceSchema)
+});
+
+async function rollbackArtifact(runtime: AppRuntime, result: Record<string, unknown>): Promise<void> {
+  const artifact = result.artifact && typeof result.artifact === "object" && !Array.isArray(result.artifact) ? result.artifact as Record<string, unknown> : undefined;
+  if (typeof artifact?.resource_uri === "string") {
+    await runtime.evidence.release(artifact.resource_uri);
+  } else if (typeof artifact?.local_path === "string") {
+    await fs.rm(artifact.local_path, { force: true });
   }
 }
 
@@ -323,84 +498,57 @@ function registerEvidenceTools(server: McpServer, runtime: AppRuntime): void {
   server.registerResource(
     "yfy_evidence_artifact",
     new ResourceTemplate("yfy://evidence/{token}", { list: undefined }),
-    { title: "Yifangyun Evidence Artifact", description: "Short-lived downloaded evidence bytes referenced by evidence tools.", mimeType: "application/octet-stream" },
+    { title: "Yifangyun Evidence Artifact", description: "Short-lived integrity-protected bytes produced by yfy_evidence_capture.", mimeType: "application/octet-stream" },
     async (uri, variables) => {
       const artifact = await runtime.evidence.read(String(variables.token));
       return { contents: [{ uri: uri.href, blob: artifact.blob, ...(artifact.mimeType ? { mimeType: artifact.mimeType } : {}) }] };
     }
   );
 
-  registerTool(server, "yfy_evidence_download", {
-    title: "Download Yifangyun Evidence",
-    description: "Download a validated current or historical version using an unambiguous relative version selector.",
-    inputSchema: { file_id: IdSchema, version: VersionSelectorSchema.default({ kind: "current" }), access_context: z.string().trim().min(1).optional() },
-    outputSchema: { file: z.record(z.unknown()), version: z.record(z.unknown()), selection: z.record(z.unknown()), evidence: z.record(z.unknown()), provenance: z.array(z.record(z.unknown())) }
-  }, { readOnly: false, idempotent: false }, async ({ file_id, version, access_context }, extra) => {
-    const resolved = runtime.access.resolveContext(typeof access_context === "string" ? access_context : undefined);
-    const selector = (version ?? { kind: "current" }) as VersionSelector;
-    return captureVersionEvidence(runtime, { accessContext: resolved.context.id, externalEnterpriseId: resolved.context.externalEnterpriseId, fileId: String(file_id), identityRef: resolved.identityRef, onProgress: progressReporter(extra), selector, signal: extra.signal });
-  });
-
-  registerTool(server, "yfy_evidence_lock_current", {
-    title: "Lock Current Yifangyun Evidence",
-    description: "Prove scope membership, download provider version 0 and reject metadata or version-history drift.",
-    inputSchema: { file_id: IdSchema, scope_id: z.string().trim().min(1) },
-    outputSchema: { file: z.record(z.unknown()), version: z.record(z.unknown()), selection: z.record(z.unknown()), evidence: z.record(z.unknown()), scope_proof: z.record(z.unknown()), drift_checks: z.record(z.unknown()), provenance: z.array(z.record(z.unknown())) }
-  }, { readOnly: false, idempotent: false }, async ({ file_id, scope_id }, extra) => {
-    const resolved = runtime.access.resolveScope(String(scope_id));
-    return captureVersionEvidence(runtime, { accessContext: resolved.context.id, externalEnterpriseId: resolved.context.externalEnterpriseId, fileId: String(file_id), identityRef: resolved.identityRef, lockScopeId: String(scope_id), onProgress: progressReporter(extra), selector: { kind: "current" }, signal: extra.signal });
-  });
-
-  registerTool(server, "yfy_evidence_verify", {
-    title: "Verify Yifangyun File Evidence",
-    description: "Verify current metadata and optionally downloaded content against expected evidence fields.",
+  registerTool(server, "yfy_evidence_capture", {
+    title: "Capture Yifangyun Evidence",
+    description: "Capture current or exact historical bytes inside an Authority Scope. The tool validates scope membership, version history, metadata, SHA-1, and size, then returns a releasable artifact. Do not call it when metadata alone is sufficient.",
     inputSchema: {
-      file_id: IdSchema,
+      scope_id: z.string().trim().min(1).describe("Configured Authority Scope ID. Access identity is derived from this scope."),
+      file_id: IdSchema.describe("Numeric string ID of the file to capture."),
       version: VersionSelectorSchema.default({ kind: "current" }),
-      access_context: z.string().trim().min(1).optional(),
-      expected_sha1: z.string().trim().regex(/^[a-f\d]{40}$/i).optional(),
-      expected_sha256: z.string().trim().regex(/^[a-f\d]{64}$/i).optional(),
-      expected_size_bytes: z.number().int().nonnegative().optional(),
-      expected_modified_at_unix: z.number().int().nonnegative().optional(),
-      expected_file_version_key: z.string().trim().min(1).optional()
+      expected: z.object({
+        sha1: z.string().trim().regex(/^[a-f\d]{40}$/i).optional(),
+        sha256: z.string().trim().regex(/^[a-f\d]{64}$/i).optional(),
+        size_bytes: z.number().int().nonnegative().optional(),
+        modified_at_unix: z.number().int().nonnegative().optional(),
+        file_version_key: z.string().trim().min(1).optional()
+      }).optional().describe("Optional expected values. When provided, the result includes expectation.matches and per-field checks.")
     },
-    outputSchema: { file: z.record(z.unknown()), version: z.record(z.unknown()), selection: z.record(z.unknown()), checks: z.record(z.unknown()), matches: z.boolean(), evidence: z.record(z.unknown()), provenance: z.array(z.record(z.unknown())) }
-  }, { readOnly: false, idempotent: false }, async (args, extra) => {
+    outputSchema: EvidenceCaptureResultSchema
+  }, { readOnly: false, idempotent: false, onInvalidOutput: (result) => rollbackArtifact(runtime, result) }, async (args, extra) => {
     const selector = (args.version ?? { kind: "current" }) as VersionSelector;
-    const expectedStrings = [args.expected_sha1, args.expected_sha256, args.expected_file_version_key];
-    if (expectedStrings.some((value) => typeof value === "string" && value.trim().length === 0)) {
-      throw new YifangyunError("Expected evidence string fields must not be empty.", { code: "YFY_INPUT_INVALID", phase: "evidence_verify" });
-    }
-    const hasExpectedValue = [args.expected_sha1, args.expected_sha256, args.expected_size_bytes, args.expected_modified_at_unix, args.expected_file_version_key]
-      .some((value) => value !== undefined);
-    if (!hasExpectedValue) {
-      throw new YifangyunError("At least one expected evidence field is required.", { code: "YFY_INPUT_INVALID", phase: "evidence_verify", suggestedAction: "Use yfy_evidence_download to collect evidence without comparing expected values." });
-    }
-    if (selector.kind === "history" && args.expected_file_version_key !== undefined) {
-      throw new YifangyunError("A current file version key cannot verify a historical generation.", {
+    const expected = args.expected && typeof args.expected === "object" && !Array.isArray(args.expected) ? args.expected as Record<string, unknown> : undefined;
+    if (selector.kind === "historical" && expected?.file_version_key !== undefined) {
+      throw new YifangyunError("当前文件版本键不能用于验证历史版本。", {
         code: "YFY_INPUT_INVALID",
-        phase: "evidence_verify",
-        suggestedAction: "Verify historical content with SHA-1, SHA-256, size or modified time instead."
+        phase: "evidence_capture",
+        suggestedAction: "历史版本请使用 SHA-1、SHA-256、大小或修改时间作为期望值。"
       });
     }
-    const resolved = runtime.access.resolveContext(typeof args.access_context === "string" ? args.access_context : undefined);
-    const captured = await captureVersionEvidence(runtime, { accessContext: resolved.context.id, externalEnterpriseId: resolved.context.externalEnterpriseId, fileId: String(args.file_id), identityRef: resolved.identityRef, onProgress: progressReporter(extra), selector, signal: extra.signal });
+    const captured = await captureVersionEvidence(runtime, { fileId: String(args.file_id), onProgress: progressReporter(extra), scopeId: String(args.scope_id), selector, signal: extra.signal });
+    if (!expected || Object.keys(expected).length === 0) return captured;
     const file = captured.file as JsonObject;
     const version = captured.version as unknown as FileVersion;
-    const evidence = captured.evidence as JsonObject;
+    const artifact = captured.artifact as JsonObject;
     const checks: JsonObject = {};
-    if (typeof args.expected_sha1 === "string") checks.sha1 = evidence.sha1 === args.expected_sha1.toLowerCase();
-    if (typeof args.expected_sha256 === "string") checks.sha256 = evidence.sha256 === args.expected_sha256.toLowerCase();
-    if (args.expected_size_bytes !== undefined) checks.size_bytes = evidence.size_bytes === args.expected_size_bytes;
-    if (args.expected_modified_at_unix !== undefined) checks.modified_at_unix = version.modified_at_unix === args.expected_modified_at_unix;
-    if (args.expected_file_version_key !== undefined) checks.file_version_key = file.file_version_key === args.expected_file_version_key;
-    return { file, version: captured.version, selection: captured.selection, checks, matches: Object.values(checks).every((value) => value === true), evidence, provenance: captured.provenance };
+    if (typeof expected.sha1 === "string") checks.sha1 = artifact.sha1 === expected.sha1.toLowerCase();
+    if (typeof expected.sha256 === "string") checks.sha256 = artifact.sha256 === expected.sha256.toLowerCase();
+    if (expected.size_bytes !== undefined) checks.size_bytes = artifact.size_bytes === expected.size_bytes;
+    if (expected.modified_at_unix !== undefined) checks.modified_at_unix = version.modified_at_unix === expected.modified_at_unix;
+    if (expected.file_version_key !== undefined) checks.file_version_key = file.file_version_key === expected.file_version_key;
+    return { ...captured, expectation: { checks, matches: Object.values(checks).every((value) => value === true) } };
   });
 
   registerTool(server, "yfy_evidence_release", {
     title: "Release Yifangyun Evidence",
-    description: "Delete one short-lived local evidence artifact and invalidate its resource URI.",
+    description: "Delete a short-lived artifact and invalidate its resource URI. This operation is idempotent; expired or previously released artifacts return already_unavailable.",
     inputSchema: { resource_uri: z.string().regex(/^yfy:\/\/evidence\/[a-f0-9]{48}$/) },
-    outputSchema: { released: z.boolean(), resource_uri: z.string() }
-  }, { readOnly: false, idempotent: true }, async ({ resource_uri }) => ({ released: await runtime.evidence.release(String(resource_uri)), resource_uri: String(resource_uri) }));
+    outputSchema: { status: z.enum(["released", "already_unavailable"]), resource_uri: z.string() }
+  }, { readOnly: false, idempotent: true }, async ({ resource_uri }) => ({ status: await runtime.evidence.release(String(resource_uri)) ? "released" : "already_unavailable", resource_uri: String(resource_uri) }));
 }

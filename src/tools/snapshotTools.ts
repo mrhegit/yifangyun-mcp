@@ -6,21 +6,32 @@ import type { AppRuntime } from "../runtime/runtime.js";
 import type { ScopeItemCursor } from "../scan/types.js";
 import { registerTool } from "./tooling.js";
 
+const SnapshotStatusSchema = z.enum(["running", "paused_retryable", "complete", "partial", "cancelled", "failed", "expired"]);
+const SnapshotCompletenessSchema = z.object({
+  pagination_complete: z.boolean(),
+  safe_to_claim_absence: z.boolean(),
+  scope: z.enum(["entire_observed_accessible_scope", "observed_subset_only"]),
+  consistency_level: z.enum(["best_effort_complete_observation", "partial_observation"]),
+  incomplete_reasons: z.array(z.string())
+}).strict();
+const ObservationWindowSchema = z.object({ started_at: z.string(), updated_at: z.string() }).strict();
 const SnapshotSummaryShape = {
   snapshot_id: z.string().uuid(),
-  status: z.enum(["running", "paused_retryable", "complete", "partial", "cancelled", "failed", "expired"]),
+  status: SnapshotStatusSchema,
   access_context: z.string(),
   root_folder_id: z.string(),
   scanned_file_count: z.number().int().nonnegative(),
   scanned_folder_count: z.number().int().nonnegative(),
   page_receipt_count: z.number().int().nonnegative(),
-  completeness: z.record(z.unknown()),
-  observation_window: z.record(z.unknown()),
+  completeness: SnapshotCompletenessSchema,
+  terminal: z.boolean(),
+  limits: z.object({ max_item_depth: z.number().int().min(1), max_items: z.number().int().positive() }),
+  observation_window: ObservationWindowSchema,
   created_at: z.string(),
   updated_at: z.string(),
   expires_at: z.string(),
   artifact_uri: z.string(),
-  suggested_action: z.string().optional()
+  next_action: z.object({ tool: z.literal("yfy_snapshot_get"), arguments: z.object({ snapshot_id: z.string().uuid(), access_context: z.string() }).strict(), stop_when_terminal: z.literal(true) }).strict().optional()
 };
 const CursorSchema = z.object({
   item_id: z.string().min(1),
@@ -69,14 +80,13 @@ export function registerSnapshotTools(server: McpServer, runtime: AppRuntime): v
 
   registerTool(server, "yfy_snapshot_create", {
     title: "Create Yifangyun Snapshot",
-    description: "Create or reuse a durable background snapshot. Pagination, checkpoints and retries are managed by the server.",
+    description: "Create or reuse a durable recursive observation of one configured scope. Use this before claiming that material is absent; queries are supplied later to yfy_snapshot_query so one snapshot can be reused.",
     inputSchema: {
-      scope_id: z.string().trim().min(1),
-      queries: z.array(z.string().trim().min(1).max(200)).max(50).default([]),
-      match_fields: z.array(z.enum(["name", "path"])).min(1).default(["name", "path"]),
-      max_depth: z.number().int().min(0).max(100).default(20),
-      max_items: z.number().int().min(1).max(1000000).default(50000),
-      page_capacity: z.number().int().min(1).max(500).default(500),
+      scope_id: z.string().trim().min(1).describe("Configured Authority Scope ID."),
+      match_fields: z.array(z.enum(["name", "path"])).min(1).default(["name", "path"]).describe("Fields indexed for later search."),
+      max_item_depth: z.number().int().min(1).max(100).default(20).describe("Maximum returned item depth relative to the scope root; direct children are depth 1."),
+      max_items: z.number().int().min(1).max(1000000).default(50000).describe("Hard item budget. Reaching it makes the snapshot partial."),
+      page_capacity: z.number().int().min(1).max(500).default(500).describe("Requested Provider page capacity; the Provider may override it."),
       include_files: z.boolean().default(true),
       include_folders: z.boolean().default(true),
       case_sensitive: z.boolean().default(false)
@@ -90,10 +100,9 @@ export function registerSnapshotTools(server: McpServer, runtime: AppRuntime): v
       includeFiles: args.include_files !== false,
       includeFolders: args.include_folders !== false,
       matchFields: Array.isArray(args.match_fields) ? args.match_fields as Array<"name" | "path"> : ["name", "path"],
-      maxDepth: Number(args.max_depth ?? 20),
+      maxItemDepth: Number(args.max_item_depth ?? 20),
       maxItems: Number(args.max_items ?? 50000),
       pageCapacity: Math.min(Number(args.page_capacity ?? 500), runtime.config.maxPageCapacity),
-      queries: Array.isArray(args.queries) ? args.queries as string[] : [],
       rootFolderId: resolved.scope.rootFolderId,
       signal: extra.signal
     });
@@ -102,7 +111,7 @@ export function registerSnapshotTools(server: McpServer, runtime: AppRuntime): v
 
   registerTool(server, "yfy_snapshot_get", {
     title: "Get Yifangyun Snapshot",
-    description: "Get durable snapshot status, completeness and artifact information.",
+    description: "Read snapshot progress and completeness. Continue polling next_action until terminal=true, then inspect completeness before making absence claims.",
     inputSchema: { snapshot_id: z.string().uuid(), access_context: z.string().trim().min(1).optional() },
     outputSchema: SnapshotSummaryShape
   }, { readOnly: true, openWorld: false }, async ({ snapshot_id, access_context }) => {
@@ -112,11 +121,11 @@ export function registerSnapshotTools(server: McpServer, runtime: AppRuntime): v
 
   registerTool(server, "yfy_snapshot_query", {
     title: "Query Yifangyun Snapshot",
-    description: "Search or list indexed snapshot items without calling the Provider directory API again.",
+    description: "Search or list one stable page from a snapshot without calling the Provider again. For search mode, provide queries. If a cursor becomes stale while scanning, restart without cursor.",
     inputSchema: {
       snapshot_id: z.string().uuid(),
       mode: z.enum(["search", "list"]).default("search"),
-      queries: z.array(z.string().trim().min(1).max(200)).max(50).optional(),
+      queries: z.array(z.string().trim().min(1).max(200)).min(1).max(50).optional().describe("Required in search mode; ignored in list mode."),
       item_type: z.enum(["file", "folder", "all"]).default("all"),
       cursor: z.string().min(1).optional(),
       limit: z.number().int().min(1).max(500).default(100),
@@ -124,13 +133,13 @@ export function registerSnapshotTools(server: McpServer, runtime: AppRuntime): v
     },
     outputSchema: {
       snapshot_id: z.string().uuid(),
-      status: z.string(),
+      status: SnapshotStatusSchema,
       items: z.array(z.record(z.unknown())),
       total_count: z.number().int().nonnegative(),
       limit: z.number().int().positive(),
       has_more: z.boolean(),
       next_cursor: z.string().optional(),
-      completeness: z.record(z.unknown())
+      completeness: SnapshotCompletenessSchema
     }
   }, { readOnly: true, openWorld: false }, async (args) => {
     if (args.mode === "search" && Array.isArray(args.queries) && args.queries.length === 0) {
@@ -139,13 +148,14 @@ export function registerSnapshotTools(server: McpServer, runtime: AppRuntime): v
     const mode = args.mode as "search" | "list";
     const itemType = args.item_type as "file" | "folder" | "all";
     const snapshotId = String(args.snapshot_id);
-    const queryKey = crypto.createHash("sha256").update(JSON.stringify(Array.isArray(args.queries) ? args.queries : null)).digest("hex");
+    const queries = mode === "search" && Array.isArray(args.queries) ? args.queries as string[] : undefined;
+    const queryKey = crypto.createHash("sha256").update(JSON.stringify(queries ?? null)).digest("hex");
     const result = await runtime.snapshots.query({
       accessContextId: typeof args.access_context === "string" ? args.access_context : undefined,
       cursor: decodeCursor(args.cursor, snapshotId, mode, itemType, queryKey, runtime.config.clientSecret),
       limit: Number(args.limit),
       mode,
-      queries: Array.isArray(args.queries) ? args.queries as string[] : undefined,
+      queries,
       scanId: snapshotId,
       type: itemType
     });

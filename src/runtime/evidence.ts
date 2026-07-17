@@ -65,7 +65,7 @@ export class EvidenceArtifactRegistry {
           code: "YFY_EVIDENCE_RESOURCE_TOO_LARGE",
           details: { max_resource_bytes: this.maxResourceBytes, size_bytes: stat.size },
           phase: "evidence_resource",
-          suggestedAction: "Use temp_path from a local stdio client, or capture a smaller file for remote MCP resource transfer."
+          suggestedAction: "Use artifact.local_path from a local stdio capture, or capture a smaller file for MCP resource transfer."
         });
       }
       const content = Buffer.alloc(stat.size);

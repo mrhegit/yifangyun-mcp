@@ -8,7 +8,7 @@
 - Agent 使用命名 `access_context`，不再在每个工具中传递裸 `user_id`
 - Authority 工作流使用命名 `scope_id`，根目录和访问身份由 scope 配置统一派生
 - Snapshot 是 1.0 新增的完整目录观察能力，负责后台分页、重试、完整性判断和索引查询
-- Evidence 工具按普通下载、当前原件锁定、验证和释放分离，并统一处理下载后漂移复核
+- Evidence 工具合并为深接口 `yfy_evidence_capture` 和幂等 `yfy_evidence_release`，统一处理 Scope、版本、内容、期望值和 Artifact 生命周期
 - 工具成功结果直接返回领域字段，不再包含通用成功 envelope 或 Provider raw response
 - Streamable HTTP 使用有状态 MCP session，支持 `POST`、`GET`、`DELETE` 和 SSE
 
@@ -24,7 +24,7 @@
 | `yfy_resolve_path` | `yfy_path_resolve` |
 | 递归目录扫描与 scope scan 工具 | `yfy_snapshot_create`、`yfy_snapshot_get`、`yfy_snapshot_query` |
 | 文件范围查询与断言工具 | `yfy_scope_check` |
-| 下载、哈希和原件锁定工具 | `yfy_evidence_download`、`yfy_evidence_lock_current`、`yfy_evidence_verify`、`yfy_evidence_release` |
+| 下载、哈希、原件锁定和验证工具 | `yfy_evidence_capture`、`yfy_evidence_release` |
 | 多个文件 mutation 工具 | `yfy_item_mutate`、`yfy_folder_create`、upload 工具 |
 | 多个管理原子工具 | 对应的 admin read/mutate 工具 |
 
@@ -36,7 +36,9 @@
 - Authority 工作流中的 `root_folder_id` 改为 `scope_id`
 - `detail_level`、`include_full_metadata` 改为各工具定义的稳定 view 或领域字段
 - Snapshot 使用 opaque `cursor` / `next_cursor`，不接受 offset 分页
-- 文件下载版本改用 `{kind:"current"}` 或 `{kind:"history",generations_back:n}`，Provider 版本详情 ID 不再作为下载参数
+- 文件版本选择改用 `{kind:"current"}` 或 `{kind:"historical",version_id:"..."}`；历史 ID 必须来自最新 `yfy_file_versions`
+- Snapshot 创建参数 `max_depth` 改为语义明确的 `max_item_depth`，创建时不再接收查询词
+- Snapshot 持久化 schema 已升级；beta.3 的 SQLite 状态库不能复用，升级前应停止旧进程并为 `YFY_STATE_DB` 配置新的空路径
 - 普通分页响应拆分为 `requested`、`effective`、`returned`，继续条件仍使用 `has_more` 和 `next_page_id`
 - 所有 Agent-facing ID 使用数字字符串
 - 错误通过 MCP `isError=true` 返回 `{error:{code,message,...}}`
@@ -60,7 +62,7 @@ YFY_ACCESS_CONTEXTS_JSON=[]
 YFY_SCOPES_JSON=[]
 ```
 
-需要 Authority、Snapshot 或 current-lock Evidence 时，应先配置 scope。启用 `YFY_WORKFLOW_PROFILES=tender` 也要求至少一个 scope：
+需要 Authority、Snapshot 或 Evidence Capture 时，应先配置 scope。启用 `YFY_WORKFLOW_PROFILES=tender` 也要求至少一个 scope：
 
 ```env
 YFY_SCOPES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_context":"default","tags":["tender"]}]
@@ -76,7 +78,7 @@ YFY_SCOPES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_c
 4. 更新 MCP 客户端中的工具名、参数、响应解析和 HTTP session 处理。
 5. 运行 `yfy_connection_check`、`yfy_context_get` 和 `yfy_authority_validate` 验证身份与 scope。
 6. 创建一个小范围 Snapshot，确认 `safe_to_claim_absence` 只在完整观察后为 true。
-7. 使用受控文件执行一次 `yfy_evidence_lock_current`，核对 file ID、下载版本、SHA-256、size 和 path proof。
+7. 使用受控文件执行一次 `yfy_evidence_capture`，核对 file ID、Authority proof、稳定版本 ID、SHA-256、size 和 Artifact delivery。
 8. 完成只读验证后，再按需开启 `mutation`、`collaboration`、`admin` 或 `transfer`。
 
 旧扫描结果和旧 evidence 元数据不属于 1.0 合同。需要继续作为权威证据使用的文件，应通过 1.0 重新锁定，生成新的 provenance、哈希和 resource reference。

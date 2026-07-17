@@ -19,8 +19,8 @@
 |---|---|---|
 | folder and department ancestry | `yfy_authority_validate` | 组合覆盖 |
 | file path scope | `yfy_scope_check` | 组合覆盖 |
-| download ticket and validated original bytes | `yfy_evidence_download`、`yfy_evidence_lock_current` | 已覆盖 |
-| content and metadata verification | `yfy_evidence_verify` | 组合覆盖 |
+| download ticket and validated original bytes | `yfy_evidence_capture` | 组合覆盖，Scope-bound |
+| content and metadata expectation checks | `yfy_evidence_capture.expected` | 组合覆盖 |
 | direct download URL | `yfy_transfer_ticket_get` | 可选 sensitive toolset |
 
 ## 组织与协作

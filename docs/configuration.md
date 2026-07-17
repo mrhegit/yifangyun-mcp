@@ -17,15 +17,15 @@
 Scope-bound 能力 = 亿方云 OAuth/用户权限 ∩ 已启用 Toolset ∩ Authority Scope
 ```
 
-Scope 不会全局限制 `yfy_item_get`、`yfy_item_search` 等 Core 工具。需要强制业务目录边界时，应使用 `yfy_scope_check(mode="assert")`、Snapshot 或 `yfy_evidence_lock_current`。
+Scope 不会全局限制 `yfy_item_get`、`yfy_item_search` 等 Core 工具。需要强制业务目录边界时，应使用 `yfy_scope_check(mode="assert")`、Snapshot 或 `yfy_evidence_capture`。
 
 ## 选择运行模式
 
 | 场景 | Toolsets | Scope | Profile | 能力 |
 |---|---|---|---|---|
 | 只读浏览和搜索 | `core` | 不需要 | 留空 | 元数据、目录、搜索、路径、版本、评论、分享信息 |
-| 只读并下载校验 | `core,evidence` | 可选 | 留空 | 上述能力加当前版/历史版下载、哈希与验证 |
-| 权威资料工作流 | `core,authority,snapshot,evidence` | 必须 | 留空 | 范围证明、完整目录快照、Current Lock；由上层 Agent 自行编排 |
+| 只读并下载校验 | `core,evidence` | 必须 | 留空 | 上述能力加 Authority-bound 当前版/历史版捕获、哈希与验证 |
+| 权威资料工作流 | `core,authority,snapshot,evidence` | 必须 | 留空 | 范围证明、完整目录快照和 Evidence Capture；由上层 Agent 自行编排 |
 | 投标专用工作流 | `core,organization,authority,snapshot,evidence` | 必须 | `tender` | 上述能力加 Tender Prompt、Guidance 和启动 readiness 校验 |
 | 云端内容变更 | 在所需组合上增加 `mutation` | 按业务决定 | 任意 | 创建、移动、删除、上传；属于云端写能力 |
 | 管理和协作变更 | 增加 `collaboration` 或 `admin` | 按业务决定 | 任意 | 协作成员和企业管理操作，高风险 |
@@ -83,7 +83,7 @@ YFY_TOOLSETS=core,authority,snapshot,evidence,organization
 | `core` | 只读 | 无持久化写入 | 认证检查、元数据、目录、搜索、路径、版本、评论、分享元数据 | 几乎所有部署都应启用 |
 | `authority` | 只读 | 无持久化写入 | 验证 Scope，查询或断言文件是否在业务范围内 | 使用 Scope 时启用 |
 | `snapshot` | 只读扫描 | 写 SQLite | 后台遍历 Scope，生成完整性状态和可查询索引 | 需要完整性判断时启用 |
-| `evidence` | 下载文件 | 写临时 Artifact | 当前/历史版本下载、哈希、漂移检测、Current Lock | 需要原件或内容验证时启用 |
+| `evidence` | 下载文件 | 写临时 Artifact | 当前/历史版本捕获、哈希、Scope 和漂移检测 | 需要原件或内容验证时启用 |
 | `organization` | 只读 | 无 | 部门、企业用户和群组读取 | Tender Profile 强制要求；其他场景可选 |
 | `collaboration` | 读取和写入 | 无 | 查询协作、邀请成员、改角色、移除协作 | 高风险，按需开启 |
 | `mutation` | 写入 | 可读取上传目录 | 创建、更新、移动、复制、删除、恢复、上传 | 高风险，按需开启 |
@@ -158,7 +158,7 @@ YFY_SCOPES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_c
 | `access_context` | 否 | 已配置 Context ID，默认 `default` | 使用哪个身份访问该目录 |
 | `tags` | 否 | 非空字符串数组 | 业务标签，仅用于说明和选择，不改变权限 |
 
-Scope 是服务端业务边界，不是亿方云 ACL。它不会授予访问权，只能证明某文件是否位于配置目录内，并限制 Snapshot 和 Current Lock 的工作范围。
+Scope 是服务端业务边界，不是亿方云 ACL。它不会授予访问权，只能证明某文件是否位于配置目录内，并限制 Snapshot 和 Evidence Capture 的工作范围。
 
 多个业务范围示例：
 
@@ -179,7 +179,7 @@ YFY_SCOPES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_c
 - `yfy_scope_check(mode="query")`：越界时正常返回 `in_scope=false`。
 - `yfy_scope_check(mode="assert")`：越界时返回工具错误，中断工作流。
 - `yfy_snapshot_create`：只能扫描命名 Scope，Agent 不能传任意根目录。
-- `yfy_evidence_lock_current`：下载前后都会验证文件仍在 Scope 内。
+- `yfy_evidence_capture`：下载前后都会验证文件仍在 Scope 内，调用方无需先执行重复的 assert。
 
 ## 三个容易误解的功能语义
 
@@ -203,7 +203,7 @@ YFY_SCOPES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_c
 
 - `mode="query"`：越界时正常返回 `in_scope=false`，适合筛选候选。
 - `mode="assert"`：越界时返回 MCP 工具错误，适合必须在业务目录内的工作流。
-- `yfy_evidence_lock_current`：即使上一步漏掉 assert，也会在下载前后再次硬校验 Scope。
+- `yfy_evidence_capture`：始终在下载前后硬校验 Scope；外部 `yfy_scope_check(mode="assert")` 仅用于不下载的独立业务判断。
 
 ### Prompt 统一的是工作流报告
 
@@ -255,7 +255,7 @@ YFY_ALLOW_PRIVATE_TRANSFER_URLS=enabled
 
 布尔变量接受 `enabled/true/1/yes` 或 `disabled/false/0/no`。
 Evidence 配额和 TTL 清理只作用于 `YFY_TEMP_DIR/artifacts`，不会扫描或删除同目录下的 Snapshot SQLite 文件。
-`YFY_STATE_DB` 不允许位于 `YFY_TEMP_DIR/artifacts` 内。超过 Evidence resource 上限的文件仍会完成下载和哈希，但不会生成远程 resource link；stdio 返回本地 `temp_path`，HTTP 会在校验后删除文件并返回 `resource_omitted`。
+`YFY_STATE_DB` 不允许位于 `YFY_TEMP_DIR/artifacts` 内。超过 Evidence resource 上限的文件仍会完成下载和哈希；stdio 返回 `artifact.delivery=local_file`、`local_path` 和可释放 URI，HTTP 会删除文件并返回 `artifact.delivery=omitted`。
 `mutation` toolset 的本地上传仅允许读取 `YFY_UPLOAD_ROOT_DIR` 内的文件；未配置时 `yfy_file_upload` 和 `yfy_file_version_upload` 拒绝执行。
 
 ## 请求调度
@@ -303,8 +303,8 @@ GET/list 可以对 429/5xx 做 jitter 重试；非幂等 POST 不自动重试。
 | Prompt | 作用 | 主要通用工具 |
 |---|---|---|
 | `yfy_tender_material_audit` | 按材料清单建立 Snapshot，区分确认、歧义和缺失 | Authority Validate、Snapshot Create/Get/Query |
-| `yfy_tender_lock_evidence` | 定位文件、断言 Scope、锁定当前原件 | Path/Search、Scope Check、Evidence Lock Current |
-| `yfy_tender_compare_versions` | 查看版本历史并按已有哈希验证当前内容 | File Versions、Item Get、Evidence Verify |
+| `yfy_tender_lock_evidence` | 定位文件并在 Scope 内捕获当前原件 | Path/Search、Evidence Capture/Release |
+| `yfy_tender_compare_versions` | 查看版本历史并在 Scope 内按已有哈希验证内容 | Context Get、File Versions、Evidence Capture/Release |
 
 不开 Profile 不会移除底层能力。只要 Toolset 和 Scope 已配置，上层 Agent 仍可手动组合 Authority、Snapshot 和 Evidence 工具完成同一流程。
 
@@ -344,7 +344,7 @@ YFY_WORKFLOW_PROFILES=
 YFY_SCOPES_JSON=[{"id":"documents","root_folder_id":"501000715605","access_context":"default","tags":["authority"]}]
 ```
 
-可以做完整性 Snapshot、范围断言和 Current Lock，但不注册 Tender Prompt。
+可以做完整性 Snapshot、范围断言和 Evidence Capture，但不注册 Tender Prompt。
 
 ### 3. Tender Profile
 

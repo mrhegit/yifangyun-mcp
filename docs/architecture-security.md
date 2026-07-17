@@ -97,7 +97,7 @@ Evidence 工具默认不返回下载 URL。Provider URL 只在服务内部使用
 - TTL 清理
 - drift 时删除候选文件
 
-成功 Evidence 在大小不超过 `YFY_MAX_EVIDENCE_RESOURCE_BYTES` 时注册随机、短期 `yfy://evidence/{token}` resource。读取 resource 会在分配内存前再次校验文件大小。stdio 调用方可使用 `temp_path`；HTTP 输出移除服务器绝对路径，远程调用方应读取 resource link。HTTP 超限结果在完成校验后删除本地文件并返回 `resource_omitted`；`transfer` toolset 是唯一直接返回 Provider 下载 URL 的接口。
+成功 Evidence 在大小不超过 `YFY_MAX_EVIDENCE_RESOURCE_BYTES` 时注册随机、短期 `yfy://evidence/{token}` resource。读取 resource 会在分配内存前再次校验文件大小与 SHA-256。普通 stdio 和 HTTP 调用都只返回 resource；仅 stdio 超限 Artifact 返回显式 `local_file` delivery 和本地路径，同时保留可释放 URI。HTTP 超限结果在校验后删除。工具输出在交给 MCP SDK 前执行严格 schema 校验，失败时回滚 Artifact，避免孤儿文件；`transfer` toolset 是唯一直接返回 Provider 下载 URL 的接口。
 
 ## HTTP
 

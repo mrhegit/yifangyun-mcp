@@ -7,7 +7,7 @@ import type { JsonObject } from "../types.js";
 import type { ScopeItemCursor, ScopeItemPage, ScopePageArtifact, ScopePageReceipt, ScopeScanFrontier, ScopeScanRepository, ScopeScanState, ScopeSeenItem } from "./types.js";
 
 type Row = Record<string, unknown>;
-const SNAPSHOT_SCHEMA_VERSION = 1;
+const SNAPSHOT_SCHEMA_VERSION = 2;
 
 function normalizeText(value: string, caseSensitive: boolean): string {
   const normalized = value.normalize("NFKC")
