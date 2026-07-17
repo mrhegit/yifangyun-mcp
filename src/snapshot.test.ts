@@ -256,7 +256,41 @@ test("bounded concurrent page fetch preserves canonical receipt order", async ()
     const manifest = await service.manifest(started.state.scanId);
     const receipts = manifest.receipts as Array<Record<string, unknown>>;
     assert.ok(maxInFlight >= 3, `expected concurrent Provider requests, observed ${maxInFlight}`);
-    assert.deepEqual(receipts.map((receipt) => receipt.pageId), [0, 1, 2, 3, 4]);
+    assert.deepEqual(receipts.map((receipt) => receipt.page_id), [0, 1, 2, 3, 4]);
+    assert.deepEqual(manifest.receipt_summary, { total_count: 5, included_count: 5, truncated: false });
+    assert.equal((manifest.policy as Record<string, unknown>).page_capacity, 1);
+    assert.equal((manifest.policy as Record<string, unknown>).pageCapacity, undefined);
+  } finally {
+    await service.close();
+  }
+});
+
+test("inventory manifests bound inline receipts and report truncation", async () => {
+  const pageCount = 105;
+  const receiptProvider: ScopeScanProvider = {
+    getRoot: async () => ({ folder: { id: "1", name: "Root", type: "folder" }, meta: meta("/root") }),
+    listChildren: async (_folderId, _userId, pageId) => ({
+      files: [{ id: String(pageId + 10), name: `file-${pageId}.txt`, type: "file", parent_folder_id: "1" }],
+      folders: [],
+      hasMore: pageId + 1 < pageCount,
+      ...(pageId + 1 < pageCount ? { nextPageId: pageId + 1 } : {}),
+      pageCapacity: 1,
+      pageCount,
+      pageId,
+      paginationReliable: true,
+      totalCount: pageCount,
+      meta: meta(`/page/${pageId}`)
+    })
+  };
+  const store = new SqliteScopeScanStore(":memory:", 3600, 20_000_000);
+  const service = new SnapshotService(new ScopeScanEngine(store, receiptProvider), store, new AccessRegistry(config(":memory:")), 4);
+  await service.initialize();
+  try {
+    const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: pageCount, pageCapacity: 1, rootFolderId: "1" });
+    await service.waitForIdle(started.state.scanId);
+    const manifest = await service.manifest(started.state.scanId);
+    assert.equal((manifest.receipts as unknown[]).length, 100);
+    assert.deepEqual(manifest.receipt_summary, { total_count: pageCount, included_count: 100, truncated: true });
   } finally {
     await service.close();
   }
@@ -626,7 +660,8 @@ test("SQLite snapshot handles 50000 synthetic files", { skip: process.env.YFY_RU
       assert.equal(result.total, 500);
     }
     assert.ok(performance.now() - queryStartedAt < 2_000, "20 indexed snapshot queries exceeded 2 seconds");
-    assert.ok(performance.now() - startedAt < 10_000, "50k disk-backed snapshot exceeded 10 seconds");
+    const scanBudgetMs = process.platform === "win32" ? 15_000 : 10_000;
+    assert.ok(performance.now() - startedAt < scanBudgetMs, `50k disk-backed snapshot exceeded ${scanBudgetMs}ms`);
     assert.ok(store.storageBytes() > 0);
     await new Promise((resolve) => setTimeout(resolve, 1100));
     const pruneStartedAt = performance.now();

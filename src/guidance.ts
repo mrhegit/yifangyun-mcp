@@ -7,9 +7,9 @@ export function serverInstructions(runtime: AppRuntime): string {
   const instructions = [
     "Yifangyun MCP provides drive access, workspace-bound verification, durable inventories, and content capture."
   ];
-  if (runtime.config.toolsets.includes("drive")) instructions.push("Start with yfy_status, then use yfy_browse, yfy_search, or yfy_resolve.", "Indexed search is hint-only and never proves absence.");
-  if (runtime.config.toolsets.includes("inventory") && runtime.config.authorityScopes.length > 0) instructions.push("Use one fresh or reusable inventory for exhaustive workspace work, then search it with explicit terms.");
-  if (runtime.config.toolsets.includes("evidence") && runtime.config.authorityScopes.length > 0) instructions.push("Use yfy_capture for workspace-bound current or historical bytes, and release resources when finished.");
+  if (runtime.config.toolsets.includes("drive")) instructions.push("Use yfy_status only when effective identity or capabilities are unknown. With an ItemRef use yfy_get for metadata or yfy_open for bytes; with an exact relative path use yfy_resolve; otherwise use yfy_search for candidates.", "Indexed search is hint-only and never proves absence. Release every resource returned by yfy_open.");
+  if (runtime.config.toolsets.includes("inventory") && runtime.config.authorityScopes.length > 0) instructions.push("For completeness or absence, create one bounded workspace inventory, follow next_action until terminal, then search it. Only safe_to_claim_absence=true proves absence; partial, failed, cancelled, running, and expired inventories do not.");
+  if (runtime.config.toolsets.includes("evidence") && runtime.config.authorityScopes.length > 0) instructions.push("Use yfy_capture only when workspace-bound original bytes are required, and release every returned resource. Binary rendering depends on client attachment support.");
   return instructions.join(" ");
 }
 
@@ -33,9 +33,15 @@ export function registerGuidance(server: McpServer, runtime: AppRuntime): void {
     "",
     "",
     "## Tool selection order",
-    ...(runtime.config.toolsets.includes("drive") ? ["1. Known exact path: use `yfy_resolve`.", "2. Unknown location: use `yfy_search` for candidates only."] : []),
-    ...(runtime.config.toolsets.includes("inventory") && runtime.config.authorityScopes.length > 0 ? ["3. Completeness or absence question: call `yfy_inventory_create`, follow next_action until terminal, then call `yfy_inventory_search`."] : []),
-    ...(runtime.config.toolsets.includes("evidence") && runtime.config.authorityScopes.length > 0 ? ["4. Need workspace-bound original bytes: use `yfy_capture` and release the returned resource when done."] : []),
+    ...(runtime.config.toolsets.includes("drive") ? [
+      "1. Runtime identity or capability state is unknown: call `yfy_status` once.",
+      "2. Existing ItemRef and metadata needed: call `yfy_get`; use `yfy_get_many` for a bounded batch.",
+      "3. Existing FileRef and bytes needed without a Workspace claim: call `yfy_open`, process the Resource, then call `yfy_resource_release`.",
+      "4. Known exact relative path: call `yfy_resolve`.",
+      "5. Unknown location: call `yfy_search` for candidates only; disambiguate before opening or capturing."
+    ] : []),
+    ...(runtime.config.toolsets.includes("inventory") && runtime.config.authorityScopes.length > 0 ? ["6. Completeness or absence question: call `yfy_inventory_create` with explicit bounded limits, follow next_action until terminal, then call `yfy_inventory_search`. Absence is valid only when `safe_to_claim_absence=true`."] : []),
+    ...(runtime.config.toolsets.includes("evidence") && runtime.config.authorityScopes.length > 0 ? ["7. Workspace-bound original bytes required: call `yfy_capture`, process the Resource, then call `yfy_resource_release`. Binary rendering depends on client attachment support."] : []),
     "",
     "Never substitute a nearby candidate, current version, or partial inventory for the requested workspace claim."
   ].join("\n")));
@@ -76,7 +82,7 @@ function registerTenderProfile(server: McpServer): void {
     "",
     "## Material completeness audit",
     "1. Validate the configured workspace.",
-    "2. Create one fresh or reusable inventory with bounded depth and item limits.",
+    "2. Create one fresh or reusable inventory with explicit bounded depth and item limits.",
     "3. Poll until `terminal=true`.",
     "4. Search the same inventory separately for each required material category.",
     "5. Report confirmed matches, ambiguous candidates, missing categories, and completeness limitations.",
@@ -94,8 +100,8 @@ function registerTenderProfile(server: McpServer): void {
     argsSchema: {
       workspace: z.string().min(1),
       required_materials: z.string().min(1).describe("Comma-separated or newline-separated required material names."),
-      max_item_depth: z.string().regex(/^\d+$/).default("20"),
-      max_items: z.string().regex(/^\d+$/).default("50000")
+      max_item_depth: z.string().regex(/^\d+$/).default("8"),
+      max_items: z.string().regex(/^\d+$/).default("10000")
     }
   }, ({ workspace, required_materials, max_item_depth, max_items }) => ({ messages: [{ role: "user", content: { type: "text", text: [
     "# Objective",

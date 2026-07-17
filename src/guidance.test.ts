@@ -41,7 +41,10 @@ test("server instructions only recommend available and ready capabilities", () =
   const instructions = serverInstructions(evidenceOnly);
   assert.doesNotMatch(instructions, /yfy_status|inventory|yfy_capture/);
   const ready = { config: { toolsets: ["drive", "inventory", "evidence"], workflowProfiles: [], authorityScopes: [{ id: "workspace" }] } } as unknown as AppRuntime;
-  assert.match(serverInstructions(ready), /yfy_status/);
-  assert.match(serverInstructions(ready), /inventory/);
-  assert.match(serverInstructions(ready), /yfy_capture/);
+  const readyInstructions = serverInstructions(ready);
+  assert.match(readyInstructions, /ItemRef.*yfy_get/);
+  assert.match(readyInstructions, /yfy_open/);
+  assert.match(readyInstructions, /safe_to_claim_absence=true/);
+  assert.match(readyInstructions, /yfy_capture/);
+  assert.match(readyInstructions, /release every returned resource/i);
 });

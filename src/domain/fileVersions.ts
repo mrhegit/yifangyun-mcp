@@ -85,29 +85,29 @@ export function selectFileVersion(versions: FileVersion[], selector: VersionSele
     ? versions[0]
     : versions.find((version) => version.provider_version_id === selector.version_id);
   if (!selected) {
-    throw new YifangyunError("请求的文件版本不在当前版本历史中。", {
+    throw new YifangyunError("The requested file version is not present in the current version history.", {
       code: "YFY_VERSION_NOT_FOUND",
       phase: "version_selection",
       agentDetails: {
         available_version_ids: versions.flatMap((version) => version.provider_version_id ? [version.provider_version_id] : []),
         requested_version_id: selector.kind === "historical" ? selector.version_id : "current"
       },
-      suggestedAction: "重新调用 yfy_versions，并复制当前返回的历史 version ref。"
+      suggestedAction: "Call yfy_versions again and copy a historical version ref from the current result."
     });
   }
   if ((selector.kind === "current") !== selected.current || (selected.current && selected.generation !== 0)) {
-    throw new YifangyunError("Provider 版本顺序存在歧义。", {
+    throw new YifangyunError("The Provider version order is ambiguous.", {
       code: "YFY_DOWNLOAD_VERSION_ORDER_AMBIGUOUS",
       phase: "version_selection",
       details: { selected_current: selected.current, selected_generation: selected.generation }
     });
   }
   if (!selected.evidence_ready) {
-    throw new YifangyunError("请求的文件版本缺少安全取证所需的 SHA-1 或大小元数据。", {
+    throw new YifangyunError("The requested file version lacks the SHA-1 or size metadata required for verified capture.", {
       code: "YFY_VERSION_METADATA_INCOMPLETE",
       phase: "version_selection",
       agentDetails: { generation: selected.generation, provider_version_id: selected.provider_version_id ?? null },
-      suggestedAction: "只能对 evidence_ready=true 的版本执行取证。"
+      suggestedAction: "Capture only versions that report evidence_ready=true."
     });
   }
   return selected;

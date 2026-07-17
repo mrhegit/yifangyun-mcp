@@ -227,6 +227,7 @@ export function hasToolset(config: AppConfig, toolset: Toolset): boolean {
 
 export function getConfigSummary(config: AppConfig): Record<string, string | number | boolean | string[]> {
   return {
+    configuration_source: "process_environment",
     access_contexts: config.accessContexts.map((context) => context.id),
     api_base_url: config.apiBaseUrl,
     workspaces: config.authorityScopes.map((scope) => scope.id),

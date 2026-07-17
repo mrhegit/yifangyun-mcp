@@ -33,7 +33,7 @@ export const ItemSchema = z.object({
   sha1: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(), size_bytes: z.number().optional(), parent_folder_id: z.string().optional(),
   created_at_unix: z.number().optional(), created_at_iso: z.string().optional(), modified_at_unix: z.number().optional(), modified_at_iso: z.string().optional(),
   deleted_at_unix: z.number().optional(), deleted_at_iso: z.string().optional(), in_trash: z.boolean().optional(), is_deleted: z.boolean().optional(), shared: z.boolean().optional(), current: z.boolean().optional(),
-  path_chain: z.array(PathEntrySchema).optional(), ancestor_folder_ids: z.array(z.string()).optional(), path: z.string().optional(), owned_by: UserSchema.optional(), modified_by: UserSchema.optional(),
+  provider_path_chain: z.array(PathEntrySchema).optional(), path_basis: z.literal("provider_supplied").optional(), ancestor_folder_ids: z.array(z.string()).optional(), path: z.string().optional(), owned_by: UserSchema.optional(), modified_by: UserSchema.optional(),
   space: z.object({ id: z.string().optional(), name: z.string().optional(), type: z.string().optional() }).optional(), comments_count: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(),
   sequence_id: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(), remark: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional()
 });

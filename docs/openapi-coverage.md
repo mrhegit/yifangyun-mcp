@@ -1,6 +1,6 @@
 # OpenAPI 覆盖矩阵
 
-beta.5 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Drive、Inventory、Content 和 Organization Module 内。
+beta.6 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Drive、Inventory、Content 和 Organization Module 内。
 
 ## Drive
 

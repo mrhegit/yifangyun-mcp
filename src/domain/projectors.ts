@@ -55,10 +55,14 @@ export function projectItem(value: JsonValue | undefined, view: "summary" | "evi
   }
   const pathChain = projectPath(source.path);
   if (pathChain.length > 0) {
-    output.path_chain = pathChain;
+    output.provider_path_chain = pathChain;
+    output.path_basis = "provider_supplied";
     output.ancestor_folder_ids = pathChain.flatMap((entry) => typeof entry.id === "string" ? [entry.id] : []);
   }
-  if (typeof source.path === "string") output.path = source.path;
+  if (typeof source.path === "string") {
+    output.path = source.path;
+    output.path_basis = "provider_supplied";
+  }
   if (view !== "summary") {
     const owner = projectUser(source.owned_by, false);
     const modifiedBy = projectUser(source.modified_by, false);

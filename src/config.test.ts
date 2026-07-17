@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { loadConfig } from "./config.js";
+import { getConfigSummary, loadConfig } from "./config.js";
 
 const ENV_KEYS = [
   "YFY_CLIENT_ID", "YFY_CLIENT_SECRET", "YFY_ENTERPRISE_ID", "YFY_DEFAULT_USER_ID", "YFY_TOOLSETS", "YFY_ACCESS_CONTEXTS_JSON", "YFY_WORKSPACES_JSON",
@@ -42,6 +42,7 @@ test("loadConfig creates access contexts, workspaces and toolsets", () => {
     assert.equal(config.snapshotConcurrency, 2);
     assert.match(config.stateDatabasePath, /state\.sqlite$/);
     assert.equal(config.apiBaseUrl, "https://open.fangcloud.com/api");
+    assert.equal(getConfigSummary(config).configuration_source, "process_environment");
   });
 });
 

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { YifangyunError } from "../client.js";
 import type { JsonObject } from "../types.js";
+import { decodeCanonicalBase64Url } from "./base64url.js";
 
 export interface CursorEnvelope<T extends JsonObject = JsonObject> {
   operation: string;
@@ -17,7 +18,7 @@ export function encodeCursor<T extends JsonObject>(secret: string, operation: st
 
 export function decodeCursor<T extends JsonObject>(secret: string, operation: string, value: string): T {
   try {
-    const decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as CursorEnvelope<T> & { signature?: unknown };
+    const decoded = JSON.parse(decodeCanonicalBase64Url(value).toString("utf8")) as CursorEnvelope<T> & { signature?: unknown };
     if (decoded.version !== 1 || decoded.operation !== operation || typeof decoded.signature !== "string" || typeof decoded.payload !== "object" || decoded.payload === null) {
       throw new Error("cursor envelope is invalid");
     }

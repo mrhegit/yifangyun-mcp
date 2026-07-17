@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import type { IdLike, JsonObject, JsonValue } from "../types.js";
 import { YifangyunError } from "../client.js";
 import { metrics } from "../observability.js";
+import { projectInventoryPolicy, projectInventoryReceipt } from "./projectors.js";
 import type { ScopeItemCursor, ScopeItemPage, ScopePageArtifact, ScopeScanFrontier, ScopeScanPolicy, ScopeScanProvider, ScopeScanRepository, ScopeScanState, ScopeSeenItem } from "./types.js";
 
 function digest(value: unknown): string {
@@ -489,7 +490,7 @@ export class ScopeScanEngine {
   async manifest(scanId: string): Promise<JsonObject> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const state = await this.store.load(scanId);
-      const receiptSummary = await this.store.listReceiptSummary(scanId, 1000);
+      const receiptSummary = await this.store.listReceiptSummary(scanId, 100);
       const after = await this.store.load(scanId);
       if (after.revision === state.revision) {
         const summary = this.summary(state);
@@ -498,10 +499,13 @@ export class ScopeScanEngine {
           checkpoint: { revision: state.revision, remaining_frontier_count: state.frontierCount },
           ...(state.lastError ? { last_error: state.lastError } : {}),
           observation_digest: digest({ receipt_digest: state.receiptDigest, snapshot: summary }),
-          policy: state.policy as unknown as JsonValue,
-          receipt_count: receiptSummary.total,
-          receipts: receiptSummary.receipts.map((receipt) => receipt as unknown as JsonValue),
-          receipts_truncated: receiptSummary.total > receiptSummary.receipts.length,
+          policy: projectInventoryPolicy(state.policy),
+          receipt_summary: {
+            total_count: receiptSummary.total,
+            included_count: receiptSummary.receipts.length,
+            truncated: receiptSummary.total > receiptSummary.receipts.length
+          },
+          receipts: receiptSummary.receipts.map(projectInventoryReceipt),
           root_folder: state.rootFolder
         };
       }

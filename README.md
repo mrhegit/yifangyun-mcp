@@ -2,7 +2,7 @@
 
 亿方云 OpenAPI 的通用 MCP Server。默认提供轻量 Drive 平面；需要范围证明、完整性判断或原件固化时，可启用 Workspace、Inventory 和 Evidence 平面。
 
-当前版本：`1.0.0-beta.5`。这是一次不保留旧工具别名、旧参数或旧配置键的破坏性更新。
+当前开发版本：`1.0.0-beta.6`。该版本收紧 Agent-facing 输出预算、路径、游标、错误和 Inventory manifest 契约；从 `0.4.0` 升级时按迁移文档整体切换。
 
 ## Interface
 
@@ -54,6 +54,10 @@ version:501:7001
 
 普通分页只暴露 `limit`、`cursor` 和 `next_action`。Provider 页码、实际 page capacity、过滤后的页内 offset 和签名细节都由服务端隐藏。
 
+Drive 列表默认每页 10 条，Inventory 列表默认每页 25 条。`yfy_browse` 和 `yfy_search` 默认 `detail=basic`；需要 owner、space 等字段时显式请求 `standard` 或 `full`。
+
+Provider 返回的路径明确投影为 `provider_path_chain` 和 `path_basis=provider_supplied`。Workspace 结果另返回基于配置根目录的相对祖先链，调用方不得比较不同 Provider endpoint 的原始路径数组来判断项目身份。
+
 ## 两个内容工具
 
 - `yfy_open`：普通网盘内容读取，可读取当前版或 `yfy_versions` 返回的历史 VersionRef。
@@ -61,7 +65,7 @@ version:501:7001
 
 `expected` 是断言。任一字段不匹配时，`yfy_capture` 返回 `YFY_EXPECTATION_MISMATCH`，删除临时内容，不返回可用 Resource。
 
-文本 Resource 返回 MCP `text`，二进制返回 `blob`。大文件返回 multipart manifest，调用方按 manifest 中的 part URI 分段读取；任何结果都不暴露服务器 `local_path`。
+文本 Resource 返回 MCP `text`，二进制返回 `blob`。大文件返回 multipart manifest，调用方按 manifest 中的 part URI 分段读取；任何结果都不暴露服务器 `local_path`。二进制是否能直接呈现取决于 MCP 客户端附件能力，服务端不把成功下载等同于模型已读取正文。
 
 ## Inventory Freshness
 
@@ -77,6 +81,8 @@ version:501:7001
 - 对终态调用 `yfy_inventory_cancel` 是真正 no-op，不改变状态、revision 或时间戳。
 
 只有终态结果中 `safe_to_claim_absence=true` 时，才能在该 Workspace 和观察窗口内声明未找到。
+
+Inventory 默认上限为 `max_item_depth=8`、`max_items=10000`。更大范围必须由调用方显式提高，避免普通查找误触发高成本递归扫描。
 
 ## Toolsets
 
@@ -160,4 +166,4 @@ npm pack --dry-run
 - [架构与安全](docs/architecture-security.md)
 - [部署](docs/deployment.md)
 - [OpenAPI 覆盖](docs/openapi-coverage.md)
-- [从 0.4.0 迁移到 1.0.0-beta.5](docs/migration-v1.md)
+- [从 0.4.0 迁移到 1.0.0-beta.6](docs/migration-v1.md)

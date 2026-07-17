@@ -3,6 +3,7 @@ import { z } from "zod";
 import { redactSensitiveText, YifangyunError } from "../client.js";
 import { logEvent } from "../observability.js";
 import type { JsonObject } from "../types.js";
+import { serializeToolText } from "./resultDelivery.js";
 
 type ToolExtra = {
   _meta?: { progressToken?: string | number };
@@ -31,13 +32,14 @@ function normalizedErrorCode(error: YifangyunError, providerCode?: string): stri
   const code = providerCode?.toLowerCase() ?? "";
   if (code.includes("file_version_not_found")) return "YFY_VERSION_NOT_FOUND";
   if (code.includes("folder_not_found")) return "YFY_FOLDER_NOT_FOUND";
-  if (code.includes("file_not_found") || code.includes("file_not_locked")) return "YFY_FILE_NOT_FOUND";
+  if (code.includes("file_not_locked")) return "YFY_FILE_UNAVAILABLE";
+  if (code.includes("file_not_found")) return "YFY_FILE_NOT_FOUND";
   if (code.includes("permission") || code.includes("forbidden")) return "YFY_PERMISSION_DENIED";
   return error.code;
 }
 
 function errorCategory(error: YifangyunError, normalizedCode: string): string {
-  if (["YFY_INVENTORY_QUERY_EMPTY", "YFY_INVENTORY_CURSOR_INVALID"].includes(normalizedCode)) return "invalid_input";
+  if (normalizedCode.endsWith("_CURSOR_INVALID") || normalizedCode === "YFY_INVENTORY_QUERY_EMPTY") return "invalid_input";
   if (["YFY_INVENTORY_QUERY_TOO_SHORT", "YFY_INVENTORY_QUERY_TOO_BROAD"].includes(normalizedCode)) return "capacity_limit";
   if (normalizedCode.includes("CANCEL")) return "cancelled";
   if (normalizedCode.includes("TIMEOUT")) return "timeout";
@@ -47,11 +49,11 @@ function errorCategory(error: YifangyunError, normalizedCode: string): string {
   if (error.statusCode === 429) return "rate_limited";
   if (error.statusCode !== undefined && error.statusCode >= 500) return "provider_unavailable";
   if (normalizedCode.includes("INPUT") || normalizedCode.includes("PATH_INVALID")) return "invalid_input";
-  if (normalizedCode.includes("STALE") || normalizedCode.includes("REVISION_CONFLICT")) return "stale_state";
+  if (normalizedCode.endsWith("_CURSOR_STALE") || normalizedCode.includes("STALE") || normalizedCode.includes("REVISION_CONFLICT")) return "stale_state";
   if (normalizedCode.includes("TOO_LARGE") || normalizedCode.includes("QUOTA") || normalizedCode.includes("CAPACITY") || normalizedCode.includes("STORAGE_INSUFFICIENT")) return "capacity_limit";
   if (normalizedCode.includes("CONTENT_MISMATCH") || normalizedCode.includes("FALLBACK_DETECTED") || normalizedCode.includes("HISTORICAL_CAPTURE")) return "provider_contract";
   if (normalizedCode.includes("CONFLICT") || normalizedCode.includes("DRIFT") || normalizedCode.includes("CONTENT_MISMATCH") || normalizedCode.includes("EXPECTATION_MISMATCH") || normalizedCode.includes("ARTIFACT_INTEGRITY") || normalizedCode.includes("IDENTITY_AMBIGUOUS")) return "conflict";
-  if (normalizedCode.includes("PROVIDER") || normalizedCode.includes("VERSION_ORDER") || normalizedCode.includes("METADATA_INCOMPLETE") || normalizedCode.includes("FALLBACK_DETECTED")) return "provider_contract";
+  if (normalizedCode.includes("PROVIDER") || normalizedCode.includes("VERSION_ORDER") || normalizedCode.includes("METADATA_INCOMPLETE") || normalizedCode.includes("FALLBACK_DETECTED") || normalizedCode.includes("UNAVAILABLE")) return "provider_contract";
   return "internal";
 }
 
@@ -127,10 +129,7 @@ export function registerTool(
       const resourceUri = typeof resource?.resource_uri === "string" ? resource.resource_uri : typeof artifact?.resource_uri === "string" ? artifact.resource_uri : typeof legacyEvidence?.resource_uri === "string" ? legacyEvidence.resource_uri : undefined;
       const delivery = resource?.delivery ?? artifact?.delivery;
       const resourceReadable = delivery === undefined || delivery === "mcp_resource" || delivery === "multipart_resource";
-      const serialized = JSON.stringify(output);
-      const text = serialized.length <= 12_000
-        ? serialized
-        : JSON.stringify({ status: "success", tool: name, structured_content_only: true, top_level_fields: Object.keys(output) });
+      const text = serializeToolText(name, output);
       return {
         content: [
           { type: "text" as const, text },

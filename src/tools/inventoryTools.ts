@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { YifangyunError } from "../client.js";
+import { decodeCanonicalBase64Url } from "../domain/base64url.js";
 import { formatItemRef } from "../domain/refs.js";
 import type { AppRuntime } from "../runtime/runtime.js";
 import type { ScopeItemCursor, ScopeScanState } from "../scan/types.js";
@@ -11,6 +12,9 @@ import { NextActionSchema, SimplePageSchema } from "./schemas.js";
 
 const InventoryStatusSchema = z.enum(["running", "paused_retryable", "complete", "partial", "cancelled", "failed", "expired"]);
 const InventoryRefSchema = z.string().regex(/^inventory:[A-Za-z0-9_-]+$/);
+const DEFAULT_INVENTORY_DEPTH = 8;
+const DEFAULT_INVENTORY_ITEMS = 10_000;
+const DEFAULT_INVENTORY_PAGE_SIZE = 25;
 const CompletenessSchema = z.object({
   pagination_complete: z.boolean(),
   safe_to_claim_absence: z.boolean(),
@@ -37,7 +41,7 @@ const CursorSchema = z.object({
   item_id: z.string().min(1),
   item_type: z.enum(["file", "folder", "all"]),
   mode: z.enum(["search", "list"]),
-  page_limit: z.number().int().min(1).max(500),
+  page_limit: z.number().int().min(1).max(100),
   query: z.string().optional(),
   query_key: z.string().regex(/^[a-f0-9]{64}$/),
   revision: z.number().int().nonnegative(),
@@ -60,7 +64,7 @@ function inventoryRef(secret: string, state: ScopeScanState): string {
 function parseInventoryRef(secret: string, value: unknown): { accessContext: string; inventoryId: string } {
   try {
     const encoded = String(value).slice("inventory:".length);
-    const parsed = z.object({ access_context: z.string(), inventory_id: z.string().uuid(), signature: z.string().regex(/^[a-f0-9]{64}$/), version: z.literal(1) }).parse(JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")));
+    const parsed = z.object({ access_context: z.string(), inventory_id: z.string().uuid(), signature: z.string().regex(/^[a-f0-9]{64}$/), version: z.literal(1) }).parse(JSON.parse(decodeCanonicalBase64Url(encoded).toString("utf8")));
     const expected = Buffer.from(signature(secret, [parsed.version, parsed.inventory_id, parsed.access_context]), "utf8");
     const actual = Buffer.from(parsed.signature, "utf8");
     if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) throw new Error("signature mismatch");
@@ -77,7 +81,7 @@ function cursorSignature(secret: string, value: { item_id: string; item_type: st
 function decodeCursor(value: unknown, inventoryId: string, secret: string): { cursor: ScopeItemCursor; itemType: "file" | "folder" | "all"; limit: number; mode: "search" | "list"; query?: string } | undefined {
   if (typeof value !== "string") return undefined;
   try {
-    const parsed = CursorSchema.parse(JSON.parse(Buffer.from(value, "base64url").toString("utf8")));
+    const parsed = CursorSchema.parse(JSON.parse(decodeCanonicalBase64Url(value).toString("utf8")));
     if (parsed.snapshot_id !== inventoryId || parsed.query_key !== crypto.createHash("sha256").update(JSON.stringify(parsed.query ?? null)).digest("hex")) throw new Error("cursor context mismatch");
     const expected = Buffer.from(cursorSignature(secret, parsed), "utf8");
     const actual = Buffer.from(parsed.signature, "utf8");
@@ -124,8 +128,8 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
     inputSchema: {
       workspace: z.string().trim().min(1),
       freshness: z.object({ max_age_seconds: z.number().int().min(0).max(604800).default(300), mode: z.enum(["reuse_if_fresh", "force_refresh"]).default("reuse_if_fresh") }).default({ max_age_seconds: 300, mode: "reuse_if_fresh" }),
-      max_item_depth: z.number().int().min(1).max(100).default(20),
-      max_items: z.number().int().min(1).max(1000000).default(50000)
+      max_item_depth: z.number().int().min(1).max(100).default(DEFAULT_INVENTORY_DEPTH),
+      max_items: z.number().int().min(1).max(1000000).default(DEFAULT_INVENTORY_ITEMS)
     },
     outputSchema: { ...InventorySummaryShape, reuse: z.object({ reused: z.boolean(), reason: z.enum(["fresh_complete", "running_join", "new"]), max_age_seconds: z.number().int().nonnegative(), mode: z.enum(["reuse_if_fresh", "force_refresh"]) }).strict() }
   }, { readOnly: false, idempotent: true }, async (args, extra) => {
@@ -141,8 +145,8 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
       includeFolders: true,
       matchFields: ["name", "path"],
       maxAgeSeconds,
-      maxItemDepth: Number(args.max_item_depth ?? 20),
-      maxItems: Number(args.max_items ?? 50000),
+      maxItemDepth: Number(args.max_item_depth ?? DEFAULT_INVENTORY_DEPTH),
+      maxItems: Number(args.max_items ?? DEFAULT_INVENTORY_ITEMS),
       pageCapacity: runtime.config.maxPageCapacity,
       rootFolderId: workspace.scope.rootFolderId,
       signal: extra.signal
@@ -163,7 +167,7 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
   registerTool(server, "yfy_inventory_search", {
     title: "Search Yifangyun Workspace Inventory",
     description: "Search a stable inventory page, or omit query to list it. Continue with only the returned cursor and inventory ref.",
-    inputSchema: { inventory: InventoryRefSchema, query: z.string().trim().min(1).max(200).optional(), kind: z.enum(["file", "folder", "all"]).default("all"), cursor: z.string().min(1).optional(), limit: z.number().int().min(1).max(500).default(100) },
+    inputSchema: { inventory: InventoryRefSchema, query: z.string().trim().min(1).max(200).optional(), kind: z.enum(["file", "folder", "all"]).default("all"), cursor: z.string().min(1).optional(), limit: z.number().int().min(1).max(100).default(DEFAULT_INVENTORY_PAGE_SIZE) },
     outputSchema: { inventory: InventoryRefSchema, status: InventoryStatusSchema, items: z.array(z.record(z.unknown())), page: SimplePageSchema, next_action: NextActionSchema.optional(), completeness: CompletenessSchema }
   }, { readOnly: true, openWorld: false }, async (args) => {
     const ref = parseInventoryRef(runtime.config.clientSecret, args.inventory);
@@ -171,7 +175,7 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
     const query = continued?.query ?? (typeof args.query === "string" ? args.query : undefined);
     const mode = continued?.mode ?? (query ? "search" as const : "list" as const);
     const itemType = continued?.itemType ?? args.kind as "file" | "folder" | "all";
-    const limit = continued?.limit ?? Number(args.limit ?? 100);
+    const limit = continued?.limit ?? Number(args.limit ?? DEFAULT_INVENTORY_PAGE_SIZE);
     const result = await runtime.snapshots.query({
       accessContextId: ref.accessContext,
       cursor: continued?.cursor,
@@ -209,7 +213,7 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
   server.registerResource(
     "yfy_inventory_manifest",
     new ResourceTemplate("yfy://inventory/{inventory_id}/{artifact_token}/{access_context}/manifest", { list: undefined }),
-    { title: "Yifangyun Inventory Manifest", description: "Durable inventory receipts and observation digest.", mimeType: "application/json" },
+    { title: "Yifangyun Inventory Manifest", description: "Inventory observation digest with a bounded receipt summary.", mimeType: "application/json" },
     async (uri, variables) => {
       const state = await runtime.snapshots.get(String(variables.inventory_id), String(variables.access_context));
       if (state.artifactToken !== String(variables.artifact_token)) throw new YifangyunError("Inventory manifest token is invalid.", { code: "YFY_INVENTORY_ARTIFACT_FORBIDDEN", phase: "inventory_resource", scanId: state.scanId });

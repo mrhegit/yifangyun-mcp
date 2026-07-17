@@ -24,7 +24,7 @@ MCP 客户端配置示例：
   "mcpServers": {
     "yifangyun": {
       "command": "npx",
-      "args": ["-y", "yifangyun-mcp-server@1.0.0-beta.5"],
+      "args": ["-y", "yifangyun-mcp-server@1.0.0-beta.6"],
       "env": {
         "YFY_CLIENT_ID": "...",
         "YFY_CLIENT_SECRET": "...",
@@ -40,6 +40,8 @@ MCP 客户端配置示例：
 ```
 
 此示例是普通 Drive 模式。要使用 Workspace、Inventory 或 Capture，需要增加对应 toolset 和 `YFY_WORKSPACES_JSON`；Tender Prompt 还要求 `YFY_WORKFLOW_PROFILES=tender`。
+
+`yfy_status.runtime.configuration_source=process_environment` 表示当前进程环境是唯一生效配置。项目目录中的 `.env` 只有在启动命令或 MCP Host 显式加载时才有效；排查 capability 漂移时以 `yfy_status` 为准。
 
 ## HTTP
 

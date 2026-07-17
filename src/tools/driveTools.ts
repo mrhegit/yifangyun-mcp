@@ -16,6 +16,7 @@ import { FileRefSchema, FileVersionSchema, ItemRefSchema, ItemSchema, NextAction
 type ItemKind = "file" | "folder" | "all";
 type Detail = "basic" | "standard" | "full";
 type SearchField = "name" | "content" | "creator" | "tag" | "all";
+const DEFAULT_DRIVE_PAGE_SIZE = 10;
 
 const DriveItemSchema = ItemSchema.extend({ ref: ItemRefSchema });
 const PageOutputShape = { page: SimplePageSchema, next_action: NextActionSchema.optional() };
@@ -132,7 +133,7 @@ async function findAcrossPages(runtime: AppRuntime, at: string, pathText: string
 export function registerDriveTools(server: McpServer, runtime: AppRuntime): void {
   registerTool(server, "yfy_status", {
     title: "Get Yifangyun Drive Status",
-    description: "Check the configured drive identity and list copyable places. Ordinary drive tasks can start directly with yfy_browse or yfy_search.",
+    description: "Check the effective process configuration, drive identity, enabled capabilities and copyable places. Call once when runtime identity or capability state is unknown.",
     inputSchema: {},
     outputSchema: {
       connected: z.literal(true),
@@ -171,8 +172,8 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
     inputSchema: {
       at: PlaceRefSchema.default("personal"),
       kind: z.enum(["file", "folder", "all"]).default("all"),
-      detail: z.enum(["basic", "standard", "full"]).default("standard"),
-      limit: z.number().int().min(1).max(100).default(25),
+      detail: z.enum(["basic", "standard", "full"]).default("basic"),
+      limit: z.number().int().min(1).max(100).default(DEFAULT_DRIVE_PAGE_SIZE),
       cursor: z.string().optional(),
       access_context: z.string().trim().min(1).optional()
     },
@@ -181,10 +182,10 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
     const cursor = typeof args.cursor === "string" ? decodeCursor(runtime.config.clientSecret, "drive_browse", args.cursor) : undefined;
     const at = cursor ? String(cursor.at) : String(args.at ?? "personal");
     const kind = (cursor ? String(cursor.kind) : String(args.kind ?? "all")) as ItemKind;
-    const detail = (cursor ? String(cursor.detail) : String(args.detail ?? "standard")) as Detail;
+    const detail = (cursor ? String(cursor.detail) : String(args.detail ?? "basic")) as Detail;
     const pageId = cursor ? Number(cursor.page_id) : 0;
     const offset = cursor ? Number(cursor.offset) : 0;
-    const limit = cursor ? Number(cursor.limit) : Number(args.limit ?? 25);
+    const limit = cursor ? Number(cursor.limit) : Number(args.limit ?? DEFAULT_DRIVE_PAGE_SIZE);
     const accessContext = cursor && typeof cursor.access_context === "string" ? cursor.access_context : contextId(args.access_context);
     const capacity = Math.min(runtime.config.maxPageCapacity, Math.max(50, limit));
     const response = await placePage(runtime, at, kind, pageId, capacity, accessContext, extra.signal);
@@ -210,10 +211,11 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
       in: PlaceRefSchema.default("personal"),
       kind: z.enum(["file", "folder", "all"]).default("all"),
       field: z.enum(["name", "content", "creator", "tag", "all"]).default("all"),
+      detail: z.enum(["basic", "standard", "full"]).default("basic"),
       exact_name: z.boolean().default(false),
       sort: z.enum(["name", "date", "size", "score"]).default("score"),
       direction: z.enum(["asc", "desc"]).default("desc"),
-      limit: z.number().int().min(1).max(100).default(25),
+      limit: z.number().int().min(1).max(100).default(DEFAULT_DRIVE_PAGE_SIZE),
       cursor: z.string().optional(),
       access_context: z.string().trim().min(1).optional()
     },
@@ -230,14 +232,16 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
     const at = cursor ? String(cursor.at) : String(args.in ?? "personal");
     const kind = (cursor ? String(cursor.kind) : String(args.kind ?? "all")) as ItemKind;
     const field = (cursor ? String(cursor.field) : String(args.field ?? "all")) as SearchField;
+    const detail = (cursor ? String(cursor.detail) : String(args.detail ?? "basic")) as Detail;
     const exactName = cursor ? cursor.exact_name === true : args.exact_name === true;
     const sort = cursor ? String(cursor.sort) : String(args.sort ?? "score");
     const direction = cursor ? String(cursor.direction) : String(args.direction ?? "desc");
     const pageId = cursor ? Number(cursor.page_id) : 0;
     const offset = cursor ? Number(cursor.offset) : 0;
-    const limit = cursor ? Number(cursor.limit) : Number(args.limit ?? 25);
+    const limit = cursor ? Number(cursor.limit) : Number(args.limit ?? DEFAULT_DRIVE_PAGE_SIZE);
     const accessContext = cursor && typeof cursor.access_context === "string" ? cursor.access_context : contextId(args.access_context);
     const root = await searchPlace(runtime, at, accessContext, extra.signal);
+    const capacity = Math.min(runtime.config.maxPageCapacity, Math.max(50, limit));
     const response = await runtime.gateway.getUser("/v2/item/search", root.accessContext, {
       query_words: query,
       type: kind,
@@ -248,13 +252,13 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
       sort_by: sort,
       sort_direction: direction,
       page_id: pageId,
-      page_capacity: Math.min(runtime.config.maxPageCapacity, Math.max(50, limit))
+      page_capacity: capacity
     }, extra.signal);
     const source = objectValue(response.data) ?? {};
     const rawItems = [...arrayValue(source.files), ...arrayValue(source.folders)];
     const eligible = rawItems.flatMap((entry) => {
       const raw = objectValue(entry) ?? {};
-      const item = driveItem(entry, "standard");
+      const item = driveItem(entry, detail);
       if (typeof item.id !== "string" || typeof item.name !== "string" || (item.type !== "file" && item.type !== "folder")) return [];
       if (root.folderId) {
         const ancestors = Array.isArray(item.ancestor_folder_ids) ? item.ancestor_folder_ids : [];
@@ -265,8 +269,8 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
     });
     const hits = eligible.slice(offset, offset + limit);
     const nextOffset = offset + hits.length;
-    const providerPage = projectPage(response.data, { itemCount: rawItems.length, providerCount: rawItems.length, pageCapacity: runtime.config.maxPageCapacity, pageId });
-    const payload = { query, at, kind, field, exact_name: exactName, sort, direction, page_id: pageId, offset: nextOffset, limit, ...(accessContext ? { access_context: accessContext } : {}) };
+    const providerPage = projectPage(response.data, { itemCount: rawItems.length, providerCount: rawItems.length, pageCapacity: capacity, pageId });
+    const payload = { query, at, kind, field, detail, exact_name: exactName, sort, direction, page_id: pageId, offset: nextOffset, limit, ...(accessContext ? { access_context: accessContext } : {}) };
     const nextCursor = nextOffset < eligible.length
       ? encodeCursor(runtime.config.clientSecret, "drive_search", payload)
       : pageHasMore(providerPage)
@@ -325,7 +329,7 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
   registerTool(server, "yfy_versions", {
     title: "List Yifangyun File Versions",
     description: "List stable version refs for one file. Copy a historical ref into yfy_open or yfy_capture.",
-    inputSchema: { file: FileRefSchema.optional(), limit: z.number().int().min(1).max(100).default(25), cursor: z.string().optional(), access_context: z.string().trim().min(1).optional() },
+    inputSchema: { file: FileRefSchema.optional(), limit: z.number().int().min(1).max(100).default(DEFAULT_DRIVE_PAGE_SIZE), cursor: z.string().optional(), access_context: z.string().trim().min(1).optional() },
     outputSchema: { file: FileRefSchema, versions: z.array(FileVersionSchema.extend({ ref: VersionRefSchema.optional(), file: FileRefSchema })), fingerprint: z.string(), ...PageOutputShape, provenance: ProvenanceSchema }
   }, { readOnly: true }, async (args, extra) => {
     const cursor = typeof args.cursor === "string" ? decodeCursor(runtime.config.clientSecret, "drive_versions", args.cursor) : undefined;
@@ -333,7 +337,7 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
     const item = parseItemRef(file);
     if (item.type !== "file") throw new YifangyunError("yfy_versions requires a file ref.", { code: "YFY_INPUT_INVALID", phase: "drive_versions" });
     const offset = cursor ? Number(cursor.offset) : 0;
-    const limit = cursor ? Number(cursor.limit) : Number(args.limit ?? 25);
+    const limit = cursor ? Number(cursor.limit) : Number(args.limit ?? DEFAULT_DRIVE_PAGE_SIZE);
     const accessContext = cursor && typeof cursor.access_context === "string" ? cursor.access_context : contextId(args.access_context);
     const access = runtime.gateway.context(accessContext);
     const response = await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(item.id)}/versions`, access.context.id, {}, extra.signal);
@@ -354,14 +358,14 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
   registerTool(server, "yfy_comments", {
     title: "List Yifangyun File Comments",
     description: "List comments for one file ref with bounded local pagination.",
-    inputSchema: { file: FileRefSchema.optional(), limit: z.number().int().min(1).max(100).default(25), cursor: z.string().optional(), access_context: z.string().trim().min(1).optional() },
+    inputSchema: { file: FileRefSchema.optional(), limit: z.number().int().min(1).max(100).default(DEFAULT_DRIVE_PAGE_SIZE), cursor: z.string().optional(), access_context: z.string().trim().min(1).optional() },
     outputSchema: { comments: z.array(z.record(z.unknown())), ...PageOutputShape, provenance: ProvenanceSchema }
   }, { readOnly: true }, async (args, extra) => {
     const cursor = typeof args.cursor === "string" ? decodeCursor(runtime.config.clientSecret, "drive_comments", args.cursor) : undefined;
     const file = cursor ? String(cursor.file) : requiredInitialRef(args.file, "file", "drive_comments");
     const item = parseItemRef(file);
     const offset = cursor ? Number(cursor.offset) : 0;
-    const limit = cursor ? Number(cursor.limit) : Number(args.limit ?? 25);
+    const limit = cursor ? Number(cursor.limit) : Number(args.limit ?? DEFAULT_DRIVE_PAGE_SIZE);
     const accessContext = cursor && typeof cursor.access_context === "string" ? cursor.access_context : contextId(args.access_context);
     const access = runtime.gateway.context(accessContext);
     const response = await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(item.id)}/comments`, access.context.id, {}, extra.signal);
@@ -385,7 +389,7 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
   registerTool(server, "yfy_shares", {
     title: "List Yifangyun Shares",
     description: "List redacted share metadata for one item ref. URLs and passwords are never returned.",
-    inputSchema: { item: ItemRefSchema.optional(), limit: z.number().int().min(1).max(100).default(25), cursor: z.string().optional(), access_context: z.string().trim().min(1).optional() },
+    inputSchema: { item: ItemRefSchema.optional(), limit: z.number().int().min(1).max(100).default(DEFAULT_DRIVE_PAGE_SIZE), cursor: z.string().optional(), access_context: z.string().trim().min(1).optional() },
     outputSchema: { shares: z.array(z.record(z.unknown())), ...PageOutputShape, provenance: ProvenanceSchema }
   }, { readOnly: true }, async (args, extra) => {
     const cursor = typeof args.cursor === "string" ? decodeCursor(runtime.config.clientSecret, "drive_shares", args.cursor) : undefined;
@@ -393,7 +397,7 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
     const item = parseItemRef(itemValue);
     const pageId = cursor ? Number(cursor.page_id) : 0;
     const offset = cursor ? Number(cursor.offset) : 0;
-    const limit = cursor ? Number(cursor.limit) : Number(args.limit ?? 25);
+    const limit = cursor ? Number(cursor.limit) : Number(args.limit ?? DEFAULT_DRIVE_PAGE_SIZE);
     const accessContext = cursor && typeof cursor.access_context === "string" ? cursor.access_context : contextId(args.access_context);
     const access = runtime.gateway.context(accessContext);
     const response = await runtime.gateway.getUser(`/v2/${item.type}/${encodeURIComponent(item.id)}/share_links`, access.context.id, { page_id: pageId, page_capacity: Math.min(runtime.config.maxPageCapacity, Math.max(50, limit)) }, extra.signal);

@@ -1,12 +1,12 @@
-# 从 0.4.0 迁移到 1.0.0-beta.5
+# 从 0.4.0 迁移到 1.0.0-beta.6
 
-本文适用于从正式版本 `0.4.0` 升级到 `1.0.0-beta.5`。beta.5 将 Agent-facing Interface 改为轻量 Drive 平面，加可选的 Workspace、Inventory、Evidence 和 Organization 平面。
+本文适用于从正式版本 `0.4.0` 直接升级到当前版本 `1.0.0-beta.6`。beta.6 将 Agent-facing Interface 改为轻量 Drive 平面，加可选的 Workspace、Inventory、Evidence 和 Organization 平面，并统一结果预算、路径、游标、错误、Capture provenance 和 Inventory manifest 契约。
 
 这是破坏性迁移：不提供 `0.4.0` 工具别名、旧参数解析、旧配置键映射或旧 SQLite schema 原地迁移。MCP 客户端定义、Prompt、评测、环境变量和状态库必须作为一个版本单元同步切换。
 
 ## 工具迁移
 
-| 0.4.0 | 1.0.0-beta.5 |
+| 0.4.0 | 1.0.0-beta.6 |
 |---|---|
 | `yfy_connection_check`、`yfy_context_get` | `yfy_status` |
 | `yfy_root_list`、`yfy_folder_list` | `yfy_browse` |
@@ -33,6 +33,13 @@
 - `scope_id` 改为 `workspace`。
 - `expected` 不匹配不再成功返回 false，而是 `YFY_EXPECTATION_MISMATCH`。
 - provenance 不再包含 endpoint、下载 pathname、status code 或 access context。
+- Item 的 `path_chain` 改为 `provider_path_chain`，并增加 `path_basis=provider_supplied`。Workspace 结果另返回基于配置根目录的相对祖先链。
+- `yfy_search` 新增 `detail`；`yfy_browse/yfy_search` 默认 `detail=basic`。
+- Drive 普通分页默认 `limit=10`；`yfy_inventory_search` 默认 `limit=25`、最大 100。
+- `yfy_inventory_create` 默认改为 `max_item_depth=8/max_items=10000`。更大扫描必须显式提高限制。
+- 超过 12,000 字符的文本结果返回含真实样本、遗漏计数和 `next_action` 的 `compact_preview`；完整结果仍位于 `structuredContent`。
+- cursor 和 Inventory ref 必须使用规范、无 padding 的 Base64URL。invalid cursor 为 `invalid_input`，stale cursor 为 `stale_state`。
+- Provider `file_not_locked` 映射为 `YFY_FILE_UNAVAILABLE/provider_contract`，不再错误声明文件不存在。
 
 ## 配置迁移
 
@@ -50,7 +57,7 @@ YFY_SNAPSHOT_CONCURRENCY     -> YFY_INVENTORY_CONCURRENCY
 YFY_SNAPSHOT_TTL_SECONDS     -> YFY_INVENTORY_TTL_SECONDS
 ```
 
-beta.5 默认 `YFY_TOOLSETS=drive`。Tender Profile 要求 `drive,workspace,inventory,evidence` 和至少一个 Workspace。
+beta.6 默认 `YFY_TOOLSETS=drive`。Tender Profile 要求 `drive,workspace,inventory,evidence` 和至少一个 Workspace。
 
 `0.4.0` 配置示例：
 
@@ -61,7 +68,7 @@ YFY_SNAPSHOT_CONCURRENCY=2
 YFY_SNAPSHOT_TTL_SECONDS=604800
 ```
 
-对应的 beta.5 配置：
+对应的 beta.6 配置：
 
 ```env
 YFY_TOOLSETS=drive,workspace,inventory,evidence,organization
@@ -70,7 +77,7 @@ YFY_INVENTORY_CONCURRENCY=2
 YFY_INVENTORY_TTL_SECONDS=604800
 ```
 
-不要同时保留新旧键。beta.5 只读取新键，旧键不会作为兼容 fallback 使用。
+不要同时保留新旧键。beta.6 只读取新键，旧键不会作为兼容 fallback 使用。
 
 ## 调用迁移示例
 
@@ -80,7 +87,7 @@ YFY_INVENTORY_TTL_SECONDS=604800
 {"tool":"yfy_root_list","arguments":{"root":{"kind":"scope","scope_id":"tender_public"},"page_capacity":50}}
 ```
 
-beta.5 浏览同一 Workspace：
+beta.6 浏览同一 Workspace：
 
 ```json
 {"tool":"yfy_browse","arguments":{"at":"workspace:tender_public","limit":50}}
@@ -92,21 +99,24 @@ beta.5 浏览同一 Workspace：
 {"tool":"yfy_evidence_capture","arguments":{"scope_id":"tender_public","file_id":"501","version":{"kind":"current"}}}
 ```
 
-beta.5 固化当前内容：
+beta.6 固化当前内容：
 
 ```json
 {"tool":"yfy_capture","arguments":{"workspace":"tender_public","file":"file:501"}}
 ```
 
-beta.5 返回 `next_action` 时应原样执行，不要把 cursor 与 `0.4.0` 的 Provider 页码参数混用。
+beta.6 返回 `next_action` 时应原样执行，不要把 cursor 与 `0.4.0` 的 Provider 页码参数混用。
 
 ## 状态与 Resource
 
 - SQLite schema 从 2 升到 3。`0.4.0` 状态库会被拒绝；升级时配置新的空 `YFY_STATE_DB`。
-- `0.4.0` snapshot ID、cursor 和 manifest URI 失效，不能转换为 beta.5 Inventory ref。
+- `0.4.0` snapshot ID、cursor 和 manifest URI 失效，不能转换为 beta.6 Inventory ref。
 - stdio 不再返回服务器本地路径。
 - 大文件通过 multipart manifest/parts 读取，不再返回 omitted。
 - 文本 Resource 使用 MCP `text`；二进制和 parts 使用 `blob`。
+- 常见 Office MIME alias 会归一化；二进制正文能否直接呈现仍取决于 MCP 客户端附件能力。
+- Capture provenance 区分下载前后元数据、版本历史、下载 ticket 和内容下载。
+- Inventory manifest 的 `policy`、`receipts` 和 `receipt_summary` 统一使用 snake_case，最多内联 100 条 receipt 并明确标记截断。
 
 ## 升级步骤
 
@@ -119,4 +129,4 @@ beta.5 返回 `next_action` 时应原样执行，不要把 cursor 与 `0.4.0` �
 7. 使用受控当前/历史文件验证 `yfy_open`、`yfy_capture`、expectation mismatch 和 Resource release。
 8. 完成只读验证后再开启 mutation、collaboration、admin 或 transfer。
 
-回滚必须整体切回 `0.4.0` 服务、配置和客户端定义。`0.4.0` 与 beta.5 不能共享状态数据库、cursor、Resource URI 或 Agent 调用契约。
+回滚必须整体切回 `0.4.0` 服务、配置和客户端定义。`0.4.0` 与 beta.6 不能共享状态数据库、cursor、Resource URI 或 Agent 调用契约。

@@ -8,7 +8,7 @@ import { YifangyunError } from "./client.js";
 import { provenance } from "./domain/projectors.js";
 import type { AppRuntime } from "./runtime/runtime.js";
 import { registerAdminTools } from "./tools/adminTools.js";
-import { registerWorkspaceContentTools } from "./tools/workspaceContentTools.js";
+import { normalizedMediaType, registerWorkspaceContentTools } from "./tools/workspaceContentTools.js";
 import { registerDriveTools } from "./tools/driveTools.js";
 import { registerMutationTools } from "./tools/mutationTools.js";
 import { registerInventoryTools } from "./tools/inventoryTools.js";
@@ -59,6 +59,12 @@ test("provenance exposes a logical operation without transport paths", () => {
   assert.doesNotMatch(JSON.stringify(value), /download\.example|secret\/path|private-context/);
 });
 
+test("legacy Office media types are normalized for MCP clients", () => {
+  assert.equal(normalizedMediaType("application/excel", undefined), "application/vnd.ms-excel");
+  assert.equal(normalizedMediaType("application/powerpoint; charset=binary", undefined), "application/vnd.ms-powerpoint");
+  assert.equal(normalizedMediaType("application/octet-stream", "application/pdf"), "application/pdf");
+});
+
 test("drive search hides Provider pagination behind one cursor", async () => {
   const server = new FakeServer();
   const files = Array.from({ length: 3 }, (_, index) => ({ id: index + 1, name: `candidate-${index + 1}.pdf`, type: "file", owned_by: { id: 9, name: "Owner", login: "secret" } }));
@@ -82,6 +88,8 @@ test("drive search hides Provider pagination behind one cursor", async () => {
   const second = await call(server, "yfy_search", { cursor });
   assert.deepEqual((second.structuredContent?.hits as Array<Record<string, unknown>>).map((hit) => (hit.item as Record<string, unknown>).ref), ["file:3"]);
   assert.doesNotMatch(JSON.stringify(first.structuredContent), /login|secret/);
+  const standard = await call(server, "yfy_search", { query: "candidate", in: "personal", detail: "standard" });
+  assert.equal((((standard.structuredContent?.hits as Array<Record<string, unknown>>)[0]?.item as Record<string, unknown>).owned_by as Record<string, unknown>).name, "Owner");
 });
 
 test("admin log pagination counts user activity rows", async () => {
@@ -117,7 +125,11 @@ test("drive search enforces folder scope and exact names", async () => {
   } as unknown as AppRuntime;
   registerDriveTools(server as unknown as McpServer, runtime);
   const result = await call(server, "yfy_search", { query: "test.docx", in: "folder:10", kind: "file", field: "name", exact_name: true, limit: 5 });
-  assert.deepEqual((result.structuredContent?.hits as Array<Record<string, unknown>>).map((hit) => (hit.item as Record<string, unknown>).ref), ["file:1"]);
+  const item = ((result.structuredContent?.hits as Array<Record<string, unknown>>)[0]?.item as Record<string, unknown>);
+  assert.equal(item.ref, "file:1");
+  assert.equal(item.path_basis, "provider_supplied");
+  assert.equal(item.path_chain, undefined);
+  assert.deepEqual((item.provider_path_chain as Array<Record<string, unknown>>).map((entry) => entry.id), ["10"]);
 });
 
 test("drive batch reads preserve successes when one Provider request fails", async () => {
@@ -172,6 +184,9 @@ test("workspace membership distinguishes query and assert semantics", async () =
   registerWorkspaceContentTools(server as unknown as McpServer, runtime);
   const query = await call(server, "yfy_membership_check", { file: "file:10", workspace: "tender", mode: "query" });
   assert.equal(query.structuredContent?.in_workspace, false);
+  assert.equal(query.structuredContent?.path_basis, "configured_workspace_root");
+  assert.deepEqual(query.structuredContent?.workspace_relative_ancestor_chain, []);
+  assert.equal((query.structuredContent?.file as Record<string, unknown>).path_basis, "provider_supplied");
   assert.equal(query.isError, undefined);
   const assertion = await call(server, "yfy_membership_check", { file: "file:10", workspace: "tender", mode: "assert" });
   assert.equal(assertion.isError, true);
@@ -298,6 +313,9 @@ test("evidence capture validates a historical version with the reverse-ordinal s
   assert.notEqual(result.isError, true);
   assert.equal(requestedVersion, 1);
   assert.equal((result.structuredContent?.selection as Record<string, unknown>).download_strategy, "historical_reverse_ordinal");
+  assert.deepEqual((result.structuredContent?.provenance as Array<Record<string, unknown>>).map((entry) => entry.operation), [
+    "file_metadata_before", "version_history_before", "download_ticket", "content_download", "version_history_after", "file_metadata_after"
+  ]);
 });
 
 test("evidence capture falls back to a validated historical version-id strategy", async () => {
@@ -420,7 +438,7 @@ test("large captured content returns a multipart resource without a local path",
       ? response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 7, modified_at: 1 }] })
       : endpoint.endsWith("/download_v2") ? response(endpoint, { download_url: "https://download.example/file" })
         : response(endpoint, { id: 10, name: "evidence.bin", type: "file", size: 7, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] }) },
-    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.bin", tempPath, sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 7, meta: response("/download", {}).meta }) },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.xls", tempPath, sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 7, contentType: "application/excel", meta: response("/download", {}).meta }) },
     evidence: { register: () => `yfy://evidence/${"4".repeat(48)}` }
   } as unknown as AppRuntime;
   try {
@@ -429,6 +447,7 @@ test("large captured content returns a multipart resource without a local path",
     assert.notEqual(result.isError, true, JSON.stringify(result.content));
     const resource = result.structuredContent?.resource as Record<string, unknown>;
     assert.equal(resource.delivery, "multipart_resource");
+    assert.equal(resource.media_type, "application/vnd.ms-excel");
     assert.match(String(resource.resource_uri), /\/manifest$/);
     const link = result.content?.find((entry) => entry.type === "resource_link") as ({ mimeType?: string } | undefined);
     assert.equal(link?.mimeType, "application/json");

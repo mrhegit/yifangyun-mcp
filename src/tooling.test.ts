@@ -5,6 +5,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { YifangyunError } from "./client.js";
+import { decodeCanonicalBase64Url } from "./domain/base64url.js";
 import type { AppRuntime } from "./runtime/runtime.js";
 import { registerWorkspaceContentTools } from "./tools/workspaceContentTools.js";
 import { registerDriveTools } from "./tools/driveTools.js";
@@ -57,9 +58,58 @@ test("stale snapshot cursors expose a recoverable state category and safe diagno
 
 test("snapshot query input and capacity errors use recoverable categories", () => {
   assert.equal(serializeError(new YifangyunError("empty", { code: "YFY_INVENTORY_QUERY_EMPTY" })).category, "invalid_input");
-  assert.equal(serializeError(new YifangyunError("cursor", { code: "YFY_INVENTORY_CURSOR_INVALID" })).category, "invalid_input");
   assert.equal(serializeError(new YifangyunError("short", { code: "YFY_INVENTORY_QUERY_TOO_SHORT" })).category, "capacity_limit");
   assert.equal(serializeError(new YifangyunError("broad", { code: "YFY_INVENTORY_QUERY_TOO_BROAD" })).category, "capacity_limit");
+});
+
+test("all cursor errors use recoverable categories", () => {
+  assert.equal(serializeError(new YifangyunError("cursor", { code: "YFY_CURSOR_INVALID" })).category, "invalid_input");
+  assert.equal(serializeError(new YifangyunError("cursor", { code: "YFY_CURSOR_STALE" })).category, "stale_state");
+});
+
+test("unavailable Provider files are not misreported as missing", () => {
+  const error = serializeError(new YifangyunError("not locked", { code: "YFY_PROVIDER_HTTP_ERROR", details: { api_code: "file_not_locked" } }));
+  assert.equal(error.code, "YFY_FILE_UNAVAILABLE");
+  assert.equal(error.category, "provider_contract");
+});
+
+test("signed values reject non-canonical Base64URL aliases", () => {
+  assert.equal(decodeCanonicalBase64Url("Zg").toString("utf8"), "f");
+  assert.throws(() => decodeCanonicalBase64Url("Zh"), /canonical Base64URL/);
+});
+
+test("large tool results retain useful data and continuation in compact text", async () => {
+  const server = new McpServer({ name: "test-server", version: "1.0.0" });
+  registerTool(server, "large_result", {
+    title: "Large Result",
+    description: "Returns enough data to exercise compact text delivery.",
+    inputSchema: {},
+    outputSchema: { items: z.array(z.object({ id: z.string(), value: z.string() })), page: z.record(z.unknown()), next_action: z.record(z.unknown()) }
+  }, { readOnly: true }, async () => ({
+    items: Array.from({ length: 20 }, (_, index) => ({ id: `item-${index}`, value: "x".repeat(1000) })),
+    page: { returned_count: 20, has_more: true, next_cursor: "cursor" },
+    next_action: { tool: "large_result", arguments: { cursor: "cursor" } }
+  }));
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-client", version: "1.0.0" });
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const result = await client.callTool({ name: "large_result", arguments: {} });
+    const text = (result.content as Array<{ text?: string }>)[0]?.text ?? "{}";
+    const compact = JSON.parse(text) as Record<string, unknown>;
+    assert.ok(text.length <= 12_000);
+    assert.equal(((compact.text_delivery as Record<string, unknown>).mode), "compact_preview");
+    const resultPreview = compact.result_preview as Record<string, unknown>;
+    const itemPreview = resultPreview.items as { items: Array<Record<string, unknown>>; omitted_count: number };
+    assert.equal(itemPreview.items[0]?.id, "item-0");
+    assert.ok(itemPreview.omitted_count > 0);
+    assert.equal(((resultPreview.next_action as Record<string, unknown>).tool), "large_result");
+    assert.equal(((result.structuredContent as Record<string, unknown>).items as unknown[]).length, 20);
+  } finally {
+    await client.close();
+    await server.close();
+  }
 });
 
 test("invalid successful output becomes a tool error and runs rollback", async () => {
@@ -95,17 +145,18 @@ test("unexpected system errors do not expose local details", () => {
 
 test("the MCP client accepts a running inventory success result", async () => {
   const server = new McpServer({ name: "test-server", version: "1.0.0" });
+  let createInput: Record<string, unknown> | undefined;
   const runtime = {
     config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["inventory"] },
     access: { resolveScope: () => ({ context: { id: "default" }, scope: { rootFolderId: "501" } }) },
     snapshots: {
-      create: async () => ({ reused: false, reuseReason: "new", state: {
+      create: async (input: Record<string, unknown>) => { createInput = input; return ({ reused: false, reuseReason: "new", state: {
         accessContextId: "default", accessIdentityRef: "identity", artifactToken: "token", createdAt: "2026-07-16T00:00:00.000Z", expiresAt: "2026-07-17T00:00:00.000Z",
         fileCount: 0, folderCount: 0, frontierCount: 1, incompleteReasons: [], observationStartedAt: "2026-07-16T00:00:00.000Z", observationUpdatedAt: "2026-07-16T00:00:00.000Z",
         pageReceiptCount: 0, policy: { caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"], maxItemDepth: 20, maxItems: 50000, pageCapacity: 500 },
         policyHash: "hash", receiptDigest: "digest", revision: 0, rootFolder: {}, rootFolderId: "501", rootObservationDigest: "root", scanId: "123e4567-e89b-12d3-a456-426614174000",
         status: "running", updatedAt: "2026-07-16T00:00:00.000Z"
-      } }),
+      } }); },
       summary: () => ({ terminal: false, completeness: { pagination_complete: false, safe_to_claim_absence: false, scope: "observed_subset_only", consistency_level: "partial_observation", incomplete_reasons: [] } })
     }
   } as unknown as AppRuntime;
@@ -119,6 +170,8 @@ test("the MCP client accepts a running inventory success result", async () => {
     const result = await client.callTool({ name: "yfy_inventory_create", arguments: { workspace: "tender" } });
     assert.equal(result.isError, undefined);
     assert.equal((result.structuredContent as Record<string, unknown>).status, "running");
+    assert.equal(createInput?.maxItemDepth, 8);
+    assert.equal(createInput?.maxItems, 10_000);
   } finally {
     await client.close();
     await server.close();

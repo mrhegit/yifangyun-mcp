@@ -1,6 +1,6 @@
 # 工具参考
 
-`1.0.0-beta.5` 使用“双平面” Interface：普通 Drive 操作保持轻量；Workspace、Inventory 和 Capture 提供范围与证据语义。
+`1.0.0-beta.6` 使用“双平面” Interface：普通 Drive 操作保持轻量；Workspace、Inventory 和 Capture 提供范围与证据语义。
 
 ## 通用契约
 
@@ -9,6 +9,8 @@
 ```json
 {"error":{"code":"YFY_PERMISSION_DENIED","category":"authorization","message":"Permission denied.","retryable":false,"phase":"provider_request"}}
 ```
+
+成功结果始终保留完整 `structuredContent`。当文本序列化超过 12,000 字符时，`content` 返回带真实样本、遗漏计数、分页和 `next_action` 的 `compact_preview`，不再只返回顶层字段名。
 
 provenance 不返回 endpoint、下载 URL pathname 或 access context：
 
@@ -19,10 +21,12 @@ provenance 不返回 endpoint、下载 URL pathname 或 access context：
 分页统一为：
 
 ```json
-{"page":{"returned_count":25,"has_more":true,"next_cursor":"..."},"next_action":{"tool":"yfy_browse","arguments":{"cursor":"..."}}}
+{"page":{"returned_count":10,"has_more":true,"next_cursor":"..."},"next_action":{"tool":"yfy_browse","arguments":{"cursor":"..."}}}
 ```
 
 续页时执行返回的 `next_action`，不要解析 cursor，也不要继续传 Provider 页码。
+
+普通 cursor 必须是签名覆盖的规范 Base64URL。`YFY_CURSOR_INVALID` 属于 `invalid_input`，`YFY_CURSOR_STALE` 属于 `stale_state`，都应按 `suggested_action` 无 cursor 重启原操作。
 
 ## Drive
 
@@ -40,6 +44,8 @@ provenance 不返回 endpoint、下载 URL pathname 或 access context：
 | `yfy_shares` | `item/limit` 或 `cursor` | 脱敏 share metadata/page |
 
 `yfy_search.coverage` 固定说明 Provider index 非穷尽。空结果不能证明文件不存在。
+
+Drive 列表默认 `limit=10`，`yfy_browse/yfy_search` 默认 `detail=basic`。项目的 Provider 原始祖先链使用 `provider_path_chain`，并带 `path_basis=provider_supplied`；该数组只用于观察和成员关系校验，不保证不同 endpoint 返回相同前缀。
 
 历史内容先调用 `yfy_versions`，复制 `version:<file_id>:<provider_version_id>` 到 `yfy_open` 或 `yfy_capture`。当前版省略 `version`。
 
@@ -64,7 +70,7 @@ provenance 不返回 endpoint、下载 URL pathname 或 access context：
 创建参数：
 
 ```json
-{"workspace":"tender_public","freshness":{"max_age_seconds":300,"mode":"reuse_if_fresh"},"max_item_depth":20,"max_items":50000}
+{"workspace":"tender_public","freshness":{"max_age_seconds":300,"mode":"reuse_if_fresh"},"max_item_depth":8,"max_items":10000}
 ```
 
 复用规则：
@@ -74,6 +80,8 @@ provenance 不返回 endpoint、下载 URL pathname 或 access context：
 - `new`：强制刷新、无等价任务、旧任务过期，或旧任务是 partial/cancelled/failed/expired。
 
 Inventory cursor 绑定 inventory、query、kind、limit、revision 和 Adapter 版本。后台状态变化导致 cursor stale 时，无 cursor 重新开始。
+
+`yfy_inventory_search` 默认 `limit=25`。manifest 的 `policy`、`receipts` 和 `receipt_summary` 全部使用 snake_case；manifest 最多内联 100 条 receipt，并明确返回 total、included 和 truncated，避免把大规模审计日志直接灌入模型上下文。
 
 ## Capture 与 Resource
 
@@ -91,6 +99,7 @@ Inventory cursor 绑定 inventory、query、kind、limit、revision 和 Adapter 
 - `assurance.checks`：`pass`、`not_applicable` 或 `unavailable`
 - `expectation.verdict`：`matched` 或 `not_provided`
 - `resource`：SHA-1、SHA-256、size、media type 和交付方式
+- `provenance`：区分 `file_metadata_before`、`version_history_before`、`download_ticket`、`content_download`、`version_history_after` 和 `file_metadata_after`
 
 expected 任一不匹配时返回 `YFY_EXPECTATION_MISMATCH`，并在 diagnostics 中给出 expected、actual 和 mismatches；临时文件不会注册为 Resource。
 
@@ -99,6 +108,7 @@ Resource 交付：
 - `mcp_resource`：单个 `yfy://evidence/<token>`；合法 UTF-8 文本返回 `text`，其他返回 `blob`。
 - `multipart_resource`：`yfy://evidence/<token>/manifest`；manifest 列出有界 `part` URI，每个 part 读取时复核整文件 SHA-256。
 - 不返回 `local_path`。
+- 常见 Office 非标准 MIME 会归一化为 IANA 类型；二进制能否直接呈现仍取决于 MCP 客户端附件能力。
 
 处理完成后调用 `yfy_resource_release({resource_uri})`。它是 Drive/Evidence 共享工具；释放操作幂等，manifest URI 和基础 URI 都可用于释放。
 

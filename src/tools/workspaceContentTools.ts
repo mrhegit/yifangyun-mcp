@@ -9,7 +9,7 @@ import { metrics } from "../observability.js";
 import type { AppRuntime } from "../runtime/runtime.js";
 import type { JsonObject } from "../types.js";
 import { registerTool } from "./tooling.js";
-import { FileRefSchema, FileVersionSchema, ItemSchema, PlaceRefSchema, ProvenanceSchema, VerificationStatusSchema, VersionRefSchema, VersionSelectionProofSchema } from "./schemas.js";
+import { FileRefSchema, FileVersionSchema, ItemSchema, PathEntrySchema, PlaceRefSchema, ProvenanceSchema, VerificationStatusSchema, VersionRefSchema, VersionSelectionProofSchema } from "./schemas.js";
 
 function progressReporter(extra: { _meta?: { progressToken?: string | number }; sendNotification: (notification: unknown) => Promise<void>; signal: AbortSignal }) {
   const progressToken = extra._meta?.progressToken;
@@ -27,7 +27,7 @@ function progressReporter(extra: { _meta?: { progressToken?: string | number }; 
 }
 
 function inScope(file: JsonObject, rootFolderId: string): { ancestorIds: string[]; matched: boolean } {
-  const chain = Array.isArray(file.path_chain) ? file.path_chain : [];
+  const chain = Array.isArray(file.provider_path_chain) ? file.provider_path_chain : [];
   const ancestorIds = chain.flatMap((entry) => {
     if (typeof entry === "object" && entry !== null && !Array.isArray(entry) && typeof entry.id === "string") {
       return [entry.id];
@@ -37,11 +37,34 @@ function inScope(file: JsonObject, rootFolderId: string): { ancestorIds: string[
   return { ancestorIds, matched: ancestorIds.includes(rootFolderId) || file.parent_folder_id === rootFolderId };
 }
 
-function normalizedMediaType(contentType: unknown, detectedContentType: unknown): string {
-  const providerType = typeof contentType === "string" ? contentType.split(";", 1)[0]!.trim().toLowerCase() : "";
-  if (/^[\w.+-]+\/[\w.+-]+$/.test(providerType) && providerType !== "application/octet-stream") return providerType;
-  const detectedType = typeof detectedContentType === "string" ? detectedContentType.split(";", 1)[0]!.trim().toLowerCase() : "";
-  return /^[\w.+-]+\/[\w.+-]+$/.test(detectedType) ? detectedType : "application/octet-stream";
+function workspaceRelativeAncestors(file: JsonObject, rootFolderId: string): JsonObject[] {
+  const chain = Array.isArray(file.provider_path_chain) ? file.provider_path_chain : [];
+  const rootIndex = chain.findIndex((entry) => typeof entry === "object" && entry !== null && !Array.isArray(entry) && entry.id === rootFolderId);
+  return rootIndex >= 0 ? chain.slice(rootIndex + 1) as JsonObject[] : [];
+}
+
+const MEDIA_TYPE_ALIASES: Record<string, string> = {
+  "application/excel": "application/vnd.ms-excel",
+  "application/msexcel": "application/vnd.ms-excel",
+  "application/x-excel": "application/vnd.ms-excel",
+  "application/x-msexcel": "application/vnd.ms-excel",
+  "application/mspowerpoint": "application/vnd.ms-powerpoint",
+  "application/powerpoint": "application/vnd.ms-powerpoint",
+  "application/x-mspowerpoint": "application/vnd.ms-powerpoint",
+  "application/word": "application/msword",
+  "application/x-msword": "application/msword"
+};
+
+function normalizeSingleMediaType(value: unknown): string | undefined {
+  const mediaType = typeof value === "string" ? value.split(";", 1)[0]!.trim().toLowerCase() : "";
+  if (!/^[\w.+-]+\/[\w.+-]+$/.test(mediaType)) return undefined;
+  return MEDIA_TYPE_ALIASES[mediaType] ?? mediaType;
+}
+
+export function normalizedMediaType(contentType: unknown, detectedContentType: unknown): string {
+  const providerType = normalizeSingleMediaType(contentType);
+  if (providerType && providerType !== "application/octet-stream") return providerType;
+  return normalizeSingleMediaType(detectedContentType) ?? "application/octet-stream";
 }
 
 async function removeEvidenceTemp(tempPath: string): Promise<void> {
@@ -52,7 +75,7 @@ async function removeEvidenceTemp(tempPath: string): Promise<void> {
     } catch (error) {
       const retryable = Boolean(error && typeof error === "object" && "code" in error && (error.code === "EPERM" || error.code === "EBUSY"));
       if (!retryable || attempt === 2) {
-      throw new YifangyunError("Validated evidence could not be removed from temporary storage.", {
+        throw new YifangyunError("Validated evidence could not be removed from temporary storage.", {
           code: "YFY_EVIDENCE_CLEANUP_FAILED",
           phase: "evidence_cleanup",
           retryable
@@ -73,6 +96,7 @@ async function attachEvidenceArtifact(runtime: AppRuntime, evidence: JsonObject)
   const sizeBytes = typeof evidence.size_bytes === "number" ? evidence.size_bytes : Number.MAX_SAFE_INTEGER;
   const maxResourceBytes = runtime.config.maxEvidenceResourceBytes ?? 16777216;
   const mediaType = normalizedMediaType(evidence.content_type, evidence.detected_content_type);
+  const detectedMediaType = normalizeSingleMediaType(evidence.detected_content_type);
   const common: JsonObject = {
     file: `file:${String(evidence.file_id)}`,
     file_name: String(evidence.file_name),
@@ -80,7 +104,7 @@ async function attachEvidenceArtifact(runtime: AppRuntime, evidence: JsonObject)
     sha256: String(evidence.sha256),
     size_bytes: sizeBytes,
     media_type: mediaType,
-    ...(typeof evidence.detected_content_type === "string" ? { detected_media_type: String(evidence.detected_content_type).split(";", 1)[0]!.trim().toLowerCase() } : {})
+    ...(detectedMediaType ? { detected_media_type: detectedMediaType } : {})
   };
   if (sizeBytes > maxResourceBytes) {
     const baseUri = await runtime.evidence.register({
@@ -119,7 +143,7 @@ function assertEvidenceAnchors(file: JsonObject, requireAncestry: boolean): void
   if (typeof file.size_bytes !== "number" || !Number.isSafeInteger(file.size_bytes) || file.size_bytes < 0) missing.push("size_bytes");
   if (typeof file.modified_at_unix !== "number" || !Number.isSafeInteger(file.modified_at_unix) || file.modified_at_unix < 0) missing.push("modified_at_unix");
   if (typeof file.file_version_key !== "string" || file.file_version_key.length === 0) missing.push("file_version_key");
-  if (requireAncestry && (!Array.isArray(file.path_chain) || file.path_chain.length === 0) && typeof file.parent_folder_id !== "string") missing.push("ancestry");
+  if (requireAncestry && (!Array.isArray(file.provider_path_chain) || file.provider_path_chain.length === 0) && typeof file.parent_folder_id !== "string") missing.push("ancestry");
   if (missing.length > 0) {
     throw new YifangyunError("Provider metadata is incomplete for drift-safe evidence.", {
       code: "YFY_EVIDENCE_METADATA_INCOMPLETE",
@@ -172,7 +196,7 @@ async function downloadAttempt(runtime: AppRuntime, input: { accessContext: stri
       ...(downloaded.contentType ? { content_type: downloaded.contentType } : {}),
       ...(downloaded.detectedContentType ? { detected_content_type: downloaded.detectedContentType } : {})
     } as JsonObject,
-    observations: [provenance(ticket.meta, input.accessContext), provenance(downloaded.meta, input.accessContext)],
+    observations: [provenance(ticket.meta, input.accessContext, "download_ticket"), provenance(downloaded.meta, input.accessContext, "content_download")],
     strategy: input.strategy
   };
 }
@@ -230,7 +254,7 @@ async function downloadSelectedVersion(runtime: AppRuntime, input: {
     }
   }
   if (input.selector.kind === "historical") {
-    throw new YifangyunError("Provider 无法返回与所选历史版本元数据一致的内容。", {
+    throw new YifangyunError("The Provider could not return content matching the selected historical version metadata.", {
       code: "YFY_HISTORICAL_CAPTURE_UNAVAILABLE",
       phase: "evidence_download_validation",
       agentDetails: {
@@ -239,14 +263,14 @@ async function downloadSelectedVersion(runtime: AppRuntime, input: {
         provider_version_id: input.selected.provider_version_id ?? null,
         attempts
       },
-      suggestedAction: "不要使用其他版本替代。可重新读取版本列表后重试，或报告该历史原件当前无法由 Provider 可靠导出。"
+      suggestedAction: "Do not substitute another version. Refresh yfy_versions and retry, or report that the historical original is unavailable from the Provider."
     });
   }
-  throw new YifangyunError("Provider 返回的当前文件内容与版本元数据不一致。", {
+  throw new YifangyunError("The Provider returned current content that does not match the version metadata.", {
     code: "YFY_EVIDENCE_CONTENT_MISMATCH",
     phase: "evidence_download_validation",
     agentDetails: { expected_sha1: input.selected.sha1 ?? null, expected_size_bytes: input.selected.size_bytes ?? null, attempts },
-    suggestedAction: "重新读取文件元数据和版本列表后重试；不要使用本次下载内容。"
+    suggestedAction: "Refresh file metadata and yfy_versions before retrying. Do not use the downloaded content."
   });
 }
 
@@ -317,7 +341,7 @@ function registerAuthorityTools(server: McpServer, runtime: AppRuntime): void {
     title: "Check Yifangyun Workspace Membership",
     description: "Check whether a file belongs to a configured workspace. Assert mode returns a tool error when outside it.",
     inputSchema: { file: FileRefSchema, workspace: z.string().trim().min(1), mode: z.enum(["query", "assert"]).default("query") },
-    outputSchema: { file: ItemSchema.extend({ ref: FileRefSchema }), workspace: z.object({ id: z.string(), ref: PlaceRefSchema, root_folder_id: z.string() }), in_workspace: z.boolean(), ancestor_folder_ids: z.array(z.string()), provenance: z.record(z.unknown()) }
+    outputSchema: { file: ItemSchema.extend({ ref: FileRefSchema }), workspace: z.object({ id: z.string(), ref: PlaceRefSchema, root_folder_id: z.string() }), in_workspace: z.boolean(), ancestor_folder_ids: z.array(z.string()), workspace_relative_ancestor_chain: z.array(PathEntrySchema), path_basis: z.literal("configured_workspace_root"), provenance: z.record(z.unknown()) }
   }, { readOnly: true }, async ({ file, workspace, mode }, extra) => {
     const item = parseItemRef(String(file));
     const result = await getScopedFile(runtime, item.id, String(workspace), extra.signal);
@@ -334,6 +358,8 @@ function registerAuthorityTools(server: McpServer, runtime: AppRuntime): void {
       workspace: { id: result.scope.scope.id, ref: `workspace:${result.scope.scope.id}`, root_folder_id: result.scope.scope.rootFolderId },
       in_workspace: result.membership.matched,
       ancestor_folder_ids: result.membership.ancestorIds,
+      workspace_relative_ancestor_chain: workspaceRelativeAncestors(result.file, result.scope.scope.rootFolderId),
+      path_basis: "configured_workspace_root",
       provenance: provenance(result.response.meta, result.scope.context.id)
     };
   });
@@ -373,7 +399,7 @@ async function captureVersionContent(runtime: AppRuntime, input: {
       });
     }
   }
-  const observations: JsonObject[] = [provenance(beforeResponse.meta, access.context.id), provenance(versionsBefore.response.meta, access.context.id)];
+  const observations: JsonObject[] = [provenance(beforeResponse.meta, access.context.id, "file_metadata_before"), provenance(versionsBefore.response.meta, access.context.id, "version_history_before")];
   const downloaded = await downloadSelectedVersion(runtime, {
     accessContext: access.context.id,
     externalEnterpriseId: access.context.externalEnterpriseId,
@@ -389,7 +415,7 @@ async function captureVersionContent(runtime: AppRuntime, input: {
   observations.push(...downloaded.observations);
   try {
     const versionsAfter = await observeVersions(runtime, input.fileId, access.context.id, input.signal);
-    observations.push(provenance(versionsAfter.response.meta, access.context.id));
+    observations.push(provenance(versionsAfter.response.meta, access.context.id, "version_history_after"));
     if (versionsBefore.fingerprint !== versionsAfter.fingerprint) {
       throw new YifangyunError("File version history changed while content was being captured.", { code: "YFY_EVIDENCE_DRIFT", phase: "version_recheck", retryable: true, suggestedAction: "Restart the operation from yfy_versions." });
     }
@@ -397,7 +423,7 @@ async function captureVersionContent(runtime: AppRuntime, input: {
     const afterResponse = scopedAfter?.response ?? await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(input.fileId)}/info_v2`, access.context.id, access.context.externalEnterpriseId ? { external_enterprise_id: access.context.externalEnterpriseId } : {}, input.signal);
     const after = scopedAfter?.file ?? projectItem(afterResponse.data, "evidence");
     assertEvidenceAnchors(after, Boolean(input.scopeId));
-    observations.push(provenance(afterResponse.meta, access.context.id));
+    observations.push(provenance(afterResponse.meta, access.context.id, "file_metadata_after"));
     const beforeSha1 = typeof before.sha1 === "string" && /^[a-f\d]{40}$/i.test(before.sha1) ? before.sha1.toLowerCase() : undefined;
     const afterSha1 = typeof after.sha1 === "string" && /^[a-f\d]{40}$/i.test(after.sha1) ? after.sha1.toLowerCase() : undefined;
     const stable = {
@@ -405,7 +431,7 @@ async function captureVersionContent(runtime: AppRuntime, input: {
       modified_at: before.modified_at_unix === after.modified_at_unix,
       size: before.size_bytes === after.size_bytes,
       metadata_sha1: beforeSha1 === undefined || afterSha1 === undefined || beforeSha1 === afterSha1,
-      path: JSON.stringify(before.path_chain) === JSON.stringify(after.path_chain),
+      path: JSON.stringify(before.provider_path_chain) === JSON.stringify(after.provider_path_chain),
       workspace_membership: !input.scopeId || scopedAfter?.membership.matched === true,
       current_metadata_size: input.selector.kind === "historical" || (before.size_bytes === selected.size_bytes && after.size_bytes === selected.size_bytes),
       current_metadata_sha1: input.selector.kind === "historical" || [beforeSha1, afterSha1].filter((value): value is string => value !== undefined).every((value) => value === selected.sha1)
@@ -451,7 +477,7 @@ async function captureVersionContent(runtime: AppRuntime, input: {
       version: { ...selected, ...(!selected.current ? { ref: `version:${input.fileId}:${selected.provider_version_id}` } : {}) },
       selection: versionSelectionProof(selected, input.selector, downloaded.strategy),
       assurance: { level: input.scopeId ? "workspace_bound" : "content_integrity", verdict: "verified", checks },
-      ...(input.scopeId && scopedAfter ? { workspace: { id: input.scopeId, ref: `workspace:${input.scopeId}`, root_folder_id: scopedAfter.scope.scope.rootFolderId, ancestor_folder_ids: scopedAfter.membership.ancestorIds, membership: "verified" } } : {}),
+      ...(input.scopeId && scopedAfter ? { workspace: { id: input.scopeId, ref: `workspace:${input.scopeId}`, root_folder_id: scopedAfter.scope.scope.rootFolderId, ancestor_folder_ids: scopedAfter.membership.ancestorIds, relative_ancestor_chain: workspaceRelativeAncestors(after, scopedAfter.scope.scope.rootFolderId), path_basis: "configured_workspace_root", membership: "verified" } } : {}),
       expectation: { verdict: Object.keys(expectationChecks).length > 0 ? "matched" : "not_provided", checks: expectationChecks },
       resource,
       provenance: observations
@@ -500,7 +526,7 @@ const ContentResultSchema = z.object({
       workspace_membership: VerificationStatusSchema
     })
   }),
-  workspace: z.object({ id: z.string(), ref: PlaceRefSchema, root_folder_id: z.string(), ancestor_folder_ids: z.array(z.string()), membership: z.literal("verified") }).optional(),
+  workspace: z.object({ id: z.string(), ref: PlaceRefSchema, root_folder_id: z.string(), ancestor_folder_ids: z.array(z.string()), relative_ancestor_chain: z.array(PathEntrySchema), path_basis: z.literal("configured_workspace_root"), membership: z.literal("verified") }).optional(),
   expectation: ExpectationSchema,
   resource: ContentResourceSchema,
   provenance: z.array(ProvenanceSchema)
@@ -521,7 +547,7 @@ function registerArtifactTools(server: McpServer, runtime: AppRuntime): void {
   server.registerResource(
     "yfy_content_resource",
     new ResourceTemplate("yfy://evidence/{token}", { list: undefined }),
-    { title: "Yifangyun Content Resource", description: "Short-lived integrity-protected bytes produced by yfy_open or yfy_capture.", mimeType: "application/octet-stream" },
+    { title: "Yifangyun Content Resource", description: "Short-lived integrity-protected bytes produced by yfy_open or yfy_capture. Binary rendering depends on client attachment support.", mimeType: "application/octet-stream" },
     async (uri, variables) => {
       const resource = await runtime.evidence.read(String(variables.token));
       return { contents: [{ uri: uri.href, ...(resource.kind === "text" ? { text: resource.text } : { blob: resource.blob }), ...(resource.mimeType ? { mimeType: resource.mimeType } : {}) }] };
@@ -542,10 +568,10 @@ function registerArtifactTools(server: McpServer, runtime: AppRuntime): void {
   server.registerResource(
     "yfy_content_part",
     new ResourceTemplate("yfy://evidence/{token}/part/{part}", { list: undefined }),
-    { title: "Yifangyun Multipart Content Part", description: "One verified bounded part of a larger content resource.", mimeType: "application/octet-stream" },
+    { title: "Yifangyun Multipart Content Part", description: "One verified bounded part of a larger content resource. Binary rendering depends on client attachment support.", mimeType: "application/octet-stream" },
     async (uri, variables) => {
       const part = await runtime.evidence.readPart(String(variables.token), Number(variables.part));
-      return { contents: [{ uri: uri.href, blob: part.blob, mimeType: "application/octet-stream" }] };
+      return { contents: [{ uri: uri.href, blob: part.blob, mimeType: part.mimeType ?? "application/octet-stream" }] };
     }
   );
 
@@ -560,7 +586,7 @@ function registerArtifactTools(server: McpServer, runtime: AppRuntime): void {
 function registerOpenTool(server: McpServer, runtime: AppRuntime): void {
   registerTool(server, "yfy_open", {
     title: "Open Yifangyun File Content",
-    description: "Open verified current or historical file bytes. Omit version for current content; copy a historical version ref from yfy_versions when needed.",
+    description: "Open verified current or historical file bytes. Omit version for current content; copy a historical version ref from yfy_versions when needed. Always release the returned resource after use.",
     inputSchema: { file: FileRefSchema, version: VersionRefSchema.optional(), access_context: z.string().trim().min(1).optional() },
     outputSchema: ContentResultSchema
   }, { readOnly: true, idempotent: false, onInvalidOutput: (result) => rollbackResource(runtime, result) }, async ({ file, version, access_context }, extra) => {
@@ -579,7 +605,7 @@ function registerOpenTool(server: McpServer, runtime: AppRuntime): void {
 function registerEvidenceTools(server: McpServer, runtime: AppRuntime): void {
   registerTool(server, "yfy_capture", {
     title: "Capture Yifangyun Workspace Content",
-    description: "Capture verified current or historical bytes inside a configured workspace. Workspace membership is checked before and after download.",
+    description: "Capture verified current or historical bytes inside a configured workspace. Workspace membership is checked before and after download. Always release the returned resource after use.",
     inputSchema: {
       workspace: z.string().trim().min(1),
       file: FileRefSchema,
