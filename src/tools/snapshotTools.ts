@@ -89,11 +89,11 @@ export function registerSnapshotTools(server: McpServer, runtime: AppRuntime): v
       caseSensitive: args.case_sensitive === true,
       includeFiles: args.include_files !== false,
       includeFolders: args.include_folders !== false,
-      matchFields: args.match_fields as Array<"name" | "path">,
-      maxDepth: Number(args.max_depth),
-      maxItems: Number(args.max_items),
-      pageCapacity: Math.min(Number(args.page_capacity), runtime.config.maxPageCapacity),
-      queries: args.queries as string[],
+      matchFields: Array.isArray(args.match_fields) ? args.match_fields as Array<"name" | "path"> : ["name", "path"],
+      maxDepth: Number(args.max_depth ?? 20),
+      maxItems: Number(args.max_items ?? 50000),
+      pageCapacity: Math.min(Number(args.page_capacity ?? 500), runtime.config.maxPageCapacity),
+      queries: Array.isArray(args.queries) ? args.queries as string[] : [],
       rootFolderId: resolved.scope.rootFolderId,
       signal: extra.signal
     });

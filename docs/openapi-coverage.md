@@ -6,7 +6,7 @@
 
 | Provider 能力 | 1.0 工具 | 状态 |
 |---|---|---|
-| personal/department/collaboration space | `yfy_space_list` | 已覆盖 |
+| personal/department/collaboration/folder/scope root | `yfy_root_list` | 已覆盖 |
 | folder info/children | `yfy_item_get`、`yfy_folder_list` | 已覆盖 |
 | file info/version info/version list | `yfy_item_get`、`yfy_file_versions` | 已覆盖 |
 | indexed item search | `yfy_item_search` | 已覆盖，hint-only |
@@ -19,7 +19,7 @@
 |---|---|---|
 | folder and department ancestry | `yfy_authority_validate` | 组合覆盖 |
 | file path scope | `yfy_scope_check` | 组合覆盖 |
-| download ticket and original bytes | `yfy_evidence_capture` | 已覆盖 |
+| download ticket and validated original bytes | `yfy_evidence_download`、`yfy_evidence_lock_current` | 已覆盖 |
 | content and metadata verification | `yfy_evidence_verify` | 组合覆盖 |
 | direct download URL | `yfy_transfer_ticket_get` | 可选 sensitive toolset |
 

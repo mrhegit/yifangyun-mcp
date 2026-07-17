@@ -1,6 +1,8 @@
+import crypto from "node:crypto";
+import { configFingerprint } from "../capabilities.js";
 import { AccessRegistry } from "./access.js";
 import type { AppConfig } from "../types.js";
-import { YifangyunClient } from "../client.js";
+import { YifangyunClient, YifangyunError } from "../client.js";
 import { YifangyunGateway } from "../gateway.js";
 import { ScopeScanEngine } from "../scan/engine.js";
 import { SnapshotService } from "../scan/service.js";
@@ -13,9 +15,13 @@ export class AppRuntime {
   readonly evidence: EvidenceArtifactRegistry;
   readonly gateway: YifangyunGateway;
   readonly snapshots: SnapshotService;
+  readonly configFingerprint: string;
+  readonly instanceId = crypto.randomUUID();
+  readonly startedAtIso = new Date().toISOString();
 
   private constructor(readonly config: AppConfig, repository: SqliteScopeScanStore) {
     this.access = new AccessRegistry(config);
+    this.configFingerprint = configFingerprint(config);
     this.client = new YifangyunClient(config);
     this.evidence = new EvidenceArtifactRegistry(config.tempFileTtlSeconds, config.maxEvidenceResourceBytes ?? 16777216);
     this.gateway = new YifangyunGateway(this.client, this.access, config.maxPageCapacity);
@@ -40,8 +46,12 @@ export class AppRuntime {
   }
 
   async close(): Promise<void> {
-    await this.snapshots.close();
-    this.evidence.close();
-    this.client.close();
+    const failures: string[] = [];
+    try { await this.snapshots.close(); } catch { failures.push("snapshots"); }
+    try { await this.evidence.close(); } catch { failures.push("evidence"); }
+    try { await this.client.close(); } catch { failures.push("client"); }
+    if (failures.length > 0) {
+      throw new YifangyunError("Runtime cleanup did not complete.", { code: "YFY_RUNTIME_CLEANUP_FAILED", phase: "runtime_shutdown", details: { failed_components: failures } });
+    }
   }
 }

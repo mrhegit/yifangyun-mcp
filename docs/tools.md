@@ -1,5 +1,7 @@
 # 工具参考
 
+工具是否注册由 `YFY_TOOLSETS` 决定；Authority、Snapshot 和 Current Lock 还依赖 `YFY_SCOPES_JSON`。配置组合、权限边界和完整示例见 [配置指南](configuration.md)。
+
 ## 返回契约
 
 成功时，`structuredContent` 直接是工具领域结果：
@@ -21,6 +23,7 @@
 {
   "error": {
     "code":"YFY_PERMISSION_DENIED",
+    "category":"authorization",
     "message":"Permission denied.",
     "retryable":false,
     "phase":"provider_request",
@@ -29,7 +32,7 @@
 }
 ```
 
-全部工具都声明具体 `outputSchema`，MCP 客户端可以验证 `structuredContent` 的稳定顶层字段和类型。不存在 `ok`、`request_succeeded`、`outcome`、`server_version` 和 `raw` 字段。
+全部工具都声明具体 `outputSchema`，MCP 客户端可以验证 `structuredContent` 的稳定顶层字段和类型。`yfy_context_get.server` 返回运行版本、实例 ID、启动时间和配置指纹；任何工具都不返回 Provider raw response。
 
 ## 分页
 
@@ -38,17 +41,22 @@
 ```json
 {
   "page": {
-    "page_id": 0,
-    "page_capacity": 50,
+    "requested": {"page_id":0,"page_capacity":5},
+    "effective": {"page_id":0,"page_capacity":100,"page_capacity_source":"provider"},
+    "returned": {"provider_count":30,"item_count":7,"filtered_count":23,"invalid_count":0},
     "page_count": 3,
     "total_count": 124,
     "has_more": true,
-    "next_page_id": 1
+    "next_page_id": 1,
+    "continuation_basis":"page_count",
+    "metadata_consistent":true
   }
 }
 ```
 
-`page_count`、`total_count` 和 `next_page_id` 在 Provider 无法提供时可以省略；`page_id`、`page_capacity` 和 `has_more` 始终存在。Agent 应优先使用 `has_more` 和 `next_page_id`。Snapshot 查询使用签名 cursor，不使用 page number。
+`page_count`、`total_count` 和 `next_page_id` 在 Provider 无法提供时可以省略。Agent 应优先使用 `has_more` 和 `next_page_id`；`requested`、`effective`、`returned` 用于区分请求容量、Provider 实际容量和过滤后的返回数量。Snapshot 查询使用签名 cursor，不使用 page number。
+
+`page.effective.page_capacity` 表示 Provider 实际采用的容量，不保证等于 `page.requested.page_capacity`。当前部署的搜索和分享接口可能忽略请求容量并返回自己的默认值；调用方不应把请求容量当作客户端结果上限，也不应自行截断后再声称分页完整。
 
 ## Core
 
@@ -59,11 +67,16 @@
 | `yfy_item_get` | 文件、文件版本、文件夹元数据；`view=summary/evidence/full` |
 | `yfy_items_get` | 最多 100 个文件的批量元数据 |
 | `yfy_folder_list` | 一页直接子项，不递归 |
+| `yfy_root_list` | 使用显式 root 对象枚举个人、协作、部门、文件夹或 scope 根 |
 | `yfy_item_search` | 官方索引候选发现，永远是 hint-only |
 | `yfy_path_resolve` | 分页逐层解析精确路径 |
 | `yfy_file_versions` | 文件版本列表 |
 | `yfy_file_comments` | 评论列表 |
 | `yfy_share_list` | 分享元数据，URL 和密码始终脱敏 |
+
+`yfy_item_search` 接受统一 `root`，只返回紧凑 `candidates`。文件夹或 scope 搜索会根据 `parent_folder_id` 和祖先链二次过滤；`precise=true` 且 `field=file_name` 时执行精确名称匹配。`page.total_count` 始终是 Provider 过滤前候选总数，实际过滤数见 `page.returned.filtered_count`。
+
+`yfy_items_get` 返回输入顺序稳定的 `results[]`。单个文件失败不会丢失其他成功项，汇总位于 `summary`。
 
 ## Authority
 
@@ -105,18 +118,19 @@ Snapshot 在每页原子提交时增量维护完整 receipt digest；manifest �
 
 | 工具 | 说明 |
 |---|---|
-| `yfy_evidence_capture` | `download` 或 `current_locked`；返回本地路径和短期 Evidence resource link |
-| `yfy_evidence_verify` | 验证 SHA-1、SHA-256、size、modified time 和 version key |
+| `yfy_evidence_download` | 使用 `current` 或 `history/generations_back` selector 下载并校验内容 |
+| `yfy_evidence_lock_current` | 范围证明、显式下载版本 0、下载后版本历史和元数据复核 |
+| `yfy_evidence_verify` | 下载指定版本并比较 SHA-1、SHA-256、size、modified time 和 version key |
+| `yfy_evidence_release` | 删除短期本地 Artifact 并使 resource URI 失效 |
 
-`current_locked` 要求 `scope_id`，并执行：范围证明、当前版本固定、下载、SHA-1/SHA-256、下载后元数据和范围复核。
+版本详情的 `provider_version_id` 只用于版本详情接口，绝不传给下载接口。下载使用 `provider_download_version`：`0` 表示当前版，`1` 表示上一版。服务端会在请求 Provider 前拒绝越界代数，防止 Provider 静默回退当前版。
 
-远程 HTTP Agent 应读取结果中的 `resource_uri` / `resource_link`，HTTP 结果不暴露服务器 `temp_path`；stdio 客户端仍可使用本地路径。超过 `YFY_MAX_EVIDENCE_RESOURCE_BYTES` 的结果不会注册 resource，并通过 `resource_omitted` 说明原因。
+远程 HTTP Agent 应读取结果中的 `resource_uri` / `resource_link`，HTTP 结果不暴露服务器 `temp_path`；stdio 客户端仍可使用本地路径。超过 `YFY_MAX_EVIDENCE_RESOURCE_BYTES` 的 HTTP 结果会在完成哈希和元数据校验后立即删除本地文件，并通过 `resource_omitted` 与 `artifact_disposition=deleted_after_validation` 说明原因。
 
 ## Organization
 
 | 工具 | 说明 |
 |---|---|
-| `yfy_space_list` | personal、collaboration、department 空间 |
 | `yfy_department_read` | get、children、users |
 | `yfy_user_search` | 企业用户搜索 |
 | `yfy_group_read` | group list 或 users |

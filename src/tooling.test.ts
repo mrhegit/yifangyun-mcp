@@ -8,7 +8,7 @@ import { YifangyunError } from "./client.js";
 import type { AppRuntime } from "./runtime/runtime.js";
 import { registerCoreTools } from "./tools/coreTools.js";
 import { registerSnapshotTools } from "./tools/snapshotTools.js";
-import { registerTool } from "./tools/tooling.js";
+import { registerTool, serializeError } from "./tools/tooling.js";
 
 test("tool errors bypass successful output schema validation", async () => {
   const server = new McpServer({ name: "test-server", version: "1.0.0" });
@@ -36,6 +36,18 @@ test("tool errors bypass successful output schema validation", async () => {
     await client.close();
     await server.close();
   }
+});
+
+test("evidence integrity and Provider fallback errors use actionable categories", () => {
+  assert.equal(serializeError(new YifangyunError("mismatch", { code: "YFY_EVIDENCE_CONTENT_MISMATCH" })).category, "conflict");
+  assert.equal(serializeError(new YifangyunError("integrity", { code: "YFY_EVIDENCE_ARTIFACT_INTEGRITY_FAILED" })).category, "conflict");
+  assert.equal(serializeError(new YifangyunError("fallback", { code: "YFY_DOWNLOAD_VERSION_FALLBACK_DETECTED" })).category, "provider_contract");
+});
+
+test("unexpected system errors do not expose local details", () => {
+  const error = serializeError(new Error("EPERM unlink C:\\secret\\artifact.bin"));
+  assert.equal(error.message, "Unexpected internal error.");
+  assert.doesNotMatch(String(error.message), /secret|artifact/);
 });
 
 test("the MCP client accepts a running snapshot success result", async () => {
@@ -90,7 +102,11 @@ test("the MCP client validates a paginated success result", async () => {
     await client.listTools();
     const result = await client.callTool({ name: "yfy_share_list", arguments: { item_type: "file", item_id: "1", page_id: 0, page_capacity: 1 } });
     assert.equal(result.isError, undefined);
-    assert.deepEqual((result.structuredContent as Record<string, unknown>).page, { page_id: 0, page_capacity: 1, page_count: 2, total_count: 2, has_more: true, next_page_id: 1 });
+    const page = (result.structuredContent as Record<string, unknown>).page as Record<string, unknown>;
+    assert.deepEqual(page.requested, { page_id: 0, page_capacity: 1 });
+    assert.deepEqual(page.effective, { page_id: 0, page_capacity: 1, page_capacity_source: "provider" });
+    assert.equal(page.has_more, true);
+    assert.equal(page.next_page_id, 1);
   } finally {
     await client.close();
     await server.close();

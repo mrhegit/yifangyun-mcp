@@ -11,6 +11,7 @@ import { registerAuthorityEvidenceTools } from "./tools/authorityEvidenceTools.j
 import { registerCoreTools, registerOrganizationTools } from "./tools/coreTools.js";
 import { registerMutationTools } from "./tools/mutationTools.js";
 import { registerSnapshotTools } from "./tools/snapshotTools.js";
+import { registerTransferTools } from "./tools/transferTools.js";
 import type { ApiJsonResponse, JsonValue } from "./types.js";
 
 type ToolResult = { content?: Array<{ text?: string; type: string }>; structuredContent?: Record<string, unknown>; isError?: boolean };
@@ -52,12 +53,14 @@ test("item search returns stable projection and hint-only authority", async () =
     access: { listContexts: () => [], listScopes: () => [] }
   } as unknown as AppRuntime;
   registerCoreTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_item_search", { query: "证书", item_type: "all", field: "all", space: "personal", precise: false, sort: "score", direction: "desc", view: "full", page_id: 0, page_capacity: 50 });
+  const result = await call(server, "yfy_item_search", { query: "证书", item_type: "all", field: "all", root: { kind: "personal" }, precise: false, sort: "score", direction: "desc", page_id: 0, page_capacity: 50 });
   assert.notEqual(result.isError, true);
   assert.equal((result.structuredContent?.authority as Record<string, unknown>).level, "hint_only");
-  const file = (result.structuredContent?.files as Array<Record<string, unknown>>)[0];
-  assert.equal((file.owned_by as Record<string, unknown>).name, "Owner");
-  assert.ok(!Object.prototype.hasOwnProperty.call(file.owned_by as object, "login"));
+  const page = result.structuredContent?.page as Record<string, unknown>;
+  assert.equal((page.requested as Record<string, unknown>).page_capacity, 50);
+  const candidate = (result.structuredContent?.candidates as Array<Record<string, unknown>>)[0];
+  assert.equal((candidate.item as Record<string, unknown>).name, "证书.pdf");
+  assert.ok(!Object.prototype.hasOwnProperty.call(candidate.item as object, "owned_by"));
 });
 
 test("paginated tools return one consistent page contract", async () => {
@@ -75,10 +78,15 @@ test("paginated tools return one consistent page contract", async () => {
   registerCoreTools(server as unknown as McpServer, runtime);
   registerOrganizationTools(server as unknown as McpServer, runtime);
   const shares = await call(server, "yfy_share_list", { item_type: "file", item_id: "1", page_id: 0, page_capacity: 2 });
-  assert.deepEqual(shares.structuredContent?.page, { page_id: 0, page_capacity: 2, page_count: 2, total_count: 3, has_more: true, next_page_id: 1 });
+  const sharePage = shares.structuredContent?.page as Record<string, unknown>;
+  assert.equal((sharePage.effective as Record<string, unknown>).page_capacity, 2);
+  assert.equal(sharePage.has_more, true);
+  assert.equal(sharePage.next_page_id, 1);
   mode = "fallback";
   const users = await call(server, "yfy_user_search", { page_id: 3, page_capacity: 25, include_contact: false });
-  assert.deepEqual(users.structuredContent?.page, { page_id: 3, page_capacity: 25, has_more: false });
+  const userPage = users.structuredContent?.page as Record<string, unknown>;
+  assert.equal((userPage.requested as Record<string, unknown>).page_id, 3);
+  assert.equal(userPage.has_more, false);
 });
 
 test("admin log pagination counts user activity rows", async () => {
@@ -91,7 +99,9 @@ test("admin log pagination counts user activity rows", async () => {
   } as unknown as AppRuntime;
   registerAdminTools(server as unknown as McpServer, runtime);
   const result = await call(server, "yfy_admin_log_query", { action: "list", start_date: "2026-07-01", end_date: "2026-07-02", page_id: 0, page_capacity: 2 });
-  assert.deepEqual(result.structuredContent?.page, { page_id: 0, page_capacity: 2, has_more: true, next_page_id: 1 });
+  const page = result.structuredContent?.page as Record<string, unknown>;
+  assert.equal((page.returned as Record<string, unknown>).provider_count, 2);
+  assert.equal(page.has_more, true);
 });
 
 test("pagination ignores impossible Provider counts and continues conservatively", async () => {
@@ -105,7 +115,107 @@ test("pagination ignores impossible Provider counts and continues conservatively
   } as unknown as AppRuntime;
   registerCoreTools(server as unknown as McpServer, runtime);
   const result = await call(server, "yfy_share_list", { item_type: "file", item_id: "1", page_id: 0, page_capacity: 1 });
-  assert.deepEqual(result.structuredContent?.page, { page_id: 0, page_capacity: 1, has_more: true, next_page_id: 1 });
+  const page = result.structuredContent?.page as Record<string, unknown>;
+  assert.equal(page.continuation_basis, "inconsistent");
+  assert.equal(page.metadata_consistent, false);
+  assert.equal(page.has_more, true);
+});
+
+test("pagination terminates on an empty page beyond the Provider range", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { maxPageCapacity: 500, toolsets: ["core"] },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => response(endpoint, { files: [], folders: [], page_id: 2, page_capacity: 5, page_count: 2, total_count: 9 })
+    }
+  } as unknown as AppRuntime;
+  registerCoreTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_folder_list", { folder_id: "0", item_type: "all", view: "summary", page_id: 2, page_capacity: 5 });
+  const page = result.structuredContent?.page as Record<string, unknown>;
+  assert.equal((page.effective as Record<string, unknown>).page_id, 2);
+  assert.equal(page.has_more, false);
+  assert.equal(page.metadata_consistent, true);
+});
+
+test("pagination continues through an empty page when Provider counts show remaining items", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { maxPageCapacity: 500, toolsets: ["core"] },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => response(endpoint, { files: [], folders: [], page_id: 1, page_capacity: 5, page_count: 3, total_count: 12 })
+    }
+  } as unknown as AppRuntime;
+  registerCoreTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_folder_list", { folder_id: "0", item_type: "all", view: "summary", page_id: 1, page_capacity: 5 });
+  const page = result.structuredContent?.page as Record<string, unknown>;
+  assert.equal(page.continuation_basis, "page_count");
+  assert.equal(page.has_more, true);
+  assert.equal(page.next_page_id, 2);
+});
+
+test("item search reports the Provider capacity when it overrides the request", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { maxPageCapacity: 500, toolsets: ["core"] },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => response(endpoint, { files: [], folders: [], page_id: 0, page_capacity: 100, page_count: 1, total_count: 0 })
+    },
+    access: { listContexts: () => [], listScopes: () => [] }
+  } as unknown as AppRuntime;
+  registerCoreTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_item_search", { query: "证书", item_type: "all", field: "all", root: { kind: "personal" }, precise: false, sort: "score", direction: "desc", page_id: 0, page_capacity: 5 });
+  const page = result.structuredContent?.page as Record<string, unknown>;
+  assert.equal((page.requested as Record<string, unknown>).page_capacity, 5);
+  assert.equal((page.effective as Record<string, unknown>).page_capacity, 100);
+});
+
+test("item search enforces folder scope and precise file names after Provider search", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { maxPageCapacity: 500, toolsets: ["core"] },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => endpoint.endsWith("/info") ? response(endpoint, { id: 10, name: "Target", type: "folder", space: { type: "personal" } }) : response(endpoint, {
+        files: [
+          { id: 1, name: "test.docx", type: "file", parent_folder_id: 10, path: [{ id: 10, name: "Target", type: "folder" }] },
+          { id: 2, name: "test-copy.docx", type: "file", parent_folder_id: 10, path: [{ id: 10, name: "Target", type: "folder" }] },
+          { id: 3, name: "test.docx", type: "file", parent_folder_id: 20, path: [{ id: 20, name: "Other", type: "folder" }] }
+        ],
+        folders: [], page_id: 0, page_capacity: 100, page_count: 1, total_count: 3
+      })
+    },
+    access: { listContexts: () => [], listScopes: () => [] }
+  } as unknown as AppRuntime;
+  registerCoreTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_item_search", { query: "test.docx", item_type: "file", field: "file_name", root: { kind: "folder", folder_id: "10" }, precise: true, sort: "score", direction: "desc", page_id: 0, page_capacity: 5 });
+  assert.deepEqual((result.structuredContent?.candidates as Array<Record<string, unknown>>).map((candidate) => (candidate.item as Record<string, unknown>).id), ["1"]);
+  const page = result.structuredContent?.page as Record<string, unknown>;
+  assert.equal((page.returned as Record<string, unknown>).filtered_count, 2);
+  assert.equal(page.has_more, false);
+});
+
+test("batch item reads preserve successes when one Provider request fails", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { maxPageCapacity: 500, toolsets: ["core"] },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => endpoint.includes("/2/")
+        ? Promise.reject(new YifangyunError("missing", { code: "YFY_FILE_NOT_FOUND", statusCode: 404 }))
+        : response(endpoint, { id: 1, name: "ok.pdf", type: "file" })
+    }
+  } as unknown as AppRuntime;
+  registerCoreTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_items_get", { file_ids: ["1", "2"], view: "summary" });
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(result.structuredContent?.summary, { requested_count: 2, success_count: 1, error_count: 1 });
+  const results = result.structuredContent?.results as Array<Record<string, unknown>>;
+  assert.equal(results[0]?.status, "success");
+  assert.equal(results[1]?.status, "error");
+  assert.equal((results[1]?.error as Record<string, unknown>).category, "not_found");
 });
 
 test("scope check distinguishes query and assert semantics", async () => {
@@ -155,31 +265,6 @@ test("snapshot query returns a signed context-bound cursor", async () => {
   assert.equal(errorCode(wrongQuery), "YFY_SNAPSHOT_CURSOR_INVALID");
 });
 
-test("evidence capture rejects metadata drift and removes the candidate artifact", async () => {
-  const server = new FakeServer();
-  let infoCalls = 0;
-  const runtime = {
-    config: { toolsets: ["evidence"] },
-    access: {
-      resolveContext: access,
-      resolveScope: () => ({ ...access(), scope: { id: "scope", rootFolderId: "501", accessContext: "default", tags: [] } })
-    },
-    gateway: {
-      getUser: async (endpoint: string) => {
-        if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [{ id: 7, current: true }] });
-        if (endpoint.endsWith("/download_v2")) return response(endpoint, { download_url: "https://download.example/file" });
-        infoCalls += 1;
-        return response(endpoint, { id: 10, name: "evidence.pdf", type: "file", size: 10, sha1: infoCalls === 1 ? "a".repeat(40) : "b".repeat(40), modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
-      }
-    },
-    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/nonexistent-evidence.pdf", sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 10, meta: response("/download", {}).meta }) }
-  } as unknown as AppRuntime;
-  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_capture", { file_id: "10", mode: "current_locked", scope_id: "scope" });
-  assert.equal(result.isError, true);
-  assert.equal(errorCode(result), "YFY_EVIDENCE_DRIFT");
-});
-
 test("evidence verify rejects an empty comparison", async () => {
   const server = new FakeServer();
   const runtime = {
@@ -187,7 +272,7 @@ test("evidence verify rejects an empty comparison", async () => {
     access: { resolveContext: access }
   } as unknown as AppRuntime;
   registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_verify", { file_id: "10", verify_content: false });
+  const result = await call(server, "yfy_evidence_verify", { file_id: "10" });
   assert.equal(result.isError, true);
   assert.equal(errorCode(result), "YFY_INPUT_INVALID");
 });
@@ -199,76 +284,213 @@ test("evidence verify rejects empty expected strings without fail-open", async (
     access: { resolveContext: access }
   } as unknown as AppRuntime;
   registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_verify", { file_id: "10", expected_sha256: "", verify_content: false });
+  const result = await call(server, "yfy_evidence_verify", { file_id: "10", expected_sha256: "" });
   assert.equal(result.isError, true);
   assert.equal(errorCode(result), "YFY_INPUT_INVALID");
 });
 
-test("current_locked evidence rejects missing drift anchors", async () => {
+test("evidence verify rejects a current file version key for historical content", async () => {
   const server = new FakeServer();
+  const runtime = { config: { toolsets: ["evidence"] }, access: { resolveContext: access } } as unknown as AppRuntime;
+  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_evidence_verify", { file_id: "10", version: { kind: "history", generations_back: 1 }, expected_file_version_key: "current-key" });
+  assert.equal(result.isError, true);
+  assert.equal(errorCode(result), "YFY_INPUT_INVALID");
+});
+
+test("evidence download selects and validates a historical generation", async () => {
+  const server = new FakeServer();
+  let requestedVersion: unknown;
+  const runtime = {
+    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, transport: "stdio" },
+    access: { resolveContext: access },
+    gateway: {
+      getUser: async (endpoint: string, _context: string, params: Record<string, unknown>) => {
+        if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [
+          { current: true, sha1: "a".repeat(40), size: 10, modified_at: 2 },
+          { id: 7, current: false, sha1: "b".repeat(40), size: 9, modified_at: 1 }
+        ] });
+        if (endpoint.endsWith("/download_v2")) { requestedVersion = params.version; return response(endpoint, { download_url: "https://download.example/file" }); }
+        return response(endpoint, { id: 10, name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1" });
+      }
+    },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/evidence.pdf", sha1: "b".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
+    evidence: { register: () => "yfy://evidence/test" }
+  } as unknown as AppRuntime;
+  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_evidence_download", { file_id: "10", version: { kind: "history", generations_back: 1 } });
+  assert.notEqual(result.isError, true);
+  assert.equal(requestedVersion, 1);
+  assert.equal((result.structuredContent?.selection as Record<string, unknown>).provider_download_version, 1);
+});
+
+test("evidence download rejects an out-of-range generation before requesting a ticket", async () => {
+  const server = new FakeServer();
+  let ticketCalls = 0;
   const runtime = {
     config: { toolsets: ["evidence"] },
-    access: { resolveScope: () => ({ ...access(), scope: { id: "scope", rootFolderId: "501", accessContext: "default", tags: [] } }) },
+    access: { resolveContext: access },
     gateway: {
-      getUser: async (endpoint: string) => endpoint.endsWith("/versions")
-        ? response(endpoint, { file_versions: [{ id: 7, current: true }] })
-        : response(endpoint, { id: "10", name: "evidence.pdf", type: "file", size: 10, path: [{ id: "501", name: "Root", type: "folder" }] })
+      getUser: async (endpoint: string) => {
+        if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 10 }] });
+        if (endpoint.endsWith("/download_v2")) ticketCalls += 1;
+        return response(endpoint, { id: "10", name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1" });
+      }
     }
   } as unknown as AppRuntime;
   registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_capture", { file_id: "10", mode: "current_locked", scope_id: "scope" });
+  const result = await call(server, "yfy_evidence_download", { file_id: "10", version: { kind: "history", generations_back: 2 } });
   assert.equal(result.isError, true);
-  assert.equal(errorCode(result), "YFY_EVIDENCE_METADATA_INCOMPLETE");
+  assert.equal(errorCode(result), "YFY_VERSION_NOT_FOUND");
+  assert.equal(ticketCalls, 0);
 });
 
-test("evidence capture removes downloaded bytes when post-download recheck fails", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-evidence-recheck-"));
-  const tempPath = path.join(dir, "candidate.pdf");
-  await fs.writeFile(tempPath, "candidate");
+test("evidence download rejects a historical generation with indistinguishable content", async () => {
   const server = new FakeServer();
-  let infoCalls = 0;
+  let ticketCalls = 0;
   const runtime = {
-    config: { toolsets: ["evidence"] },
+    config: { toolsets: ["evidence"] }, access: { resolveContext: access },
+    gateway: { getUser: async (endpoint: string) => {
+      if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [
+        { current: true, sha1: "a".repeat(40), size: 10 },
+        { current: false, sha1: "a".repeat(40), size: 10 }
+      ] });
+      if (endpoint.endsWith("/download_v2")) ticketCalls += 1;
+      return response(endpoint, { id: "10", name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1" });
+    } }
+  } as unknown as AppRuntime;
+  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_evidence_download", { file_id: "10", version: { kind: "history", generations_back: 1 } });
+  assert.equal(result.isError, true);
+  assert.equal(errorCode(result), "YFY_VERSION_CONTENT_IDENTITY_AMBIGUOUS");
+  assert.equal(ticketCalls, 0);
+});
+
+test("current evidence lock succeeds without a Provider current version id", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, transport: "stdio" },
     access: { resolveScope: () => ({ ...access(), scope: { id: "scope", rootFolderId: "501", accessContext: "default", tags: [] } }) },
     gateway: {
       getUser: async (endpoint: string) => {
-        if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [{ id: 7, current: true }] });
+        if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 9, modified_at: 1 }] });
         if (endpoint.endsWith("/download_v2")) return response(endpoint, { download_url: "https://download.example/file" });
-        infoCalls += 1;
-        if (infoCalls > 1) throw new YifangyunError("recheck failed", { code: "YFY_PROVIDER_TEST" });
-        return response(endpoint, { id: 10, name: "evidence.pdf", type: "file", size: 9, sha1: "a".repeat(40), modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
+        return response(endpoint, { id: 10, name: "evidence.pdf", type: "file", size: 9, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
       }
     },
-    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath, sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) }
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/evidence.pdf", sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
+    evidence: { register: () => "yfy://evidence/test" }
+  } as unknown as AppRuntime;
+  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_evidence_lock_current", { file_id: "10", scope_id: "scope" });
+  assert.notEqual(result.isError, true);
+  assert.equal((result.structuredContent?.selection as Record<string, unknown>).provider_download_version, 0);
+});
+
+test("evidence verify returns a mismatch without treating it as a tool error", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, transport: "stdio" },
+    access: { resolveContext: access },
+    gateway: {
+      getUser: async (endpoint: string) => endpoint.endsWith("/versions")
+        ? response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 9, modified_at: 1 }] })
+        : endpoint.endsWith("/download_v2") ? response(endpoint, { download_url: "https://download.example/file" })
+          : response(endpoint, { id: 10, name: "evidence.pdf", type: "file", size: 9, modified_at: 1, file_version_key: "v1" })
+    },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/evidence.pdf", sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
+    evidence: { register: () => "yfy://evidence/test" }
+  } as unknown as AppRuntime;
+  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_evidence_verify", { file_id: "10", version: { kind: "current" }, expected_sha256: "d".repeat(64) });
+  assert.equal(result.isError, undefined, JSON.stringify(result.content));
+  assert.equal(result.structuredContent?.matches, false);
+});
+
+test("evidence verify compares hexadecimal hashes case-insensitively", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, transport: "stdio" }, access: { resolveContext: access },
+    gateway: { getUser: async (endpoint: string) => endpoint.endsWith("/versions")
+      ? response(endpoint, { file_versions: [{ current: true, sha1: "A".repeat(40), size: 9, modified_at: 1 }] })
+      : endpoint.endsWith("/download_v2") ? response(endpoint, { download_url: "https://download.example/file" })
+        : response(endpoint, { id: 10, name: "evidence.pdf", type: "file", size: 9, modified_at: 1, file_version_key: "v1" }) },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/evidence.pdf", sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
+    evidence: { register: () => "yfy://evidence/test" }
+  } as unknown as AppRuntime;
+  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_evidence_verify", { file_id: "10", expected_sha1: "A".repeat(40), expected_sha256: "C".repeat(64) });
+  assert.equal(result.isError, undefined, JSON.stringify(result.content));
+  assert.equal(result.structuredContent?.matches, true);
+});
+
+test("HTTP evidence deletes validated files that exceed the resource limit", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-http-evidence-large-"));
+  const tempPath = path.join(dir, "evidence.bin");
+  await fs.writeFile(tempPath, "content");
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1, transport: "http" }, access: { resolveContext: access },
+    gateway: { getUser: async (endpoint: string) => endpoint.endsWith("/versions")
+      ? response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 7, modified_at: 1 }] })
+      : endpoint.endsWith("/download_v2") ? response(endpoint, { download_url: "https://download.example/file" })
+        : response(endpoint, { id: 10, name: "evidence.bin", type: "file", size: 7, modified_at: 1, file_version_key: "v1" }) },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.bin", tempPath, sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 7, meta: response("/download", {}).meta }) },
+    evidence: { register: () => { throw new Error("oversized evidence must not be registered"); } }
   } as unknown as AppRuntime;
   try {
     registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-    const result = await call(server, "yfy_evidence_capture", { file_id: "10", mode: "current_locked", scope_id: "scope" });
-    assert.equal(result.isError, true);
-    assert.equal(errorCode(result), "YFY_PROVIDER_TEST");
+    const result = await call(server, "yfy_evidence_download", { file_id: "10" });
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    const evidence = result.structuredContent?.evidence as Record<string, unknown>;
+    assert.equal(evidence.temp_path, undefined);
+    assert.equal(evidence.artifact_disposition, "deleted_after_validation");
     await assert.rejects(() => fs.stat(tempPath), { code: "ENOENT" });
   } finally {
     await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }
 });
 
-test("current_locked evidence fails when the Provider has no current version id", async () => {
+test("HTTP evidence cleanup failures are redacted and retained for registry cleanup", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-http-evidence-cleanup-"));
+  const artifactDirectory = path.join(dir, "artifact-directory");
+  await fs.mkdir(artifactDirectory);
+  const server = new FakeServer();
+  let registeredPath: string | undefined;
+  const runtime = {
+    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1, transport: "http" }, access: { resolveContext: access },
+    gateway: { getUser: async (endpoint: string) => endpoint.endsWith("/versions")
+      ? response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 7, modified_at: 1 }] })
+      : endpoint.endsWith("/download_v2") ? response(endpoint, { download_url: "https://download.example/file" })
+        : response(endpoint, { id: 10, name: "evidence.bin", type: "file", size: 7, modified_at: 1, file_version_key: "v1" }) },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.bin", tempPath: artifactDirectory, sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 7, meta: response("/download", {}).meta }) },
+    evidence: { register: async (artifact: { path: string }) => { registeredPath = artifact.path; return "yfy://evidence/retained"; } }
+  } as unknown as AppRuntime;
+  try {
+    registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_evidence_download", { file_id: "10" });
+    assert.equal(result.isError, true);
+    assert.equal(errorCode(result), "YFY_EVIDENCE_CLEANUP_FAILED");
+    assert.equal(registeredPath, artifactDirectory);
+    assert.doesNotMatch(JSON.stringify(result.content), /artifact-directory|yfy-http-evidence-cleanup/);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("transfer tickets only claim selector prevalidation", async () => {
   const server = new FakeServer();
   const runtime = {
-    config: { toolsets: ["evidence"] },
-    access: {
-      resolveScope: () => ({ ...access(), scope: { id: "scope", rootFolderId: "501", accessContext: "default", tags: [] } })
-    },
-    gateway: {
-      getUser: async (endpoint: string) => endpoint.endsWith("/versions")
-        ? response(endpoint, { file_versions: [] })
-        : response(endpoint, { id: "10", name: "evidence.pdf", type: "file", path: [{ id: "501", name: "Root", type: "folder" }] })
-    }
+    config: { toolsets: ["transfer"] }, access: { resolveContext: access },
+    gateway: { getUser: async (endpoint: string) => endpoint.endsWith("/versions")
+      ? response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 7 }] })
+      : response(endpoint, { download_url: "https://download.example/file" }) }
   } as unknown as AppRuntime;
-  registerAuthorityEvidenceTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_evidence_capture", { file_id: "10", mode: "current_locked", scope_id: "scope" });
-  assert.equal(result.isError, true);
-  assert.equal(errorCode(result), "YFY_CURRENT_VERSION_NOT_FOUND");
+  registerTransferTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_transfer_ticket_get", { file_id: "10" });
+  assert.notEqual(result.isError, true, JSON.stringify(result.content));
+  assert.equal(result.structuredContent?.validation_level, "selector_prevalidated");
+  assert.equal((result.structuredContent?.selection as Record<string, unknown>).validation_level, "selector_prevalidated");
 });
 
 test("mutation and admin grouped tools build official requests", async () => {

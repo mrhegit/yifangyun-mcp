@@ -82,43 +82,73 @@ export function projectItem(value: JsonValue | undefined, view: "summary" | "evi
   return output;
 }
 
-export function projectPage(value: JsonValue | undefined, fallback: { itemCount: number; pageCapacity: number; pageId: number }): JsonObject {
+export function projectPage(value: JsonValue | undefined, fallback: { fileCount?: number; filteredCount?: number; folderCount?: number; invalidCount?: number; itemCount: number; pageCapacity: number; pageId: number; providerCount?: number; requestedPageCapacity?: number }): JsonObject {
   const source = objectValue(value) ?? {};
   const pageId = typeof source.page_id === "number" && Number.isSafeInteger(source.page_id) && source.page_id >= 0 ? source.page_id : fallback.pageId;
   const pageCapacity = typeof source.page_capacity === "number" && Number.isSafeInteger(source.page_capacity) && source.page_capacity > 0 ? source.page_capacity : fallback.pageCapacity;
   const reportedPageCount = typeof source.page_count === "number" && Number.isSafeInteger(source.page_count) && source.page_count >= 0 ? source.page_count : undefined;
   const reportedTotalCount = typeof source.total_count === "number" && Number.isSafeInteger(source.total_count) && source.total_count >= 0 ? source.total_count : undefined;
-  const pageCountConsistent = reportedPageCount === undefined || fallback.itemCount === 0 || pageId < reportedPageCount;
-  const totalCountConsistent = reportedTotalCount === undefined || reportedTotalCount >= pageId * pageCapacity + fallback.itemCount;
+  const providerCount = fallback.providerCount ?? fallback.itemCount + (fallback.filteredCount ?? 0) + (fallback.invalidCount ?? 0);
+  const explicitHasMore = typeof source.has_more === "boolean" ? source.has_more : undefined;
+  const pageStart = pageId * pageCapacity;
+  const pageCountHasMore = reportedPageCount !== undefined ? pageId + 1 < reportedPageCount : undefined;
+  const totalCountHasMore = reportedTotalCount !== undefined ? pageStart + providerCount < reportedTotalCount : undefined;
+  const terminalEmptyPage = providerCount === 0
+    && explicitHasMore !== true
+    && pageCountHasMore !== true
+    && totalCountHasMore !== true
+    && ((reportedPageCount !== undefined && pageId >= reportedPageCount) || (reportedTotalCount !== undefined && pageStart >= reportedTotalCount));
+  const pageCountConsistent = reportedPageCount === undefined || terminalEmptyPage || pageId < reportedPageCount;
+  const totalCountConsistent = reportedTotalCount === undefined || terminalEmptyPage || reportedTotalCount >= pageStart + providerCount;
   const metadataInconsistent = !pageCountConsistent || !totalCountConsistent;
   const pageCount = pageCountConsistent ? reportedPageCount : undefined;
   const totalCount = totalCountConsistent ? reportedTotalCount : undefined;
   const signals = [
-    typeof source.has_more === "boolean" ? source.has_more : undefined,
+    explicitHasMore,
     pageCount !== undefined ? pageId + 1 < pageCount : undefined,
-    totalCount !== undefined ? pageId * pageCapacity + fallback.itemCount < totalCount : undefined
+    totalCount !== undefined ? pageStart + providerCount < totalCount : undefined
   ].filter((signal): signal is boolean => signal !== undefined);
-  const hasMore = metadataInconsistent || signals.some(Boolean) || (signals.length === 0 && fallback.itemCount >= pageCapacity);
+  const hasMore = !terminalEmptyPage && (metadataInconsistent || signals.some(Boolean) || (signals.length === 0 && providerCount >= pageCapacity));
   const providerNextPageId = typeof source.next_page_id === "number" && source.next_page_id === pageId + 1 ? source.next_page_id : undefined;
   const nextPageId = hasMore ? providerNextPageId ?? pageId + 1 : undefined;
+  const continuationBasis = metadataInconsistent ? "inconsistent"
+    : explicitHasMore === true ? "provider"
+      : pageCount !== undefined && pageId + 1 < pageCount ? "page_count"
+        : totalCount !== undefined && pageStart + providerCount < totalCount ? "total_count"
+          : signals.length === 0 && providerCount >= pageCapacity ? "full_page"
+            : "none";
   return {
-    page_id: pageId,
-    page_capacity: pageCapacity,
+    requested: { page_id: fallback.pageId, page_capacity: fallback.requestedPageCapacity ?? fallback.pageCapacity },
+    effective: { page_id: pageId, page_capacity: pageCapacity, page_capacity_source: typeof source.page_capacity === "number" ? "provider" : "request_sent" },
+    returned: {
+      provider_count: providerCount,
+      item_count: fallback.itemCount,
+      ...(fallback.fileCount !== undefined ? { file_count: fallback.fileCount } : {}),
+      ...(fallback.folderCount !== undefined ? { folder_count: fallback.folderCount } : {}),
+      filtered_count: fallback.filteredCount ?? 0,
+      invalid_count: fallback.invalidCount ?? 0
+    },
     ...(pageCount !== undefined ? { page_count: pageCount } : {}),
     ...(totalCount !== undefined ? { total_count: totalCount } : {}),
     has_more: hasMore,
-    ...(nextPageId !== undefined ? { next_page_id: nextPageId } : {})
+    ...(nextPageId !== undefined ? { next_page_id: nextPageId } : {}),
+    continuation_basis: continuationBasis,
+    metadata_consistent: !metadataInconsistent
   };
 }
 
-export function projectItemPage(value: JsonValue | undefined, view: "summary" | "evidence" | "full" = "summary", fallback = { pageCapacity: 50, pageId: 0 }): JsonObject {
+export function projectItemPage(value: JsonValue | undefined, view: "summary" | "evidence" | "full" = "summary", fallback: { filteredCount?: number; pageCapacity: number; pageId: number; providerCount?: number; requestedPageCapacity?: number } = { pageCapacity: 50, pageId: 0 }): JsonObject {
   const source = objectValue(value) ?? {};
-  const files = arrayValue(source.files).map((entry) => projectItem(entry, view)).filter((entry) => Object.keys(entry).length > 0);
-  const folders = arrayValue(source.folders).map((entry) => projectItem(entry, view)).filter((entry) => Object.keys(entry).length > 0);
+  const rawFiles = arrayValue(source.files);
+  const rawFolders = arrayValue(source.folders);
+  const files = rawFiles.map((entry) => projectItem(entry, view)).filter((entry) => Object.keys(entry).length > 0);
+  const folders = rawFolders.map((entry) => projectItem(entry, view)).filter((entry) => Object.keys(entry).length > 0);
+  const providerCount = fallback.providerCount ?? rawFiles.length + rawFolders.length + (fallback.filteredCount ?? 0);
+  const invalidCount = Math.max(0, providerCount - (fallback.filteredCount ?? 0) - files.length - folders.length);
   return {
     files,
     folders,
-    page: projectPage(value, { itemCount: files.length + folders.length, pageCapacity: fallback.pageCapacity, pageId: fallback.pageId })
+    page: projectPage(value, { itemCount: files.length + folders.length, fileCount: files.length, folderCount: folders.length, providerCount, filteredCount: fallback.filteredCount, invalidCount, pageCapacity: fallback.pageCapacity, pageId: fallback.pageId, requestedPageCapacity: fallback.requestedPageCapacity })
   };
 }
 

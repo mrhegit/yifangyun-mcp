@@ -94,7 +94,7 @@ function registerDepartmentTools(server: McpServer, runtime: AppRuntime): void {
     if (args.action === "users") {
       const source = objectValue(response.data) ?? {};
       const users = [...arrayValue(source.users), ...arrayValue(source.items)].map((value) => projectUser(value, args.include_contact === true));
-      return { users, page: projectPage(response.data, { itemCount: users.length, pageCapacity: pageCapacity(runtime, args.page_capacity), pageId: Number(args.page_id) }), provenance: provenance(response.meta) };
+      return { users, page: projectPage(response.data, { itemCount: users.length, pageCapacity: pageCapacity(runtime, args.page_capacity), requestedPageCapacity: Number(args.page_capacity), pageId: Number(args.page_id) }), provenance: provenance(response.meta) };
     }
     return { spaces: sanitize(response.data), provenance: provenance(response.meta) };
   });
@@ -156,10 +156,10 @@ function registerGroupTools(server: McpServer, runtime: AppRuntime): void {
     const source = objectValue(response.data) ?? {};
     if (args.action === "list") {
       const groups = [...arrayValue(source.groups), ...arrayValue(source.items)].map(projectGroup);
-      return { groups, page: projectPage(response.data, { itemCount: groups.length, pageCapacity: capacity, pageId: Number(args.page_id) }), provenance: provenance(response.meta) };
+      return { groups, page: projectPage(response.data, { itemCount: groups.length, pageCapacity: capacity, requestedPageCapacity: Number(args.page_capacity), pageId: Number(args.page_id) }), provenance: provenance(response.meta) };
     }
     const users = [...arrayValue(source.users), ...arrayValue(source.items)].map((value) => projectUser(value, args.include_contact === true));
-    return { users, page: projectPage(response.data, { itemCount: users.length, pageCapacity: capacity, pageId: Number(args.page_id) }), provenance: provenance(response.meta) };
+    return { users, page: projectPage(response.data, { itemCount: users.length, pageCapacity: capacity, requestedPageCapacity: Number(args.page_capacity), pageId: Number(args.page_id) }), provenance: provenance(response.meta) };
   });
 
   registerTool(server, "yfy_admin_group_mutate", {
@@ -245,7 +245,7 @@ function registerLogTools(server: McpServer, runtime: AppRuntime): void {
     const response = await runtime.gateway.postEnterprise(endpoint, body, {}, extra.signal);
     const result = sanitize(response.data);
     const paged = args.action === "list" || args.action === "list_paginated";
-    return { result, ...(paged ? { page: projectPage(undefined, { itemCount: resultCount(response.data), pageCapacity: Number(args.page_capacity), pageId: Number(args.page_id) }) } : {}), provenance: provenance(response.meta) };
+    return { result, ...(paged ? { page: projectPage(undefined, { itemCount: resultCount(response.data), pageCapacity: Number(args.page_capacity), requestedPageCapacity: Number(args.page_capacity), pageId: Number(args.page_id) }) } : {}), provenance: provenance(response.meta) };
   });
 }
 

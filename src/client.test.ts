@@ -157,6 +157,18 @@ test("transfer DNS lookup preserves the all-address callback contract", async ()
   assert.deepEqual(addresses, [{ address: "8.8.8.8", family: 4 }]);
 });
 
+test("transfer DNS lookup rejects non-public and IPv4-mapped addresses", async () => {
+  for (const address of ["100.64.0.1", "192.0.2.1", "198.18.0.1", "224.0.0.1", "::ffff:127.0.0.1", "::ffff:0a00:0001", "2001:db8::1", "2002:7f00:1::"]) {
+    const resolver = ((_hostname: string, _options: dns.LookupOptions, callback: (error: NodeJS.ErrnoException | null, addresses: dns.LookupAddress[]) => void) => {
+      callback(null, [{ address, family: address.includes(":") ? 6 : 4 }]);
+    }) as unknown as typeof dns.lookup;
+    const lookup = createTransferLookup(false, resolver);
+    await assert.rejects(() => new Promise((resolve, reject) => {
+      lookup("download.example", { all: true }, (error, result) => error ? reject(error) : resolve(result));
+    }), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_TRANSFER_URL_PRIVATE_ADDRESS"));
+  }
+});
+
 test("download redirects are revalidated before the next transfer hop", async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;

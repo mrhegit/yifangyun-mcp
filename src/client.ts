@@ -286,27 +286,61 @@ function sanitizeFileName(value: string): string {
   return value.replace(/[\\/:*?"<>|]+/g, "_").replace(/\s+/g, " ").trim() || "download.bin";
 }
 
+function parseIpv6Words(value: string): number[] | undefined {
+  const address = value.toLowerCase().split("%", 1)[0]!;
+  let hextetSource = address;
+  const dottedMatch = address.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (dottedMatch) {
+    const octets = dottedMatch[2]!.split(".").map(Number);
+    if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return undefined;
+    hextetSource = `${dottedMatch[1]}${((octets[0]! << 8) | octets[1]!).toString(16)}:${((octets[2]! << 8) | octets[3]!).toString(16)}`;
+  }
+  const compressed = hextetSource.split("::");
+  if (compressed.length > 2) return undefined;
+  const left = compressed[0] ? compressed[0].split(":") : [];
+  const right = compressed.length === 2 && compressed[1] ? compressed[1].split(":") : [];
+  if (compressed.length === 1 && left.length !== 8) return undefined;
+  const fill = compressed.length === 2 ? 8 - left.length - right.length : 0;
+  if (fill < 1 && compressed.length === 2) return undefined;
+  const hextets = [...left, ...Array.from({ length: fill }, () => "0"), ...right];
+  if (hextets.length !== 8 || hextets.some((part) => !/^[a-f\d]{1,4}$/.test(part))) return undefined;
+  return hextets.map((part) => Number.parseInt(part, 16));
+}
+
+function mappedIpv4Address(value: string): string | undefined {
+  const words = parseIpv6Words(value);
+  if (!words) return undefined;
+  if (!words.slice(0, 5).every((part) => part === 0) || words[5] !== 0xffff) return undefined;
+  return `${words[6]! >>> 8}.${words[6]! & 0xff}.${words[7]! >>> 8}.${words[7]! & 0xff}`;
+}
+
 function isPrivateAddress(value: string): boolean {
   const version = net.isIP(value);
   if (version === 4) {
     const parts = value.split(".").map(Number);
     return parts[0] === 10
       || parts[0] === 127
+      || (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127)
       || (parts[0] === 169 && parts[1] === 254)
       || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)
-      || (parts[0] === 192 && parts[1] === 168)
-      || parts[0] === 0;
+      || (parts[0] === 192 && (parts[1] === 0 || parts[1] === 168 || (parts[1] === 88 && parts[2] === 99)))
+      || (parts[0] === 198 && (parts[1] === 18 || parts[1] === 19 || (parts[1] === 51 && parts[2] === 100)))
+      || (parts[0] === 203 && parts[1] === 0 && parts[2] === 113)
+      || parts[0] === 0
+      || parts[0]! >= 224;
   }
   if (version === 6) {
-    const normalized = value.toLowerCase();
-    return normalized === "::1"
-      || normalized === "::"
-      || normalized.startsWith("fc")
-      || normalized.startsWith("fd")
-      || normalized.startsWith("fe8")
-      || normalized.startsWith("fe9")
-      || normalized.startsWith("fea")
-      || normalized.startsWith("feb");
+    const mapped = mappedIpv4Address(value);
+    if (mapped) return isPrivateAddress(mapped);
+    const words = parseIpv6Words(value);
+    if (!words || (words[0]! & 0xe000) !== 0x2000) return true;
+    return (words[0] === 0x2001 && words[1] === 0)
+      || (words[0] === 0x2001 && words[1] === 2 && words[2] === 0)
+      || (words[0] === 0x2001 && (words[1]! & 0xfff0) === 0x0010)
+      || (words[0] === 0x2001 && (words[1]! & 0xfff0) === 0x0020)
+      || (words[0] === 0x2001 && words[1] === 0x0db8)
+      || words[0] === 0x2002
+      || (words[0] === 0x3fff && (words[1]! & 0xf000) === 0);
   }
   return false;
 }
@@ -377,9 +411,9 @@ export class YifangyunClient {
     this.cleanupTimer.unref();
   }
 
-  close(): void {
+  async close(): Promise<void> {
     clearInterval(this.cleanupTimer);
-    void this.transferDispatcher.close();
+    await this.transferDispatcher.close();
   }
 
   async getEnterpriseToken(signal?: AbortSignal): Promise<string> {

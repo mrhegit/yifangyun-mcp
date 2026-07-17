@@ -5,7 +5,7 @@ import { loadConfig } from "./config.js";
 const ENV_KEYS = [
   "YFY_CLIENT_ID", "YFY_CLIENT_SECRET", "YFY_ENTERPRISE_ID", "YFY_DEFAULT_USER_ID", "YFY_TOOLSETS", "YFY_ACCESS_CONTEXTS_JSON", "YFY_SCOPES_JSON",
   "YFY_API_BASE_URL", "YFY_OAUTH_BASE_URL", "YFY_SNAPSHOT_CONCURRENCY", "YFY_STATE_DB", "YFY_TEMP_DIR", "YFY_MAX_DOWNLOAD_BYTES",
-  "YFY_MAX_EVIDENCE_RESOURCE_BYTES", "YFY_TEMP_FILE_TTL_SECONDS", "YFY_LOG_LEVEL", "YFY_UPLOAD_ROOT_DIR"
+  "YFY_MAX_EVIDENCE_RESOURCE_BYTES", "YFY_TEMP_FILE_TTL_SECONDS", "YFY_LOG_LEVEL", "YFY_UPLOAD_ROOT_DIR", "YFY_WORKFLOW_PROFILES"
 ] as const;
 
 function withEnv(values: Record<string, string | undefined>, work: () => void): void {
@@ -25,7 +25,7 @@ function withEnv(values: Record<string, string | undefined>, work: () => void): 
   }
 }
 
-test("loadConfig creates v1 access contexts, scopes and toolsets", () => {
+test("loadConfig creates access contexts, scopes and toolsets", () => {
   withEnv({
     YFY_CLIENT_ID: "client",
     YFY_CLIENT_SECRET: "secret",
@@ -43,6 +43,21 @@ test("loadConfig creates v1 access contexts, scopes and toolsets", () => {
     assert.match(config.stateDatabasePath, /state\.sqlite$/);
     assert.equal(config.apiBaseUrl, "https://open.fangcloud.com/api");
   });
+});
+
+test("loadConfig rejects an incomplete tender profile", () => {
+  withEnv({
+    YFY_CLIENT_ID: "client", YFY_CLIENT_SECRET: "secret", YFY_ENTERPRISE_ID: "115", YFY_DEFAULT_USER_ID: "530",
+    YFY_TOOLSETS: "core,evidence", YFY_WORKFLOW_PROFILES: "tender"
+  }, () => assert.throws(() => loadConfig(), /Workflow profile configuration is incomplete/));
+});
+
+test("loadConfig accepts a ready tender profile", () => {
+  withEnv({
+    YFY_CLIENT_ID: "client", YFY_CLIENT_SECRET: "secret", YFY_ENTERPRISE_ID: "115", YFY_DEFAULT_USER_ID: "530",
+    YFY_TOOLSETS: "core,organization,authority,snapshot,evidence", YFY_WORKFLOW_PROFILES: "tender",
+    YFY_SCOPES_JSON: '[{"id":"tender","root_folder_id":"501"}]'
+  }, () => assert.deepEqual(loadConfig().workflowProfiles, ["tender"]));
 });
 
 test("loadConfig rejects duplicate authority scope ids", () => {

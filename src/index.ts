@@ -8,18 +8,18 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { loadConfig } from "./config.js";
-import { registerGuidance, SERVER_INSTRUCTIONS } from "./guidance.js";
+import { registerGuidance, serverInstructions } from "./guidance.js";
 import { configureObservability, logEvent, metrics } from "./observability.js";
 import { AppRuntime } from "./runtime/runtime.js";
 import { registerCatalog } from "./tools/registerCatalog.js";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
 
-interface RunningHttpServer {
+interface RunningServer {
   close(): Promise<void>;
 }
 
 function createServer(runtime: AppRuntime): McpServer {
-  const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: SERVER_INSTRUCTIONS });
+  const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: serverInstructions(runtime) });
   registerGuidance(server, runtime);
   registerCatalog(server, runtime);
   return server;
@@ -35,14 +35,15 @@ function mcpRequestId(body: unknown): unknown {
   return typeof body === "object" && body !== null && "id" in body ? (body as { id?: unknown }).id ?? null : null;
 }
 
-async function runStdio(runtime: AppRuntime): Promise<void> {
+async function runStdio(runtime: AppRuntime): Promise<RunningServer> {
   const server = createServer(runtime);
   const transport = new StdioServerTransport();
   await server.connect(transport);
   logEvent("info", "server_started", { transport: "stdio", version: SERVER_VERSION });
+  return { close: async () => server.close() };
 }
 
-async function runHttp(runtime: AppRuntime): Promise<RunningHttpServer> {
+async function runHttp(runtime: AppRuntime): Promise<RunningServer> {
   const config = runtime.config;
   const host = config.httpHost ?? "127.0.0.1";
   const port = config.httpPort ?? 3000;
@@ -192,23 +193,27 @@ async function main(): Promise<void> {
   const config = loadConfig();
   configureObservability(config.logLevel);
   const runtime = await AppRuntime.create(config);
-  let httpServer: RunningHttpServer | undefined;
+  let runningServer: RunningServer | undefined;
   let closing = false;
   const close = async (signal: string) => {
     if (closing) return;
     closing = true;
     logEvent("info", "server_stopping", { signal });
-    if (httpServer) {
-      await httpServer.close();
-    }
-    await runtime.close();
+    const failures: string[] = [];
+    if (runningServer) try { await runningServer.close(); } catch { failures.push("transport"); }
+    try { await runtime.close(); } catch { failures.push("runtime"); }
+    if (failures.length > 0) throw new Error(`Server cleanup failed: ${failures.join(",")}`);
   };
-  process.once("SIGINT", () => void close("SIGINT").finally(() => process.exit(0)));
-  process.once("SIGTERM", () => void close("SIGTERM").finally(() => process.exit(0)));
+  const onSignal = (signal: string) => void close(signal).then(
+    () => process.exit(0),
+    () => { logEvent("error", "server_stop_failed", { signal }); process.exit(1); }
+  );
+  process.once("SIGINT", () => onSignal("SIGINT"));
+  process.once("SIGTERM", () => onSignal("SIGTERM"));
   if (config.transport === "http") {
-    httpServer = await runHttp(runtime);
+    runningServer = await runHttp(runtime);
   } else {
-    await runStdio(runtime);
+    runningServer = await runStdio(runtime);
   }
 }
 

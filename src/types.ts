@@ -8,6 +8,7 @@ export type IdLike = string | number;
 export type TokenSubjectType = "enterprise" | "user";
 
 export type Toolset = "core" | "authority" | "snapshot" | "evidence" | "organization" | "collaboration" | "mutation" | "admin" | "transfer";
+export type WorkflowProfile = "tender";
 
 export interface AccessContext {
   externalEnterpriseId?: string;
@@ -102,7 +103,7 @@ export interface AppConfig {
   toolsets: Toolset[];
   transport?: "stdio" | "http";
   uploadRootDir?: string;
-  workflowProfiles: string[];
+  workflowProfiles: WorkflowProfile[];
 }
 
 export interface TokenResponse {

@@ -12,8 +12,10 @@
 ```bash
 npm ci
 npm run build
-npm start
+node --env-file=.env dist/index.js
 ```
+
+`npm start` 不会自动加载 `.env`，只继承调用进程已有的环境变量。生产部署应由 MCP 客户端、容器或进程管理器注入配置。全部变量和模式选择见 [配置指南](configuration.md)。
 
 MCP 客户端配置示例：
 
@@ -22,18 +24,22 @@ MCP 客户端配置示例：
   "mcpServers": {
     "yifangyun": {
       "command": "npx",
-      "args": ["-y", "yifangyun-mcp-server@1.0.0-beta.1"],
+      "args": ["-y", "yifangyun-mcp-server@1.0.0-beta.3"],
       "env": {
         "YFY_CLIENT_ID": "...",
         "YFY_CLIENT_SECRET": "...",
         "YFY_ENTERPRISE_ID": "115",
         "YFY_DEFAULT_USER_ID": "530",
+        "YFY_TOOLSETS": "core,authority,snapshot,evidence,organization",
+        "YFY_WORKFLOW_PROFILES": "",
         "YFY_SCOPES_JSON": "[]"
       }
     }
   }
 }
 ```
+
+此示例是通用模式。要使用 Authority Snapshot 或 Current Lock，需要配置 Scope；要注册 Tender Prompt，还需设置 `YFY_WORKFLOW_PROFILES=tender`。
 
 ## HTTP
 

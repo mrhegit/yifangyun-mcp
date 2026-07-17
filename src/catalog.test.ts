@@ -46,12 +46,12 @@ function config(toolsets: AppConfig["toolsets"]): AppConfig {
   };
 }
 
-test("v1 default catalog exposes the current tools and schemas", async () => {
+test("default catalog exposes the current tools and schemas", async () => {
   const runtime = await AppRuntime.create(config(["core", "authority", "snapshot", "evidence", "organization"]));
   const server = new FakeServer();
   try {
     registerCatalog(server as unknown as McpServer, runtime);
-    for (const name of ["yfy_context_get", "yfy_item_get", "yfy_item_search", "yfy_authority_validate", "yfy_snapshot_create", "yfy_snapshot_query", "yfy_evidence_capture"]) {
+    for (const name of ["yfy_context_get", "yfy_root_list", "yfy_item_get", "yfy_item_search", "yfy_authority_validate", "yfy_snapshot_create", "yfy_snapshot_query", "yfy_evidence_download", "yfy_evidence_lock_current", "yfy_evidence_release"]) {
       assert.ok(server.tools.has(name), `${name} should be registered`);
     }
     assert.ok((server.tools.get("yfy_context_get")!.definition.outputSchema as Record<string, unknown>).access_contexts);
@@ -61,10 +61,12 @@ test("v1 default catalog exposes the current tools and schemas", async () => {
     assert.deepEqual(Object.keys(server.tools.get("yfy_snapshot_create")!.definition.inputSchema as Record<string, unknown>).sort(), ["case_sensitive", "include_files", "include_folders", "match_fields", "max_depth", "max_items", "page_capacity", "queries", "scope_id"]);
     assert.equal((server.tools.get("yfy_snapshot_create")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
     assert.equal((server.tools.get("yfy_snapshot_cancel")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
-    assert.equal((server.tools.get("yfy_evidence_capture")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
+    assert.equal((server.tools.get("yfy_evidence_download")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
+    assert.equal((server.tools.get("yfy_evidence_lock_current")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
     const result = await server.tools.get("yfy_context_get")!.handler({}, { signal: new AbortController().signal, sendNotification: async () => undefined });
     assert.equal(result.isError, undefined);
     assert.ok(result.structuredContent?.access_contexts);
+    assert.equal((result.structuredContent?.server as Record<string, unknown>).version, "1.0.0-beta.3");
     assert.ok(!Object.prototype.hasOwnProperty.call(result.structuredContent?.runtime ?? {}, "state_database_path"));
   } finally {
     await runtime.close();
@@ -81,7 +83,7 @@ test("optional toolsets preserve mutation, collaboration, admin and transfer cap
     }
     assert.equal((server.tools.get("yfy_item_mutate")!.definition.annotations as { destructiveHint: boolean }).destructiveHint, true);
     assert.equal((server.tools.get("yfy_file_upload")!.definition.annotations as { destructiveHint: boolean }).destructiveHint, true);
-    assert.equal(server.tools.size, 38);
+    assert.equal(server.tools.size, 40);
     for (const [name, tool] of server.tools) assert.ok(tool.definition.outputSchema, `${name} must declare outputSchema`);
   } finally {
     await runtime.close();
@@ -98,7 +100,7 @@ test("the MCP client compiles every catalog output schema", async () => {
     await server.connect(serverTransport);
     await client.connect(clientTransport);
     const listed = await client.listTools();
-    assert.equal(listed.tools.length, 38);
+    assert.equal(listed.tools.length, 40);
     assert.ok(listed.tools.every((tool) => tool.outputSchema));
   } finally {
     await client.close();
@@ -112,7 +114,7 @@ test("core tools are absent when the core toolset is disabled", async () => {
   const server = new FakeServer();
   try {
     registerCatalog(server as unknown as McpServer, runtime);
-    assert.ok(server.tools.has("yfy_evidence_capture"));
+    assert.ok(server.tools.has("yfy_evidence_download"));
     assert.ok(!server.tools.has("yfy_item_get"));
     assert.ok(!server.tools.has("yfy_connection_check"));
   } finally {

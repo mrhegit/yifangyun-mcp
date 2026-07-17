@@ -1,11 +1,13 @@
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
-import type { AccessContext, AppConfig, AuthorityScope, Toolset } from "./types.js";
+import { assertProfilesReady } from "./capabilities.js";
+import type { AccessContext, AppConfig, AuthorityScope, Toolset, WorkflowProfile } from "./types.js";
 
 const PUBLIC_BASE_URL = "https://open.fangcloud.com";
 const PUBLIC_API_BASE_URL = `${PUBLIC_BASE_URL}/api`;
 const ToolsetSchema = z.enum(["core", "authority", "snapshot", "evidence", "organization", "collaboration", "mutation", "admin", "transfer"]);
+const WorkflowProfileSchema = z.enum(["tender"]);
 const AccessContextSchema = z.object({
   id: z.string().trim().min(1).regex(/^[a-zA-Z0-9_-]+$/),
   user_id: z.string().trim().regex(/^\d+$/),
@@ -171,7 +173,8 @@ export function loadConfig(): AppConfig {
   }
   const logLevel = z.enum(["debug", "info", "warn", "error"]).parse(optionalEnv("YFY_LOG_LEVEL") ?? "info");
 
-  return {
+  const workflowProfiles = (parseCsv("YFY_WORKFLOW_PROFILES") ?? []).map((value) => WorkflowProfileSchema.parse(value)) as WorkflowProfile[];
+  const config: AppConfig = {
     accessContexts,
     apiBaseUrl: apiBaseUrl(),
     authorityScopes: parseScopes(accessContexts),
@@ -212,8 +215,10 @@ export function loadConfig(): AppConfig {
     toolsets: [...new Set(toolsets)],
     transport,
     ...(optionalEnv("YFY_UPLOAD_ROOT_DIR") ? { uploadRootDir: path.resolve(optionalEnv("YFY_UPLOAD_ROOT_DIR")!) } : {}),
-    workflowProfiles: parseCsv("YFY_WORKFLOW_PROFILES") ?? ["tender"]
+    workflowProfiles
   };
+  assertProfilesReady(config);
+  return config;
 }
 
 export function hasToolset(config: AppConfig, toolset: Toolset): boolean {

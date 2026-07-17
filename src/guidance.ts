@@ -1,14 +1,17 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { profileReadiness } from "./capabilities.js";
 import type { AppRuntime } from "./runtime/runtime.js";
 
-export const SERVER_INSTRUCTIONS = [
-  "Yifangyun MCP is a general cloud authority and evidence server optimized for tender-document workflows.",
-  "Use configured access_context and scope identifiers instead of raw user ids whenever possible.",
-  "Use official index search only for candidate discovery; use snapshots when completeness or absence matters.",
-  "Use evidence capture with a configured authority scope before relying on an original file.",
-  "Mutation, collaboration, admin and transfer capabilities are available only when their toolsets are enabled."
-].join(" ");
+export function serverInstructions(runtime: AppRuntime): string {
+  const instructions = [
+    "Yifangyun MCP is a cloud authority and evidence server with explicit capability readiness."
+  ];
+  if (runtime.config.toolsets.includes("core")) instructions.push("Call yfy_context_get before multi-step work and use named access contexts and scopes.", "Official indexed search returns candidates only and cannot prove absence.");
+  if (runtime.config.toolsets.includes("snapshot") && runtime.config.authorityScopes.length > 0) instructions.push("Use snapshots for exhaustive bounded scope work.");
+  if (runtime.config.toolsets.includes("evidence") && runtime.config.authorityScopes.length > 0) instructions.push("Use yfy_evidence_lock_current for authority-bound originals.");
+  return instructions.join(" ");
+}
 
 function textResource(uri: URL, text: string) {
   return { contents: [{ uri: uri.href, mimeType: "text/markdown", text }] };
@@ -20,17 +23,17 @@ export function registerGuidance(server: McpServer, runtime: AppRuntime): void {
     description: "Runtime toolsets, access contexts, authority scopes and recommended selection rules.",
     mimeType: "text/markdown"
   }, async (uri) => textResource(uri, [
-    "# Yifangyun MCP 1.0",
+    "# Yifangyun MCP 1.0 Beta",
     "",
     `Enabled toolsets: ${runtime.config.toolsets.join(", ")}`,
     `Workflow profiles: ${runtime.config.workflowProfiles.join(", ")}`,
     `Access contexts: ${runtime.access.listContexts().map((context) => context.id).join(", ")}`,
     `Authority scopes: ${runtime.access.listScopes().map((scope) => scope.id).join(", ") || "none"}`,
+    `Profile readiness: ${JSON.stringify(profileReadiness(runtime.config))}`,
     "",
-    "Use yfy_item_search for indexed candidate discovery.",
-    "Use yfy_path_resolve for an exact known path.",
-    "Use yfy_snapshot_create and yfy_snapshot_query for exhaustive bounded scope work.",
-    "Use yfy_evidence_capture with current_locked mode for authority-bound originals."
+    ...(runtime.config.toolsets.includes("core") ? ["Use yfy_item_search for indexed candidate discovery.", "Use yfy_path_resolve for an exact known path."] : []),
+    ...(runtime.config.toolsets.includes("snapshot") && runtime.config.authorityScopes.length > 0 ? ["Use yfy_snapshot_create and yfy_snapshot_query for exhaustive bounded scope work."] : []),
+    ...(runtime.config.toolsets.includes("evidence") && runtime.config.authorityScopes.length > 0 ? ["Use yfy_evidence_lock_current for authority-bound originals."] : [])
   ].join("\n")));
 
   server.registerResource("yfy_safety", "yfy://guide/safety", {
@@ -42,12 +45,12 @@ export function registerGuidance(server: McpServer, runtime: AppRuntime): void {
     "",
     "Official indexed search cannot prove absence.",
     "Snapshot completeness applies only to the observed accessible scope and observation window.",
-    "Evidence capture deletes the downloaded temp file when metadata drift is detected.",
+    "Evidence tools delete the downloaded temp file when metadata drift is detected.",
     "Permanent deletion, collaboration removal and platform synchronization require explicit user intent.",
     "Direct transfer tickets and admin login material are sensitive."
   ].join("\n")));
 
-  if (runtime.config.workflowProfiles.includes("tender") && ["core", "authority", "snapshot", "evidence"].every((toolset) => runtime.config.toolsets.includes(toolset as AppRuntime["config"]["toolsets"][number]))) {
+  if (runtime.config.workflowProfiles.includes("tender") && runtime.config.authorityScopes.length > 0 && ["core", "organization", "authority", "snapshot", "evidence"].every((toolset) => runtime.config.toolsets.includes(toolset as AppRuntime["config"]["toolsets"][number]))) {
     registerTenderProfile(server);
   }
 }
@@ -69,7 +72,7 @@ function registerTenderProfile(server: McpServer): void {
     "## Lock an original",
     "1. Resolve or search the candidate.",
     "2. Check scope membership.",
-    "3. Capture current_locked evidence.",
+    "3. Lock current evidence.",
     "4. Return path proof, version, sha256, size and observation time."
   ].join("\n")));
 
@@ -99,8 +102,8 @@ function registerTenderProfile(server: McpServer): void {
     `Find the tender document matching: ${file_hint}`,
     `Authority scope: ${scope_id}`,
     "Use exact path resolution when possible, otherwise indexed search for candidates or a snapshot for exhaustive search.",
-    "Call yfy_scope_check in assert mode, then yfy_evidence_capture in current_locked mode.",
-    "Return file id, path proof, version id, sha256, size_bytes and the evidence resource_uri; include temp_path only for a local stdio caller."
+    "Call yfy_scope_check in assert mode, then yfy_evidence_lock_current.",
+    "Return file id, path proof, provider download version, sha256, size_bytes and the evidence resource_uri; include temp_path only for a local stdio caller."
   ].join("\n") } }] }));
 
   server.registerPrompt("yfy_tender_compare_versions", {

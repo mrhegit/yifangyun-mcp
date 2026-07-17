@@ -3,6 +3,8 @@ import { promises as fs } from "node:fs";
 import { YifangyunError } from "../client.js";
 
 interface EvidenceArtifact {
+  expectedSha256: string;
+  expectedSize: number;
   expiresAtMs: number;
   mimeType?: string;
   name: string;
@@ -12,6 +14,7 @@ interface EvidenceArtifact {
 export class EvidenceArtifactRegistry {
   private readonly artifacts = new Map<string, EvidenceArtifact>();
   private readonly cleanupTimer: NodeJS.Timeout;
+  private closing = false;
   private lastPruneAtMs = 0;
 
   constructor(
@@ -23,17 +26,21 @@ export class EvidenceArtifactRegistry {
       throw new Error("Evidence resource TTL must be a positive integer.");
     }
     const intervalMs = Math.min(Math.max(ttlSeconds * 1000, 1000), 60_000);
-    this.cleanupTimer = setInterval(() => this.pruneExpired(Date.now(), true), intervalMs);
+    this.cleanupTimer = setInterval(() => void this.pruneExpired(Date.now(), true).catch(() => undefined), intervalMs);
     this.cleanupTimer.unref();
   }
 
-  register(input: Omit<EvidenceArtifact, "expiresAtMs">): string {
-    this.pruneExpired();
+  async register(input: Omit<EvidenceArtifact, "expiresAtMs">): Promise<string> {
+    if (this.closing) throw new YifangyunError("Evidence registry is closing.", { code: "YFY_EVIDENCE_REGISTRY_CLOSED", phase: "evidence_resource" });
+    await this.pruneExpired();
+    if (this.closing) throw new YifangyunError("Evidence registry is closing.", { code: "YFY_EVIDENCE_REGISTRY_CLOSED", phase: "evidence_resource" });
     while (this.artifacts.size >= this.maxEntries) {
       const oldest = this.artifacts.keys().next().value as string | undefined;
       if (!oldest) break;
-      this.artifacts.delete(oldest);
+      const artifact = this.artifacts.get(oldest);
+      if (artifact) await this.deleteArtifact(oldest, artifact);
     }
+    if (this.closing) throw new YifangyunError("Evidence registry is closing.", { code: "YFY_EVIDENCE_REGISTRY_CLOSED", phase: "evidence_resource" });
     const token = crypto.randomBytes(24).toString("hex");
     this.artifacts.set(token, { ...input, expiresAtMs: this.ttlSeconds > 0 ? Date.now() + this.ttlSeconds * 1000 : Number.MAX_SAFE_INTEGER });
     return `yfy://evidence/${token}`;
@@ -42,14 +49,17 @@ export class EvidenceArtifactRegistry {
   async read(token: string): Promise<{ blob: string; mimeType?: string; name: string }> {
     const artifact = this.artifacts.get(token);
     if (!artifact || artifact.expiresAtMs <= Date.now()) {
-      this.artifacts.delete(token);
+      if (artifact) await this.deleteArtifact(token, artifact);
       throw new YifangyunError("Evidence artifact is unavailable or expired.", { code: "YFY_EVIDENCE_ARTIFACT_NOT_FOUND", phase: "evidence_resource" });
     }
     let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
     try {
+      const pathStat = await fs.lstat(artifact.path);
+      if (pathStat.isSymbolicLink()) throw new Error("Evidence artifact path must not be a symbolic link.");
       handle = await fs.open(artifact.path, "r");
       const stat = await handle.stat();
       if (!stat.isFile()) throw new Error("Evidence artifact path is not a file.");
+      if (stat.size !== artifact.expectedSize) throw new Error("Evidence artifact size changed after registration.");
       if (stat.size > this.maxResourceBytes) {
         throw new YifangyunError("Evidence artifact exceeds the MCP resource size limit.", {
           code: "YFY_EVIDENCE_RESOURCE_TOO_LARGE",
@@ -65,26 +75,67 @@ export class EvidenceArtifactRegistry {
         if (result.bytesRead === 0) break;
         offset += result.bytesRead;
       }
-      return { blob: content.subarray(0, offset).toString("base64"), ...(artifact.mimeType ? { mimeType: artifact.mimeType } : {}), name: artifact.name };
+      const bytes = content.subarray(0, offset);
+      if (crypto.createHash("sha256").update(bytes).digest("hex") !== artifact.expectedSha256) throw new Error("Evidence artifact hash changed after registration.");
+      return { blob: bytes.toString("base64"), ...(artifact.mimeType ? { mimeType: artifact.mimeType } : {}), name: artifact.name };
     } catch (error) {
       if (error instanceof YifangyunError) throw error;
-      this.artifacts.delete(token);
-      throw new YifangyunError("Evidence artifact file is unavailable.", { code: "YFY_EVIDENCE_ARTIFACT_NOT_FOUND", phase: "evidence_resource" });
+      await handle?.close().catch(() => undefined);
+      handle = undefined;
+      await this.deleteArtifact(token, artifact);
+      throw new YifangyunError("Evidence artifact integrity verification failed.", { code: "YFY_EVIDENCE_ARTIFACT_INTEGRITY_FAILED", phase: "evidence_resource" });
     } finally {
       await handle?.close().catch(() => undefined);
     }
   }
 
-  close(): void {
-    clearInterval(this.cleanupTimer);
-    this.artifacts.clear();
+  async release(resourceUriOrToken: string): Promise<boolean> {
+    const token = resourceUriOrToken.startsWith("yfy://evidence/") ? resourceUriOrToken.slice("yfy://evidence/".length) : resourceUriOrToken;
+    const artifact = this.artifacts.get(token);
+    if (!artifact) return false;
+    await this.deleteArtifact(token, artifact, "YFY_EVIDENCE_RELEASE_FAILED", "evidence_release");
+    return true;
   }
 
-  private pruneExpired(now = Date.now(), force = false): void {
+  async close(): Promise<void> {
+    this.closing = true;
+    clearInterval(this.cleanupTimer);
+    const failures: string[] = [];
+    await Promise.all([...this.artifacts].map(async ([token, artifact]) => {
+      try {
+        await this.deleteArtifact(token, artifact);
+      } catch {
+        failures.push(token);
+      }
+    }));
+    if (failures.length > 0) {
+      throw new YifangyunError("One or more evidence artifacts could not be deleted during shutdown.", {
+        code: "YFY_EVIDENCE_CLEANUP_FAILED",
+        phase: "evidence_shutdown",
+        details: { failure_count: failures.length }
+      });
+    }
+  }
+
+  private async deleteArtifact(token: string, artifact: EvidenceArtifact, code = "YFY_EVIDENCE_CLEANUP_FAILED", phase = "evidence_cleanup"): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await fs.rm(artifact.path, { force: true });
+        if (this.artifacts.get(token) === artifact) this.artifacts.delete(token);
+        return;
+      } catch (error) {
+        const retryable = Boolean(error && typeof error === "object" && "code" in error && (error.code === "EPERM" || error.code === "EBUSY"));
+        if (!retryable || attempt === 2) throw new YifangyunError("Evidence artifact could not be deleted.", { code, phase, retryable });
+        await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)));
+      }
+    }
+  }
+
+  private async pruneExpired(now = Date.now(), force = false): Promise<void> {
     if (!force && now - this.lastPruneAtMs < 1000) return;
     this.lastPruneAtMs = now;
     for (const [token, artifact] of this.artifacts) {
-      if (artifact.expiresAtMs <= now) this.artifacts.delete(token);
+      if (artifact.expiresAtMs <= now) await this.deleteArtifact(token, artifact).catch(() => undefined);
     }
   }
 }
