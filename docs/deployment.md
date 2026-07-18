@@ -116,4 +116,4 @@ git push origin HEAD
 git push origin v1.0.0-beta.10
 ```
 
-Action 会依次执行 `npm ci`、build、单元/集成测试、Inventory 性能测试和 `npm pack --dry-run`。预发布版本以 npm dist-tag `next` 发布，并创建 GitHub prerelease；正式版本使用 `latest`。npm publish 使用 GitHub Actions OIDC Trusted Publishing，不注入长期 npm token，provenance 由 npm 自动生成；本地不直接运行 `npm publish`。
+Action 会依次执行 `npm ci`、build、单元/集成测试、Inventory 性能测试和 `npm pack --dry-run`。预发布版本以 npm dist-tag `next` 发布，并创建 GitHub prerelease；正式版本使用 `latest`。npm publish 使用仓库配置的 granular `NPM_TOKEN`，并通过 GitHub OIDC 生成 provenance；本地不直接运行 `npm publish`。

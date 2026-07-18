@@ -24,9 +24,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: "24"
-
-      - name: Setup npm for Trusted Publishing
-        run: npm install --global npm@11.5.1
+          registry-url: "https://registry.npmjs.org"
 
       - name: Verify tag matches package version
         shell: bash
@@ -96,7 +94,9 @@ jobs:
           fi
 
       - name: Publish to npm
-        run: npm publish --tag "${{ steps.dist-tag.outputs.name }}"
+        run: npm publish --provenance --tag "${{ steps.dist-tag.outputs.name }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
