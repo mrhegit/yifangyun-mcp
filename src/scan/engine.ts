@@ -53,13 +53,17 @@ export class ScopeScanEngine {
     rootFolderId: IdLike;
     signal?: AbortSignal;
     userId?: IdLike;
+    workspaceFingerprint?: string;
+    workspaceId?: string;
+    workspaceRef?: string;
   }): Promise<{ reuseReason: "fresh_complete" | "running_join" | "new"; reused: boolean; state: ScopeScanState }> {
     const policyHash = digest(input.policy);
     const rootFolderId = String(input.rootFolderId);
-    const startLockKey = `start:${digest({ accessIdentityRef: input.accessIdentityRef, policyHash, rootFolderId })}`;
+    const effectiveWorkspaceFingerprint = input.workspaceFingerprint ?? digest({ accessIdentityRef: input.accessIdentityRef, rootFolderId });
+    const startLockKey = `start:${digest({ policyHash, workspaceFingerprint: effectiveWorkspaceFingerprint })}`;
     return this.store.withLock(startLockKey, async () => {
       await this.store.pruneExpired();
-      const reusable = input.forceRefresh ? undefined : await this.store.findReusable(input.accessIdentityRef, rootFolderId, policyHash, Date.now() - (input.maxAgeSeconds ?? 300) * 1000);
+      const reusable = input.forceRefresh ? undefined : await this.store.findReusable(effectiveWorkspaceFingerprint, policyHash, Date.now() - (input.maxAgeSeconds ?? 300) * 1000);
       if (reusable) {
         return { reuseReason: reusable.status === "complete" ? "fresh_complete" : "running_join", reused: true, state: reusable };
       }
@@ -71,6 +75,7 @@ export class ScopeScanEngine {
         accessContextId: input.accessContextId,
         accessIdentityRef: input.accessIdentityRef,
         artifactToken: crypto.randomBytes(16).toString("hex"),
+        commitWatermark: 0,
         createdAt: now,
         expiresAt: this.store.makeExpiry(),
         ...(input.externalEnterpriseId !== undefined ? { externalEnterpriseId: String(input.externalEnterpriseId) } : {}),
@@ -85,12 +90,16 @@ export class ScopeScanEngine {
         policyHash,
         receiptDigest: digest([]),
         revision: 0,
+        retryCount: 0,
         rootFolder: observed.folder,
         rootFolderId,
         rootObservationDigest: digest(observed.folder),
         scanId,
         status: "running",
-        updatedAt: now
+        updatedAt: now,
+        workspaceFingerprint: effectiveWorkspaceFingerprint,
+        workspaceId: input.workspaceId ?? "internal",
+        workspaceRef: input.workspaceRef ?? "workspace:internal"
       };
       await this.store.create(state, [{ attempt: 0, depth: 0, folderId: rootFolderId, pageId: 0, pathDisplay: rootName }]);
       return { reuseReason: "new", reused: false, state };
@@ -120,7 +129,7 @@ export class ScopeScanEngine {
             suggestedAction: "Call yfy_inventory_get and retry with the latest inventory state."
         });
       }
-      if (["cancelled", "complete", "failed", "expired"].includes(state.status)) {
+      if (["cancelled", "complete", "failed"].includes(state.status)) {
         return state;
       }
       if (state.status === "partial" && state.frontierCount === 0) {
@@ -129,6 +138,7 @@ export class ScopeScanEngine {
       state.incompleteReasons = state.incompleteReasons.filter((reason) => !["CLIENT_CANCELLED_STEP", "PERMISSION_CHANGED_OR_DENIED", "PROVIDER_STEP_FAILED"].includes(reason));
       delete state.lastError;
       state.status = "running";
+      delete state.nextRetryAt;
       const startedAt = Date.now();
       const deadline = AbortSignal.timeout(Math.max(1, input.maxWallMs));
       const requestSignal = input.signal ? AbortSignal.any([input.signal, deadline]) : deadline;
@@ -136,7 +146,7 @@ export class ScopeScanEngine {
       let processedPages = 0;
       while (state.frontierCount > 0 && processedPages < input.maxPages && Date.now() - startedAt < input.maxWallMs) {
         if (input.signal?.aborted) {
-          state.status = "paused_retryable";
+          state.status = "retry_wait";
           addReason(state, "CLIENT_CANCELLED_STEP");
           state.revision += 1;
           state.updatedAt = new Date().toISOString();
@@ -176,23 +186,23 @@ export class ScopeScanEngine {
             const error = result.reason;
             const yfyError = error instanceof YifangyunError ? error : undefined;
             if (input.signal?.aborted) {
-              state.status = "paused_retryable";
+              state.status = "retry_wait";
               addReason(state, "CLIENT_CANCELLED_STEP");
             } else if (deadline.aborted) {
-              state.status = "paused_retryable";
+              state.status = "retry_wait";
               addReason(state, "PROVIDER_STEP_FAILED");
             } else if (yfyError?.code === "YFY_PERMISSION_DENIED") {
               state.status = "partial";
               addReason(state, "PERMISSION_CHANGED_OR_DENIED");
             } else if (yfyError?.retryable ?? true) {
-              state.status = "paused_retryable";
+              state.status = "retry_wait";
               addReason(state, "PROVIDER_STEP_FAILED");
             } else {
               state.status = "failed";
               addReason(state, "PROVIDER_TERMINAL_FAILURE");
             }
             metrics.increment("snapshot_incomplete_total", { reason: state.incompleteReasons.at(-1) ?? "provider_step_failed" });
-            state.lastError = { code: yfyError?.code ?? "YFY_INVENTORY_PROVIDER_FAILURE", message: error instanceof Error ? error.message : String(error) };
+            state.lastError = { code: yfyError?.code ?? "YFY_INVENTORY_PROVIDER_FAILURE", message: error instanceof Error ? error.message : String(error), retryable: yfyError?.retryable ?? true, ...(yfyError?.phase ? { phase: yfyError.phase } : {}), ...(yfyError?.statusCode !== undefined || yfyError?.details?.api_code || yfyError?.details?.request_id ? { provider: { ...(yfyError?.statusCode !== undefined ? { status_code: yfyError.statusCode } : {}), ...(typeof yfyError?.details?.api_code === "string" ? { code: yfyError.details.api_code } : {}), ...(typeof yfyError?.details?.request_id === "string" ? { request_id: yfyError.details.request_id } : {}) } } : {}) };
             state.revision += 1;
             state.updatedAt = new Date().toISOString();
             await this.store.save(state);
@@ -336,6 +346,7 @@ export class ScopeScanEngine {
           };
           nextState.receiptDigest = digest({ previous: nextState.receiptDigest, response: artifact.receipt.responseDigest });
           nextState.pageReceiptCount += 1;
+          nextState.commitWatermark = nextState.pageReceiptCount;
           metrics.increment("snapshot_pages_total");
           processedPages += 1;
           nextState.observationUpdatedAt = observedAt;
@@ -359,9 +370,9 @@ export class ScopeScanEngine {
           finalRoot = await this.provider.getRoot(state.rootFolderId, input.userId, finalSignal);
         } catch (error) {
           const yfyError = error instanceof YifangyunError ? error : undefined;
-          state.status = input.signal?.aborted ? "paused_retryable" : yfyError?.code === "YFY_PERMISSION_DENIED" ? "partial" : yfyError?.retryable !== false || finalDeadline.aborted ? "paused_retryable" : "failed";
+          state.status = input.signal?.aborted ? "retry_wait" : yfyError?.code === "YFY_PERMISSION_DENIED" ? "partial" : yfyError?.retryable !== false || finalDeadline.aborted ? "retry_wait" : "failed";
           addReason(state, input.signal?.aborted ? "CLIENT_CANCELLED_STEP" : yfyError?.code === "YFY_PERMISSION_DENIED" ? "PERMISSION_CHANGED_OR_DENIED" : "PROVIDER_STEP_FAILED");
-          state.lastError = { code: yfyError?.code ?? "YFY_INVENTORY_PROVIDER_FAILURE", message: error instanceof Error ? error.message : String(error) };
+          state.lastError = { code: yfyError?.code ?? "YFY_INVENTORY_PROVIDER_FAILURE", message: error instanceof Error ? error.message : String(error), retryable: yfyError?.retryable ?? true, ...(yfyError?.phase ? { phase: yfyError.phase } : {}) };
           state.revision += 1;
           state.updatedAt = new Date().toISOString();
           await this.store.save(state);
@@ -396,7 +407,7 @@ export class ScopeScanEngine {
       if (expectedRevision !== undefined && state.revision !== expectedRevision) {
         throw new YifangyunError("Inventory revision conflict.", { code: "YFY_INVENTORY_REVISION_CONFLICT", scanId });
       }
-      if (["complete", "partial", "cancelled", "failed", "expired"].includes(state.status)) return state;
+    if (["complete", "partial", "cancelled", "failed"].includes(state.status)) return state;
       state.status = "cancelled";
       state.expiresAt = this.store.makeExpiry();
       state.revision += 1;
@@ -409,11 +420,11 @@ export class ScopeScanEngine {
   async fail(scanId: string, error: unknown): Promise<ScopeScanState> {
     return this.store.withLock(scanId, async () => {
       const state = await this.store.load(scanId);
-      if (["cancelled", "complete", "failed", "partial", "expired"].includes(state.status)) return state;
+      if (["cancelled", "complete", "failed", "partial"].includes(state.status)) return state;
       const yfyError = error instanceof YifangyunError ? error : undefined;
       state.status = "failed";
       state.expiresAt = this.store.makeExpiry();
-      state.lastError = { code: yfyError?.code ?? "YFY_INVENTORY_WORKER_FAILED", message: error instanceof Error ? error.message : String(error) };
+      state.lastError = { code: yfyError?.code ?? "YFY_INVENTORY_WORKER_FAILED", message: error instanceof Error ? error.message : String(error), retryable: yfyError?.retryable ?? false, ...(yfyError?.phase ? { phase: yfyError.phase } : {}) };
       addReason(state, "SNAPSHOT_WORKER_FAILED");
       state.revision += 1;
       state.updatedAt = new Date().toISOString();
@@ -422,10 +433,10 @@ export class ScopeScanEngine {
     });
   }
 
-  async search(scanId: string, queries: string[], type: "file" | "folder" | "all", cursor: ScopeItemCursor | undefined, limit: number): Promise<ScopeItemPage> {
+  async search(scanId: string, queries: string[], matchFields: Array<"name" | "path">, caseSensitive: boolean, type: "file" | "folder" | "all", cursor: ScopeItemCursor | undefined, limit: number, watermark: number): Promise<ScopeItemPage> {
     const state = await this.store.load(scanId);
     const normalizedQueries = queries
-      .map((query) => ({ normalized: normalizeText(query, state.policy.caseSensitive), original: query }))
+      .map((query) => ({ normalized: normalizeText(query, caseSensitive), original: query }))
       .filter((query) => Boolean(query.normalized));
     const itemCount = state.fileCount + state.folderCount;
     if (itemCount > 100_000 && normalizedQueries.some((query) => Array.from(query.normalized).length < 3)) {
@@ -444,7 +455,7 @@ export class ScopeScanEngine {
         suggestedAction: "Split the query set into smaller batches."
       });
     }
-    if (itemCount > 100_000 && state.policy.caseSensitive) {
+    if (itemCount > 100_000 && caseSensitive) {
       throw new YifangyunError("Case-sensitive search is disabled for large inventories.", {
         code: "YFY_INVENTORY_CASE_SENSITIVE_QUERY_TOO_LARGE",
         details: { item_count: itemCount },
@@ -452,11 +463,11 @@ export class ScopeScanEngine {
         suggestedAction: "Create a case-insensitive inventory for indexed large-space search."
       });
     }
-    return this.store.searchItems(scanId, normalizedQueries, state.policy.matchFields, type, cursor, limit, state.policy.caseSensitive);
+    return this.store.searchItems(scanId, normalizedQueries, matchFields, type, cursor, limit, caseSensitive, watermark);
   }
 
-  async listItems(scanId: string, type: "file" | "folder" | "all", cursor: ScopeItemCursor | undefined, limit: number): Promise<ScopeItemPage> {
-    return this.store.listItems(scanId, type, cursor, limit);
+  async listItems(scanId: string, type: "file" | "folder" | "all", cursor: ScopeItemCursor | undefined, limit: number, watermark: number): Promise<ScopeItemPage> {
+    return this.store.listItems(scanId, type, cursor, limit, watermark);
   }
 
   summary(state: ScopeScanState): JsonObject {
@@ -465,8 +476,7 @@ export class ScopeScanEngine {
     return {
       inventory_id: state.scanId,
       status: state.status,
-      access_context: state.accessContextId,
-      root_folder_id: state.rootFolderId,
+      workspace: { ref: state.workspaceRef, root_folder_id: state.rootFolderId, access_context: state.accessContextId, fingerprint: state.workspaceFingerprint },
       scanned_file_count: state.fileCount,
       scanned_folder_count: state.folderCount,
       page_receipt_count: state.pageReceiptCount,
@@ -477,39 +487,46 @@ export class ScopeScanEngine {
         consistency_level: paginationComplete ? "best_effort_complete_observation" : "partial_observation",
         incomplete_reasons: state.incompleteReasons
       },
-      terminal: ["complete", "partial", "cancelled", "failed", "expired"].includes(state.status),
+      terminal: ["complete", "partial", "cancelled", "failed"].includes(state.status),
       limits: { max_item_depth: state.policy.maxItemDepth, max_items: state.policy.maxItems },
       observation_window: { started_at: state.observationStartedAt, updated_at: state.observationUpdatedAt },
       created_at: state.createdAt,
       updated_at: state.updatedAt,
       expires_at: state.expiresAt,
-      manifest_uri: `yfy://inventory/${state.scanId}/${state.artifactToken}/${state.accessContextId}/manifest`
+      checkpoint: { commit_watermark: state.commitWatermark, control_revision: state.revision, remaining_frontier_count: state.frontierCount },
+      diagnostics: { retry_count: state.retryCount, ...(state.nextRetryAt ? { next_retry_at: state.nextRetryAt } : {}), ...(state.lastError ? { last_error: state.lastError } : {}), incomplete_reasons: state.incompleteReasons },
+      manifest_uri: `yfy://inventory/${state.scanId}/${state.artifactToken}/${state.accessContextId}/manifest`,
+      receipts_uri_template: `yfy://inventory/${state.scanId}/${state.artifactToken}/${state.accessContextId}/receipts/{page}`
     };
   }
 
   async manifest(scanId: string): Promise<JsonObject> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const state = await this.store.load(scanId);
-      const receiptSummary = await this.store.listReceiptSummary(scanId, 100);
       const after = await this.store.load(scanId);
       if (after.revision === state.revision) {
         const summary = this.summary(state);
         return {
           ...summary,
-          checkpoint: { revision: state.revision, remaining_frontier_count: state.frontierCount },
-          ...(state.lastError ? { last_error: state.lastError } : {}),
           observation_digest: digest({ receipt_digest: state.receiptDigest, snapshot: summary }),
           policy: projectInventoryPolicy(state.policy),
-          receipt_summary: {
-            total_count: receiptSummary.total,
-            included_count: receiptSummary.receipts.length,
-            truncated: receiptSummary.total > receiptSummary.receipts.length
-          },
-          receipts: receiptSummary.receipts.map(projectInventoryReceipt),
+          receipt_summary: { total_count: state.pageReceiptCount, inline_count: 0, receipts_uri_template: `yfy://inventory/${state.scanId}/${state.artifactToken}/${state.accessContextId}/receipts/{page}` },
           root_folder: state.rootFolder
         };
       }
     }
     throw new YifangyunError("Inventory is changing too quickly to build a consistent manifest.", { code: "YFY_INVENTORY_MANIFEST_BUSY", phase: "inventory_manifest", retryable: true, scanId });
+  }
+
+  async scheduleRetry(scanId: string, retryCount: number, nextRetryAt: string): Promise<ScopeScanState> {
+    return this.store.withLock(scanId, async () => {
+      const state = await this.store.load(scanId);
+      if (state.status !== "retry_wait") return state;
+      state.retryCount = retryCount;
+      state.nextRetryAt = nextRetryAt;
+      state.updatedAt = new Date().toISOString();
+      await this.store.save(state);
+      return state;
+    });
   }
 }

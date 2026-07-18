@@ -54,7 +54,7 @@ test("default catalog exposes the current tools and schemas", async () => {
     const expected = [
       "yfy_browse", "yfy_capture", "yfy_comments", "yfy_department_children", "yfy_department_get", "yfy_department_users",
       "yfy_get", "yfy_get_many", "yfy_group_list", "yfy_group_users", "yfy_inventory_cancel", "yfy_inventory_create",
-      "yfy_inventory_get", "yfy_inventory_search", "yfy_membership_check", "yfy_open", "yfy_resolve", "yfy_resource_release",
+      "yfy_inventory_get", "yfy_inventory_release", "yfy_inventory_search", "yfy_membership_check", "yfy_open", "yfy_resolve", "yfy_resource_release",
       "yfy_search", "yfy_shares", "yfy_status", "yfy_user_search", "yfy_versions", "yfy_workspace_validate"
     ];
     assert.deepEqual([...server.tools.keys()].sort(), expected);
@@ -63,11 +63,12 @@ test("default catalog exposes the current tools and schemas", async () => {
     }
     assert.ok((server.tools.get("yfy_status")!.definition.outputSchema as Record<string, unknown>).places);
     assert.ok(server.tools.get("yfy_inventory_search")!.definition.outputSchema);
-    const inventoryInput = server.tools.get("yfy_inventory_search")!.definition.inputSchema as Record<string, unknown>;
-    assert.ok(inventoryInput.cursor);
-    assert.deepEqual(Object.keys(server.tools.get("yfy_inventory_create")!.definition.inputSchema as Record<string, unknown>).sort(), ["freshness", "max_item_depth", "max_items", "workspace"]);
+    const inventoryInput = server.tools.get("yfy_inventory_search")!.definition.inputSchema as { shape: Record<string, unknown> };
+    assert.ok(inventoryInput.shape.request);
+    assert.deepEqual(Object.keys(server.tools.get("yfy_inventory_create")!.definition.inputSchema as Record<string, unknown>).sort(), ["limits", "refresh", "workspace"]);
     assert.equal((server.tools.get("yfy_inventory_create")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
     assert.equal((server.tools.get("yfy_inventory_cancel")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
+    assert.equal((server.tools.get("yfy_inventory_release")!.definition.annotations as { destructiveHint: boolean }).destructiveHint, true);
     assert.equal((server.tools.get("yfy_capture")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, true);
   } finally {
     await runtime.close();
@@ -117,7 +118,7 @@ test("drive tools are absent when the drive toolset is disabled", async () => {
     assert.ok(server.tools.has("yfy_capture"));
     assert.ok(server.tools.has("yfy_resource_release"));
     assert.ok(!server.tools.has("yfy_get"));
-    assert.ok(!server.tools.has("yfy_status"));
+    assert.ok(server.tools.has("yfy_status"));
   } finally {
     await runtime.close();
   }
@@ -130,6 +131,7 @@ test("organization tools can be enabled without the drive toolset", async () => 
     registerCatalog(server as unknown as McpServer, runtime);
     assert.ok(server.tools.has("yfy_department_get"));
     assert.ok(server.tools.has("yfy_user_search"));
+    assert.ok(server.tools.has("yfy_status"));
     assert.ok(!server.tools.has("yfy_get"));
   } finally {
     await runtime.close();

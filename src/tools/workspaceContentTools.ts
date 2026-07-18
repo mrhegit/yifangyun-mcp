@@ -4,12 +4,12 @@ import { z } from "zod";
 import { YifangyunError } from "../client.js";
 import { normalizeFileVersions, selectFileVersion, versionSelectionProof, type EvidenceDownloadStrategy, type FileVersion, type VersionSelector } from "../domain/fileVersions.js";
 import { idValue, objectValue, projectDepartment, projectItem, provenance } from "../domain/projectors.js";
-import { parseItemRef, parseVersionRef } from "../domain/refs.js";
+import { formatItemRef, formatVersionRef, parseItemRef, parseVersionRef } from "../domain/refs.js";
 import { metrics } from "../observability.js";
 import type { AppRuntime } from "../runtime/runtime.js";
 import type { JsonObject } from "../types.js";
 import { registerTool } from "./tooling.js";
-import { FileRefSchema, FileVersionSchema, ItemSchema, PathEntrySchema, PlaceRefSchema, ProvenanceSchema, VerificationStatusSchema, VersionRefSchema, VersionSelectionProofSchema } from "./schemas.js";
+import { CheckStatusSchema, FileRefSchema, FileVersionSchema, FolderRefSchema, ItemSchema, PathEntrySchema, ProvenanceSchema, VerificationStatusSchema, VersionRefSchema, VersionSelectionProofSchema, WorkspaceRefSchema } from "./schemas.js";
 
 function progressReporter(extra: { _meta?: { progressToken?: string | number }; sendNotification: (notification: unknown) => Promise<void>; signal: AbortSignal }) {
   const progressToken = extra._meta?.progressToken;
@@ -26,7 +26,9 @@ function progressReporter(extra: { _meta?: { progressToken?: string | number }; 
   };
 }
 
-function inScope(file: JsonObject, rootFolderId: string): { ancestorIds: string[]; matched: boolean } {
+type MembershipStatus = "inside" | "outside" | "unavailable";
+
+function membershipProof(file: JsonObject, rootFolder: JsonObject, rootFolderId: string): { ancestorIds: string[]; status: MembershipStatus } {
   const chain = Array.isArray(file.provider_path_chain) ? file.provider_path_chain : [];
   const ancestorIds = chain.flatMap((entry) => {
     if (typeof entry === "object" && entry !== null && !Array.isArray(entry) && typeof entry.id === "string") {
@@ -34,7 +36,16 @@ function inScope(file: JsonObject, rootFolderId: string): { ancestorIds: string[
     }
     return [];
   });
-  return { ancestorIds, matched: ancestorIds.includes(rootFolderId) || file.parent_folder_id === rootFolderId };
+  if (ancestorIds.includes(rootFolderId) || file.parent_folder_id === rootFolderId) return { ancestorIds, status: "inside" };
+  const fileSpaceId = objectValue(file.space)?.id;
+  const rootSpaceId = objectValue(rootFolder.space)?.id;
+  if ((typeof fileSpaceId === "string" || typeof fileSpaceId === "number") && (typeof rootSpaceId === "string" || typeof rootSpaceId === "number") && String(fileSpaceId) !== String(rootSpaceId)) return { ancestorIds, status: "outside" };
+  return { ancestorIds, status: "unavailable" };
+}
+
+function canDowngradeCheckToUnavailable(error: unknown, signal: AbortSignal): boolean {
+  if (signal.aborted) return false;
+  return error instanceof YifangyunError && error.code === "YFY_PROVIDER_HTTP_ERROR" && [400, 404, 422].includes(error.statusCode ?? 0);
 }
 
 function workspaceRelativeAncestors(file: JsonObject, rootFolderId: string): JsonObject[] {
@@ -98,7 +109,7 @@ async function attachEvidenceArtifact(runtime: AppRuntime, evidence: JsonObject)
   const mediaType = normalizedMediaType(evidence.content_type, evidence.detected_content_type);
   const detectedMediaType = normalizeSingleMediaType(evidence.detected_content_type);
   const common: JsonObject = {
-    file: `file:${String(evidence.file_id)}`,
+    file: String(evidence.file_ref),
     file_name: String(evidence.file_name),
     sha1: String(evidence.sha1),
     sha256: String(evidence.sha256),
@@ -154,14 +165,28 @@ function assertEvidenceAnchors(file: JsonObject, requireAncestry: boolean): void
   }
 }
 
-async function getScopedFile(runtime: AppRuntime, fileId: string, scopeId: string, signal?: AbortSignal) {
-  const scope = runtime.access.resolveScope(scopeId);
-  const response = await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(fileId)}/info_v2`, scope.context.id, scope.context.externalEnterpriseId
-    ? { external_enterprise_id: scope.context.externalEnterpriseId }
-    : {}, signal);
+async function getScopedFile(runtime: AppRuntime, fileRef: string, workspaceRef: string, signal?: AbortSignal) {
+  const item = parseItemRef(fileRef);
+  if (item.type !== "file") throw new YifangyunError("A file ref is required.", { code: "YFY_INPUT_INVALID", phase: "workspace_membership" });
+  const scope = runtime.access.resolveWorkspaceRef(workspaceRef);
+  if (item.accessContextId !== scope.context.id || item.identityRef !== scope.identityRef) {
+    throw new YifangyunError("File and workspace refs belong to different access identities.", {
+      code: "YFY_REF_CONTEXT_CONFLICT",
+      phase: "workspace_membership",
+      suggestedAction: "Discover the file from the same workspace before checking or capturing it."
+    });
+  }
+  const fileId = item.id;
+  const [response, rootResponse] = await Promise.all([
+    runtime.gateway.getUser(`/v2/file/${encodeURIComponent(fileId)}/info_v2`, scope.context.id, scope.context.externalEnterpriseId
+      ? { external_enterprise_id: scope.context.externalEnterpriseId }
+      : {}, signal),
+    runtime.gateway.getUser(`/v2/folder/${encodeURIComponent(scope.scope.rootFolderId)}/info`, scope.context.id, {}, signal)
+  ]);
   const file = projectItem(response.data, "evidence");
-  const membership = inScope(file, scope.scope.rootFolderId);
-  return { file, membership, response, scope };
+  const rootFolder = projectItem(rootResponse.data, "evidence");
+  const membership = membershipProof(file, rootFolder, scope.scope.rootFolderId);
+  return { file, fileId, fileRef, membership, response, rootResponse, scope };
 }
 
 async function observeVersions(runtime: AppRuntime, fileId: string, accessContext: string, signal?: AbortSignal) {
@@ -169,7 +194,7 @@ async function observeVersions(runtime: AppRuntime, fileId: string, accessContex
   return { ...normalizeFileVersions(response.data), response };
 }
 
-async function downloadAttempt(runtime: AppRuntime, input: { accessContext: string; downloadSelector: number | string; externalEnterpriseId?: string; file: JsonObject; fileId: string; identityRef: string; onProgress?: (bytes: number, totalBytes?: number) => void; signal?: AbortSignal; strategy: EvidenceDownloadStrategy }) {
+async function downloadAttempt(runtime: AppRuntime, input: { accessContext: string; downloadSelector: number | string; externalEnterpriseId?: string; file: JsonObject; fileId: string; fileRef: string; identityRef: string; onProgress?: (bytes: number, totalBytes?: number) => void; signal?: AbortSignal; strategy: EvidenceDownloadStrategy }) {
   const ticket = await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(input.fileId)}/download_v2`, input.accessContext, {
     version: input.downloadSelector,
     external_enterprise_id: input.externalEnterpriseId
@@ -188,6 +213,7 @@ async function downloadAttempt(runtime: AppRuntime, input: { accessContext: stri
   return {
     evidence: {
       file_id: input.fileId,
+      file_ref: input.fileRef,
       file_name: downloaded.fileName,
       temp_path: downloaded.tempPath,
       sha1: downloaded.sha1,
@@ -206,6 +232,7 @@ async function downloadSelectedVersion(runtime: AppRuntime, input: {
   externalEnterpriseId?: string;
   file: JsonObject;
   fileId: string;
+  fileRef: string;
   identityRef: string;
   onProgress?: (bytes: number, totalBytes?: number) => void;
   selected: FileVersion;
@@ -230,6 +257,7 @@ async function downloadSelectedVersion(runtime: AppRuntime, input: {
         externalEnterpriseId: input.externalEnterpriseId,
         file: input.file,
         fileId: input.fileId,
+        fileRef: input.fileRef,
         identityRef: input.identityRef,
         onProgress: input.onProgress,
         signal: input.signal,
@@ -292,101 +320,137 @@ export function registerWorkspaceContentTools(server: McpServer, runtime: AppRun
 function registerAuthorityTools(server: McpServer, runtime: AppRuntime): void {
   registerTool(server, "yfy_workspace_validate", {
     title: "Validate Yifangyun Workspace",
-    description: "Validate one configured workspace, its folder metadata, business path and first/last page reachability.",
-    inputSchema: { workspace: z.string().trim().min(1), expected_path: z.array(z.string().trim().min(1)).optional() },
-    outputSchema: { workspace: z.object({ id: z.string(), ref: PlaceRefSchema, root_folder_id: z.string(), tags: z.array(z.string()) }), folder: ItemSchema.extend({ ref: z.string().regex(/^folder:\d+$/) }), business_path: z.array(z.string()), department_chain: z.array(z.record(z.unknown())), checks: z.record(z.unknown()), valid: z.boolean(), provenance: z.array(z.record(z.unknown())) }
+    description: "Validate one configured workspace with explicit pass, fail, or unavailable checks.",
+    inputSchema: { workspace: WorkspaceRefSchema, expected_path: z.array(z.string().trim().min(1)).optional() },
+    outputSchema: {
+      workspace: z.object({ ref: WorkspaceRefSchema, root: FolderRefSchema, access_context: z.string(), tags: z.array(z.string()) }).strict(),
+      folder: ItemSchema.extend({ ref: FolderRefSchema }),
+      business_path: z.array(z.string()),
+      department_chain: z.array(z.record(z.unknown())),
+      checks: z.object({ exists: CheckStatusSchema, not_deleted: CheckStatusSchema, first_page_reachable: CheckStatusSchema, last_page_reachable: CheckStatusSchema, department_chain_complete: CheckStatusSchema, expected_path_matches: CheckStatusSchema.optional() }).strict(),
+      verdict: z.enum(["valid", "invalid", "unavailable"]),
+      provenance: z.array(ProvenanceSchema)
+    }
   }, { readOnly: true }, async ({ workspace, expected_path }, extra) => {
-    const resolved = runtime.access.resolveScope(String(workspace));
+    const workspaceRef = String(workspace);
+    const resolved = runtime.access.resolveWorkspaceRef(workspaceRef);
     const folderResponse = await runtime.gateway.getUser(`/v2/folder/${encodeURIComponent(resolved.scope.rootFolderId)}/info`, resolved.context.id, {}, extra.signal);
     const folder = projectItem(folderResponse.data, "evidence");
     const source = objectValue(folderResponse.data) ?? {};
     const space = objectValue(source.space);
     const departments: JsonObject[] = [];
+    const observations: JsonObject[] = [provenance(folderResponse.meta, resolved.context.id, "workspace_root_metadata")];
     const seen = new Set<string>();
     let departmentId = idValue(space?.id);
+    let departmentChainComplete: "pass" | "unavailable" = departmentId ? "pass" : "unavailable";
     while (departmentId && departmentId !== "0" && !seen.has(departmentId) && departments.length < 50) {
       seen.add(departmentId);
-      const response = await runtime.gateway.getEnterprise(`/v2/admin/department/${encodeURIComponent(departmentId)}/info`, {}, extra.signal);
-      const department = projectDepartment(response.data);
-      departments.unshift(department);
-      departmentId = typeof department.parent_id === "string" ? department.parent_id : undefined;
+      try {
+        const response = await runtime.gateway.getEnterprise(`/v2/admin/department/${encodeURIComponent(departmentId)}/info`, {}, extra.signal);
+        observations.push(provenance(response.meta, resolved.context.id, "workspace_department_metadata"));
+        const department = projectDepartment(response.data);
+        departments.unshift(department);
+        departmentId = typeof department.parent_id === "string" ? department.parent_id : undefined;
+        if (!departmentId) departmentChainComplete = "unavailable";
+      } catch (error) {
+        if (!canDowngradeCheckToUnavailable(error, extra.signal)) throw error;
+        departmentChainComplete = "unavailable";
+        break;
+      }
     }
+    if ((departmentId && seen.has(departmentId)) || departments.length >= 50) departmentChainComplete = "unavailable";
     const firstPage = await runtime.gateway.getUser(`/v2/folder/${encodeURIComponent(resolved.scope.rootFolderId)}/children`, resolved.context.id, { type: "all", page_id: 0, page_capacity: 1 }, extra.signal);
+    observations.push(provenance(firstPage.meta, resolved.context.id, "workspace_first_page"));
     const firstSource = objectValue(firstPage.data) ?? {};
     const pageCount = typeof firstSource.page_count === "number" ? firstSource.page_count : undefined;
+    let lastPageReachable: "pass" | "unavailable" = pageCount === undefined ? "unavailable" : "pass";
     if (pageCount && pageCount > 1) {
-      await runtime.gateway.getUser(`/v2/folder/${encodeURIComponent(resolved.scope.rootFolderId)}/children`, resolved.context.id, { type: "all", page_id: pageCount - 1, page_capacity: 1 }, extra.signal);
+      try {
+        const lastPage = await runtime.gateway.getUser(`/v2/folder/${encodeURIComponent(resolved.scope.rootFolderId)}/children`, resolved.context.id, { type: "all", page_id: pageCount - 1, page_capacity: 1 }, extra.signal);
+        observations.push(provenance(lastPage.meta, resolved.context.id, "workspace_last_page"));
+      } catch (error) {
+        if (!canDowngradeCheckToUnavailable(error, extra.signal)) throw error;
+        lastPageReachable = "unavailable";
+      }
     }
     const businessPath = [...departments.map((entry) => String(entry.name ?? "")), String(folder.name ?? "")].filter(Boolean);
     const expected = Array.isArray(expected_path) ? expected_path.map(String) : undefined;
-    const checks: JsonObject = {
-      exists: typeof folder.id === "string",
-      not_deleted: folder.is_deleted !== true && folder.in_trash !== true,
-      first_page_reachable: true,
-      last_page_reachable: true,
-      expected_path_matches: !expected || JSON.stringify(businessPath.slice(-expected.length)) === JSON.stringify(expected)
+    const deletedKnown = typeof folder.is_deleted === "boolean" && typeof folder.in_trash === "boolean";
+    const pathComplete = departmentChainComplete === "pass" && typeof folder.name === "string";
+    const checks: Record<string, "pass" | "fail" | "unavailable"> = {
+      exists: typeof folder.id !== "string" ? "unavailable" : folder.id === resolved.scope.rootFolderId ? "pass" : "fail",
+      not_deleted: folder.is_deleted === true || folder.in_trash === true ? "fail" : deletedKnown ? "pass" : "unavailable",
+      first_page_reachable: "pass",
+      last_page_reachable: lastPageReachable,
+      department_chain_complete: departmentChainComplete,
+      ...(expected ? { expected_path_matches: !pathComplete ? "unavailable" : JSON.stringify(businessPath.slice(-expected.length)) === JSON.stringify(expected) ? "pass" : "fail" } : {})
     };
+    const verdict = Object.values(checks).includes("fail") ? "invalid" : Object.values(checks).includes("unavailable") ? "unavailable" : "valid";
+    const rootRef = formatItemRef("folder", resolved.scope.rootFolderId, resolved.context.id, resolved.identityRef);
     return {
-      workspace: { id: resolved.scope.id, ref: `workspace:${resolved.scope.id}`, root_folder_id: resolved.scope.rootFolderId, tags: resolved.scope.tags },
-      folder: { ...folder, ref: `folder:${resolved.scope.rootFolderId}` },
+      workspace: { ref: workspaceRef, root: rootRef, access_context: resolved.context.id, tags: resolved.scope.tags },
+      folder: { ...folder, ref: rootRef },
       business_path: businessPath,
       department_chain: departments,
       checks,
-      valid: Object.values(checks).every((value) => value === true),
-      provenance: [provenance(folderResponse.meta, resolved.context.id), provenance(firstPage.meta, resolved.context.id)]
+      verdict,
+      provenance: observations
     };
   });
 
   registerTool(server, "yfy_membership_check", {
     title: "Check Yifangyun Workspace Membership",
-    description: "Check whether a file belongs to a configured workspace. Assert mode returns a tool error when outside it.",
-    inputSchema: { file: FileRefSchema, workspace: z.string().trim().min(1), mode: z.enum(["query", "assert"]).default("query") },
-    outputSchema: { file: ItemSchema.extend({ ref: FileRefSchema }), workspace: z.object({ id: z.string(), ref: PlaceRefSchema, root_folder_id: z.string() }), in_workspace: z.boolean(), ancestor_folder_ids: z.array(z.string()), workspace_relative_ancestor_chain: z.array(PathEntrySchema), path_basis: z.literal("configured_workspace_root"), provenance: z.record(z.unknown()) }
+    description: "Check whether a context-bound file belongs to a configured workspace. Membership may be inside, outside, or unavailable.",
+    inputSchema: { file: FileRefSchema, workspace: WorkspaceRefSchema, mode: z.enum(["query", "assert"]).default("query") },
+    outputSchema: { file: ItemSchema.extend({ ref: FileRefSchema }), workspace: z.object({ ref: WorkspaceRefSchema, root: FolderRefSchema, access_context: z.string() }).strict(), membership: z.enum(["inside", "outside", "unavailable"]), ancestor_folders: z.array(FolderRefSchema), relative_ancestor_chain: z.array(PathEntrySchema), path_basis: z.literal("configured_workspace_root"), provenance: z.array(ProvenanceSchema) }
   }, { readOnly: true }, async ({ file, workspace, mode }, extra) => {
-    const item = parseItemRef(String(file));
-    const result = await getScopedFile(runtime, item.id, String(workspace), extra.signal);
-    metrics.increment("scope_assertion_total", { outcome: result.membership.matched ? "inside_scope" : "outside_scope" });
-    if (!result.membership.matched && mode === "assert") {
-      throw new YifangyunError("File is outside the configured workspace.", {
-        code: "YFY_WORKSPACE_MEMBERSHIP_FAILED",
-        agentDetails: { file_ref: String(file), file_id: item.id, workspace: String(workspace), root_folder_id: result.scope.scope.rootFolderId, observed_ancestor_folder_ids: result.membership.ancestorIds, reason: "outside_workspace" },
-        phase: "workspace_membership"
+    const result = await getScopedFile(runtime, String(file), String(workspace), extra.signal);
+    metrics.increment("scope_assertion_total", { outcome: `${result.membership.status}_scope` });
+    if (mode === "assert" && result.membership.status !== "inside") {
+      throw new YifangyunError(result.membership.status === "outside" ? "File is outside the configured workspace." : "Workspace membership could not be proven from Provider metadata.", {
+        code: result.membership.status === "outside" ? "YFY_WORKSPACE_MEMBERSHIP_FAILED" : "YFY_WORKSPACE_MEMBERSHIP_UNAVAILABLE",
+        agentDetails: { file_ref: String(file), workspace: String(workspace), root_folder_id: result.scope.scope.rootFolderId, observed_ancestor_folder_ids: result.membership.ancestorIds, membership: result.membership.status },
+        phase: "workspace_membership",
+        suggestedAction: result.membership.status === "unavailable" ? "Retry after the Provider exposes a complete ancestry chain." : undefined
       });
     }
+    const ancestorFolders = result.membership.ancestorIds.map((id) => formatItemRef("folder", id, result.scope.context.id, result.scope.identityRef));
     return {
       file: { ...result.file, ref: String(file) },
-      workspace: { id: result.scope.scope.id, ref: `workspace:${result.scope.scope.id}`, root_folder_id: result.scope.scope.rootFolderId },
-      in_workspace: result.membership.matched,
-      ancestor_folder_ids: result.membership.ancestorIds,
-      workspace_relative_ancestor_chain: workspaceRelativeAncestors(result.file, result.scope.scope.rootFolderId),
+      workspace: { ref: String(workspace), root: formatItemRef("folder", result.scope.scope.rootFolderId, result.scope.context.id, result.scope.identityRef), access_context: result.scope.context.id },
+      membership: result.membership.status,
+      ancestor_folders: ancestorFolders,
+      relative_ancestor_chain: workspaceRelativeAncestors(result.file, result.scope.scope.rootFolderId),
       path_basis: "configured_workspace_root",
-      provenance: provenance(result.response.meta, result.scope.context.id)
+      provenance: [provenance(result.response.meta, result.scope.context.id, "workspace_membership_file_metadata"), provenance(result.rootResponse.meta, result.scope.context.id, "workspace_membership_root_metadata")]
     };
   });
 }
 
 async function captureVersionContent(runtime: AppRuntime, input: {
-  accessContextId?: string;
   expected?: Record<string, unknown>;
-  fileId: string;
+  fileRef: string;
   onProgress?: (bytes: number, totalBytes?: number) => void;
-  scopeId?: string;
   selector: VersionSelector;
   signal?: AbortSignal;
+  workspaceRef?: string;
 }) {
-  const scopedBefore = input.scopeId ? await getScopedFile(runtime, input.fileId, input.scopeId, input.signal) : undefined;
-  const access = scopedBefore?.scope ?? runtime.gateway.context(input.accessContextId);
-  const beforeResponse = scopedBefore?.response ?? await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(input.fileId)}/info_v2`, access.context.id, access.context.externalEnterpriseId ? { external_enterprise_id: access.context.externalEnterpriseId } : {}, input.signal);
+  const item = parseItemRef(input.fileRef);
+  if (item.type !== "file") throw new YifangyunError("A file ref is required.", { code: "YFY_INPUT_INVALID", phase: "content_capture" });
+  const scopedBefore = input.workspaceRef ? await getScopedFile(runtime, input.fileRef, input.workspaceRef, input.signal) : undefined;
+  const access = scopedBefore?.scope ?? runtime.gateway.context(item.accessContextId);
+  if (access.identityRef !== item.identityRef) throw new YifangyunError("File reference belongs to a different configured identity.", { code: "YFY_REF_IDENTITY_MISMATCH", phase: "content_capture" });
+  const beforeResponse = scopedBefore?.response ?? await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(item.id)}/info_v2`, access.context.id, access.context.externalEnterpriseId ? { external_enterprise_id: access.context.externalEnterpriseId } : {}, input.signal);
   const before = scopedBefore?.file ?? projectItem(beforeResponse.data, "evidence");
-  assertEvidenceAnchors(before, Boolean(input.scopeId));
-  if (scopedBefore && !scopedBefore.membership.matched) {
-    throw new YifangyunError("The file is outside the configured workspace.", {
-      code: "YFY_WORKSPACE_MEMBERSHIP_FAILED",
+  assertEvidenceAnchors(before, Boolean(input.workspaceRef));
+  if (scopedBefore && scopedBefore.membership.status !== "inside") {
+    throw new YifangyunError(scopedBefore.membership.status === "outside" ? "The file is outside the configured workspace." : "Workspace membership could not be proven from Provider metadata.", {
+      code: scopedBefore.membership.status === "outside" ? "YFY_WORKSPACE_MEMBERSHIP_FAILED" : "YFY_WORKSPACE_MEMBERSHIP_UNAVAILABLE",
       phase: "workspace_membership",
-      agentDetails: { file_ref: `file:${input.fileId}`, file_id: input.fileId, workspace: input.scopeId!, root_folder_id: scopedBefore.scope.scope.rootFolderId, observed_ancestor_folder_ids: scopedBefore.membership.ancestorIds, reason: "outside_workspace" }
+      agentDetails: { file_ref: input.fileRef, workspace: input.workspaceRef!, root_folder_id: scopedBefore.scope.scope.rootFolderId, observed_ancestor_folder_ids: scopedBefore.membership.ancestorIds, membership: scopedBefore.membership.status }
     });
   }
-  const versionsBefore = await observeVersions(runtime, input.fileId, access.context.id, input.signal);
+  const versionsBefore = await observeVersions(runtime, item.id, access.context.id, input.signal);
   const selected = selectFileVersion(versionsBefore.versions, input.selector);
   if (input.selector.kind === "historical") {
     const duplicateContentVersions = versionsBefore.versions.filter((version) => version.generation !== selected.generation && version.sha1 === selected.sha1 && version.size_bytes === selected.size_bytes);
@@ -399,12 +463,17 @@ async function captureVersionContent(runtime: AppRuntime, input: {
       });
     }
   }
-  const observations: JsonObject[] = [provenance(beforeResponse.meta, access.context.id, "file_metadata_before"), provenance(versionsBefore.response.meta, access.context.id, "version_history_before")];
+  const observations: JsonObject[] = [
+    provenance(beforeResponse.meta, access.context.id, "file_metadata_before"),
+    ...(scopedBefore ? [provenance(scopedBefore.rootResponse.meta, access.context.id, "workspace_root_metadata_before")] : []),
+    provenance(versionsBefore.response.meta, access.context.id, "version_history_before")
+  ];
   const downloaded = await downloadSelectedVersion(runtime, {
     accessContext: access.context.id,
     externalEnterpriseId: access.context.externalEnterpriseId,
     file: before,
-    fileId: input.fileId,
+    fileId: item.id,
+    fileRef: input.fileRef,
     identityRef: access.identityRef,
     onProgress: input.onProgress,
     selected,
@@ -414,16 +483,17 @@ async function captureVersionContent(runtime: AppRuntime, input: {
   });
   observations.push(...downloaded.observations);
   try {
-    const versionsAfter = await observeVersions(runtime, input.fileId, access.context.id, input.signal);
+    const versionsAfter = await observeVersions(runtime, item.id, access.context.id, input.signal);
     observations.push(provenance(versionsAfter.response.meta, access.context.id, "version_history_after"));
     if (versionsBefore.fingerprint !== versionsAfter.fingerprint) {
       throw new YifangyunError("File version history changed while content was being captured.", { code: "YFY_EVIDENCE_DRIFT", phase: "version_recheck", retryable: true, suggestedAction: "Restart the operation from yfy_versions." });
     }
-    const scopedAfter = input.scopeId ? await getScopedFile(runtime, input.fileId, input.scopeId, input.signal) : undefined;
-    const afterResponse = scopedAfter?.response ?? await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(input.fileId)}/info_v2`, access.context.id, access.context.externalEnterpriseId ? { external_enterprise_id: access.context.externalEnterpriseId } : {}, input.signal);
+    const scopedAfter = input.workspaceRef ? await getScopedFile(runtime, input.fileRef, input.workspaceRef, input.signal) : undefined;
+    const afterResponse = scopedAfter?.response ?? await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(item.id)}/info_v2`, access.context.id, access.context.externalEnterpriseId ? { external_enterprise_id: access.context.externalEnterpriseId } : {}, input.signal);
     const after = scopedAfter?.file ?? projectItem(afterResponse.data, "evidence");
-    assertEvidenceAnchors(after, Boolean(input.scopeId));
+    assertEvidenceAnchors(after, Boolean(input.workspaceRef));
     observations.push(provenance(afterResponse.meta, access.context.id, "file_metadata_after"));
+    if (scopedAfter) observations.push(provenance(scopedAfter.rootResponse.meta, access.context.id, "workspace_root_metadata_after"));
     const beforeSha1 = typeof before.sha1 === "string" && /^[a-f\d]{40}$/i.test(before.sha1) ? before.sha1.toLowerCase() : undefined;
     const afterSha1 = typeof after.sha1 === "string" && /^[a-f\d]{40}$/i.test(after.sha1) ? after.sha1.toLowerCase() : undefined;
     const stable = {
@@ -432,7 +502,7 @@ async function captureVersionContent(runtime: AppRuntime, input: {
       size: before.size_bytes === after.size_bytes,
       metadata_sha1: beforeSha1 === undefined || afterSha1 === undefined || beforeSha1 === afterSha1,
       path: JSON.stringify(before.provider_path_chain) === JSON.stringify(after.provider_path_chain),
-      workspace_membership: !input.scopeId || scopedAfter?.membership.matched === true,
+      workspace_membership: !input.workspaceRef || scopedAfter?.membership.status === "inside",
       current_metadata_size: input.selector.kind === "historical" || (before.size_bytes === selected.size_bytes && after.size_bytes === selected.size_bytes),
       current_metadata_sha1: input.selector.kind === "historical" || [beforeSha1, afterSha1].filter((value): value is string => value !== undefined).every((value) => value === selected.sha1)
     };
@@ -469,15 +539,15 @@ async function captureVersionContent(runtime: AppRuntime, input: {
       file_metadata_stability: "pass",
       metadata_sha1_stability: beforeSha1 === undefined || afterSha1 === undefined ? "unavailable" : "pass",
       current_metadata_match: input.selector.kind === "historical" ? "not_applicable" : "pass",
-      workspace_membership: input.scopeId ? "pass" : "not_applicable"
+      workspace_membership: input.workspaceRef ? "pass" : "not_applicable"
     };
     const resource = await attachEvidenceArtifact(runtime, downloaded.evidence);
     return {
-      file: { ...after, ref: `file:${input.fileId}` },
-      version: { ...selected, ...(!selected.current ? { ref: `version:${input.fileId}:${selected.provider_version_id}` } : {}) },
+      file: { ...after, ref: input.fileRef },
+      version: { ...selected, ...(!selected.current ? { ref: formatVersionRef(input.fileRef, selected.provider_version_id!) } : {}) },
       selection: versionSelectionProof(selected, input.selector, downloaded.strategy),
-      assurance: { level: input.scopeId ? "workspace_bound" : "content_integrity", verdict: "verified", checks },
-      ...(input.scopeId && scopedAfter ? { workspace: { id: input.scopeId, ref: `workspace:${input.scopeId}`, root_folder_id: scopedAfter.scope.scope.rootFolderId, ancestor_folder_ids: scopedAfter.membership.ancestorIds, relative_ancestor_chain: workspaceRelativeAncestors(after, scopedAfter.scope.scope.rootFolderId), path_basis: "configured_workspace_root", membership: "verified" } } : {}),
+      assurance: { level: input.workspaceRef ? "workspace_bound" : "content_integrity", verdict: "verified", checks },
+      ...(input.workspaceRef && scopedAfter ? { workspace: { ref: input.workspaceRef, root: formatItemRef("folder", scopedAfter.scope.scope.rootFolderId, scopedAfter.scope.context.id, scopedAfter.scope.identityRef), ancestor_folders: scopedAfter.membership.ancestorIds.map((id) => formatItemRef("folder", id, scopedAfter.scope.context.id, scopedAfter.scope.identityRef)), relative_ancestor_chain: workspaceRelativeAncestors(after, scopedAfter.scope.scope.rootFolderId), path_basis: "configured_workspace_root", membership: "inside" } } : {}),
       expectation: { verdict: Object.keys(expectationChecks).length > 0 ? "matched" : "not_provided", checks: expectationChecks },
       resource,
       provenance: observations
@@ -526,7 +596,7 @@ const ContentResultSchema = z.object({
       workspace_membership: VerificationStatusSchema
     })
   }),
-  workspace: z.object({ id: z.string(), ref: PlaceRefSchema, root_folder_id: z.string(), ancestor_folder_ids: z.array(z.string()), relative_ancestor_chain: z.array(PathEntrySchema), path_basis: z.literal("configured_workspace_root"), membership: z.literal("verified") }).optional(),
+  workspace: z.object({ ref: WorkspaceRefSchema, root: FolderRefSchema, ancestor_folders: z.array(FolderRefSchema), relative_ancestor_chain: z.array(PathEntrySchema), path_basis: z.literal("configured_workspace_root"), membership: z.literal("inside") }).strict().optional(),
   expectation: ExpectationSchema,
   resource: ContentResourceSchema,
   provenance: z.array(ProvenanceSchema)
@@ -537,9 +607,9 @@ async function rollbackResource(runtime: AppRuntime, result: Record<string, unkn
   if (typeof resource?.resource_uri === "string") await runtime.evidence.release(resource.resource_uri);
 }
 
-function selectorFor(fileId: string, versionRef: unknown): VersionSelector {
+function selectorFor(fileRef: string, versionRef: unknown): VersionSelector {
   if (versionRef === undefined) return { kind: "current" };
-  const version = parseVersionRef(String(versionRef), fileId);
+  const version = parseVersionRef(String(versionRef), fileRef);
   return { kind: "historical", version_id: version.providerVersionId };
 }
 
@@ -587,14 +657,13 @@ function registerOpenTool(server: McpServer, runtime: AppRuntime): void {
   registerTool(server, "yfy_open", {
     title: "Open Yifangyun File Content",
     description: "Open verified current or historical file bytes. Omit version for current content; copy a historical version ref from yfy_versions when needed. Always release the returned resource after use.",
-    inputSchema: { file: FileRefSchema, version: VersionRefSchema.optional(), access_context: z.string().trim().min(1).optional() },
+    inputSchema: { file: FileRefSchema, version: VersionRefSchema.optional() },
     outputSchema: ContentResultSchema
-  }, { readOnly: true, idempotent: false, onInvalidOutput: (result) => rollbackResource(runtime, result) }, async ({ file, version, access_context }, extra) => {
-    const item = parseItemRef(String(file));
-    const selector = selectorFor(item.id, version);
+  }, { readOnly: true, idempotent: false, onInvalidOutput: (result) => rollbackResource(runtime, result) }, async ({ file, version }, extra) => {
+    const fileRef = String(file);
+    const selector = selectorFor(fileRef, version);
     return captureVersionContent(runtime, {
-      accessContextId: typeof access_context === "string" ? access_context : undefined,
-      fileId: item.id,
+      fileRef,
       onProgress: progressReporter(extra),
       selector,
       signal: extra.signal
@@ -607,7 +676,7 @@ function registerEvidenceTools(server: McpServer, runtime: AppRuntime): void {
     title: "Capture Yifangyun Workspace Content",
     description: "Capture verified current or historical bytes inside a configured workspace. Workspace membership is checked before and after download. Always release the returned resource after use.",
     inputSchema: {
-      workspace: z.string().trim().min(1),
+      workspace: WorkspaceRefSchema,
       file: FileRefSchema,
       version: VersionRefSchema.optional(),
       expected: z.object({
@@ -620,8 +689,8 @@ function registerEvidenceTools(server: McpServer, runtime: AppRuntime): void {
     },
     outputSchema: ContentResultSchema
   }, { readOnly: true, idempotent: false, onInvalidOutput: (result) => rollbackResource(runtime, result) }, async (args, extra) => {
-    const item = parseItemRef(String(args.file));
-    const selector = selectorFor(item.id, args.version);
+    const fileRef = String(args.file);
+    const selector = selectorFor(fileRef, args.version);
     const expected = args.expected && typeof args.expected === "object" && !Array.isArray(args.expected) ? args.expected as Record<string, unknown> : undefined;
     if (selector.kind === "historical" && expected?.file_version_key !== undefined) {
       throw new YifangyunError("The current file version key cannot verify historical content.", {
@@ -632,11 +701,11 @@ function registerEvidenceTools(server: McpServer, runtime: AppRuntime): void {
     }
     return captureVersionContent(runtime, {
       expected,
-      fileId: item.id,
+      fileRef,
       onProgress: progressReporter(extra),
-      scopeId: String(args.workspace),
       selector,
-      signal: extra.signal
+      signal: extra.signal,
+      workspaceRef: String(args.workspace)
     });
   });
 }

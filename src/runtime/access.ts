@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import type { AccessContext, AppConfig, AuthorityScope } from "../types.js";
 import { YifangyunError } from "../client.js";
+import { formatWorkspaceRef, parseWorkspaceRef } from "../domain/refs.js";
 
 export interface ResolvedAccess {
   context: AccessContext;
@@ -51,6 +52,15 @@ export class AccessRegistry {
       });
     }
     return { ...this.resolveContext(scope.accessContext), scope };
+  }
+
+  resolveWorkspaceRef(ref: string): ResolvedScope {
+    return this.resolveScope(parseWorkspaceRef(ref));
+  }
+
+  workspaceRef(id: string): string {
+    this.resolveScope(id);
+    return formatWorkspaceRef(id);
   }
 
   private identityRef(context: AccessContext): string {

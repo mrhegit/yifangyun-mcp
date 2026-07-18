@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
+import { YifangyunError } from "./client.js";
 import { AccessRegistry } from "./runtime/access.js";
 import { ScopeScanEngine } from "./scan/engine.js";
 import { SnapshotService } from "./scan/service.js";
@@ -71,11 +72,58 @@ test("background snapshot completes and queries indexed SQLite items", async () 
     assert.ok(firstPage.nextCursor);
     const secondPage = await service.query({ scanId: completed.scanId, mode: "list", type: "all", cursor: firstPage.nextCursor, limit: 1 });
     assert.notEqual(secondPage.items[0]?.id, firstPage.items[0]?.id);
-    await assert.rejects(
-      () => service.query({ scanId: completed.scanId, mode: "list", type: "all", cursor: { ...firstPage.nextCursor!, revision: firstPage.nextCursor!.revision - 1 }, limit: 1 }),
-      (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_INVENTORY_CURSOR_STALE")
-    );
+    assert.equal(firstPage.nextCursor?.watermark, completed.commitWatermark);
     assert.equal((service.summary(completed).completeness as Record<string, unknown>).safe_to_claim_absence, true);
+  } finally {
+    await service.close();
+  }
+});
+
+test("running inventory cursors keep a fixed committed watermark", async () => {
+  const pagedProvider: ScopeScanProvider = {
+    getRoot: async () => ({ folder: { id: "1", name: "Root", type: "folder" }, meta: meta("/root") }),
+    listChildren: async (_folderId, _userId, pageId) => pageId === 0
+      ? { files: [{ id: "10", name: "A.txt", type: "file" }, { id: "11", name: "B.txt", type: "file" }], folders: [], hasMore: true, nextPageId: 1, pageId, paginationReliable: true, meta: meta("/0") }
+      : { files: [{ id: "12", name: "C.txt", type: "file" }], folders: [], hasMore: false, pageId, paginationReliable: true, meta: meta("/1") }
+  };
+  const store = new SqliteScopeScanStore(":memory:", 3600, 10_000_000);
+  const engine = new ScopeScanEngine(store, pagedProvider);
+  const registry = new AccessRegistry(config(":memory:"));
+  const access = registry.resolveContext("default");
+  const service = new SnapshotService(engine, store, registry);
+  try {
+    const started = await engine.start({ accessContextId: "default", accessIdentityRef: access.identityRef, policy, rootFolderId: "1", userId: "530" });
+    const firstCommit = await engine.advance({ expectedRevision: 0, maxPages: 1, maxWallMs: 5000, scanId: started.state.scanId, userId: "530" });
+    const first = await service.query({ scanId: started.state.scanId, mode: "list", type: "file", limit: 1 });
+    assert.equal(first.nextCursor?.watermark, firstCommit.commitWatermark);
+    const secondCommit = await engine.advance({ expectedRevision: firstCommit.revision, maxPages: 1, maxWallMs: 5000, scanId: started.state.scanId, userId: "530" });
+    const continued = await service.query({ scanId: started.state.scanId, mode: "list", type: "file", cursor: first.nextCursor, limit: 1 });
+    assert.deepEqual(continued.items.map((item) => item.name), ["B.txt"]);
+    const refreshed = await service.query({ scanId: started.state.scanId, mode: "list", type: "file", limit: 10 });
+    assert.equal(secondCommit.commitWatermark, 2);
+    assert.deepEqual(refreshed.items.map((item) => item.name), ["A.txt", "B.txt", "C.txt"]);
+  } finally {
+    await service.close();
+  }
+});
+
+test("inventory search reports whether name or path matched", async () => {
+  const pathProvider: ScopeScanProvider = {
+    getRoot: async () => ({ folder: { id: "1", name: "Root", type: "folder" }, meta: meta("/root") }),
+    listChildren: async (folderId) => String(folderId) === "1"
+      ? { files: [], folders: [{ id: "2", name: "证书目录", type: "folder" }], hasMore: false, pageId: 0, paginationReliable: true, meta: meta("/root/0") }
+      : { files: [{ id: "10", name: "document.pdf", type: "file" }], folders: [], hasMore: false, pageId: 0, paginationReliable: true, meta: meta("/folder/0") }
+  };
+  const store = new SqliteScopeScanStore(":memory:", 3600, 10_000_000);
+  const service = new SnapshotService(new ScopeScanEngine(store, pathProvider), store, new AccessRegistry(config(":memory:")));
+  await service.initialize();
+  try {
+    const started = await service.create({ accessContextId: "default", includeFiles: true, includeFolders: true, maxItemDepth: 5, maxItems: 100, pageCapacity: 10, rootFolderId: "1" });
+    await service.waitForIdle(started.state.scanId);
+    const nameOnly = await service.query({ scanId: started.state.scanId, mode: "search", queries: ["证书"], matchFields: ["name"], limit: 10 });
+    const pathOnly = await service.query({ scanId: started.state.scanId, mode: "search", queries: ["证书"], matchFields: ["path"], type: "file", limit: 10 });
+    assert.equal(nameOnly.items.some((item) => item.id === "10"), false);
+    assert.deepEqual(((pathOnly.items[0]?.match as Record<string, unknown>).matches as Array<Record<string, unknown>>)[0]?.fields, ["path"]);
   } finally {
     await service.close();
   }
@@ -159,6 +207,30 @@ test("running inventories are reused even when the completed freshness window is
     assert.equal(reused.state.scanId, first.state.scanId);
     assert.equal(reused.reuseReason, "running_join");
     await service.cancel(first.state.scanId);
+  } finally {
+    await service.close();
+  }
+});
+
+test("releasing an active inventory waits for its worker before deleting state", async () => {
+  let requestStarted!: () => void;
+  const startedRequest = new Promise<void>((resolve) => { requestStarted = resolve; });
+  const slowProvider: ScopeScanProvider = {
+    getRoot: async () => ({ folder: { id: "1", name: "Root", type: "folder" }, meta: meta("/root") }),
+    listChildren: async (_folderId, _userId, _pageId, _pageCapacity, signal) => {
+      requestStarted();
+      await new Promise<void>((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason ?? new Error("aborted")), { once: true }));
+      throw new Error("unreachable");
+    }
+  };
+  const store = new SqliteScopeScanStore(":memory:", 3600, 10_000_000);
+  const service = new SnapshotService(new ScopeScanEngine(store, slowProvider), store, new AccessRegistry(config(":memory:")));
+  await service.initialize();
+  try {
+    const created = await service.create({ accessContextId: "default", includeFiles: true, includeFolders: true, maxItemDepth: 5, maxItems: 1000, pageCapacity: 2, rootFolderId: "1" });
+    await startedRequest;
+    assert.equal(await service.release(created.state.scanId, "default"), true);
+    await assert.rejects(() => service.get(created.state.scanId, "default"), (error: unknown) => error instanceof YifangyunError && error.code === "YFY_INVENTORY_NOT_FOUND");
   } finally {
     await service.close();
   }
@@ -254,10 +326,10 @@ test("bounded concurrent page fetch preserves canonical receipt order", async ()
     const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: 100, pageCapacity: 1, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
     const manifest = await service.manifest(started.state.scanId);
-    const receipts = manifest.receipts as Array<Record<string, unknown>>;
+    const receipts = (await service.receipts(started.state.scanId, "default", 0)).receipts;
     assert.ok(maxInFlight >= 3, `expected concurrent Provider requests, observed ${maxInFlight}`);
-    assert.deepEqual(receipts.map((receipt) => receipt.page_id), [0, 1, 2, 3, 4]);
-    assert.deepEqual(manifest.receipt_summary, { total_count: 5, included_count: 5, truncated: false });
+    assert.deepEqual(receipts.map((receipt) => receipt.pageId), [0, 1, 2, 3, 4]);
+    assert.deepEqual(manifest.receipt_summary, { total_count: 5, inline_count: 0, receipts_uri_template: `yfy://inventory/${started.state.scanId}/${started.state.artifactToken}/default/receipts/{page}` });
     assert.equal((manifest.policy as Record<string, unknown>).page_capacity, 1);
     assert.equal((manifest.policy as Record<string, unknown>).pageCapacity, undefined);
   } finally {
@@ -289,8 +361,9 @@ test("inventory manifests bound inline receipts and report truncation", async ()
     const started = await service.create({ accessContextId: "default", caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: pageCount, pageCapacity: 1, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
     const manifest = await service.manifest(started.state.scanId);
-    assert.equal((manifest.receipts as unknown[]).length, 100);
-    assert.deepEqual(manifest.receipt_summary, { total_count: pageCount, included_count: 100, truncated: true });
+    assert.equal((await service.receipts(started.state.scanId, "default", 0)).receipts.length, 25);
+    assert.equal((await service.receipts(started.state.scanId, "default", 4)).receipts.length, 5);
+    assert.deepEqual(manifest.receipt_summary, { total_count: pageCount, inline_count: 0, receipts_uri_template: `yfy://inventory/${started.state.scanId}/${started.state.artifactToken}/default/receipts/{page}` });
   } finally {
     await service.close();
   }
@@ -603,8 +676,8 @@ test("large snapshots reject short or excessively broad search terms before a ta
     const started = await engine.start({ accessContextId: "default", accessIdentityRef: access.identityRef, policy, rootFolderId: "1", userId: "530" });
     started.state.fileCount = 100_001;
     await store.save(started.state);
-    await assert.rejects(() => engine.search(started.state.scanId, ["证书"], "all", undefined, 10), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_INVENTORY_QUERY_TOO_SHORT"));
-    await assert.rejects(() => engine.search(started.state.scanId, Array.from({ length: 11 }, (_, index) => `query-${index}`), "all", undefined, 10), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_INVENTORY_QUERY_TOO_BROAD"));
+    await assert.rejects(() => engine.search(started.state.scanId, ["证书"], ["name"], false, "all", undefined, 10, 0), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_INVENTORY_QUERY_TOO_SHORT"));
+    await assert.rejects(() => engine.search(started.state.scanId, Array.from({ length: 11 }, (_, index) => `query-${index}`), ["name"], false, "all", undefined, 10, 0), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_INVENTORY_QUERY_TOO_BROAD"));
   } finally {
     store.close();
   }
@@ -621,8 +694,8 @@ test("case-sensitive snapshot search filters FTS case-folding false positives", 
   try {
     const started = await service.create({ accessContextId: "default", caseSensitive: true, includeFiles: true, includeFolders: true, matchFields: ["name"], maxItemDepth: 1, maxItems: 100, pageCapacity: 10, rootFolderId: "1" });
     await service.waitForIdle(started.state.scanId);
-    const lower = await service.query({ scanId: started.state.scanId, mode: "search", queries: ["abc"], type: "all", limit: 10 });
-    const exact = await service.query({ scanId: started.state.scanId, mode: "search", queries: ["AbC"], type: "all", limit: 10 });
+    const lower = await service.query({ scanId: started.state.scanId, mode: "search", queries: ["abc"], matchFields: ["name"], caseSensitive: true, type: "all", limit: 10 });
+    const exact = await service.query({ scanId: started.state.scanId, mode: "search", queries: ["AbC"], matchFields: ["name"], caseSensitive: true, type: "all", limit: 10 });
     assert.equal(lower.total, 0);
     assert.equal(exact.total, 1);
   } finally {

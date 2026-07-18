@@ -1,6 +1,6 @@
 # 配置指南
 
-beta.6 默认只启用轻量 Drive 平面。Workspace、Inventory、Capture、Organization 和写入能力都必须显式开启。
+beta.7 默认只启用轻量 Drive 平面。Workspace、Inventory、Capture、Organization 和写入能力都必须显式开启。
 
 服务只读取当前进程环境变量，不会自动加载项目目录中的 `.env`。本地运行可使用 `node --env-file=.env dist/index.js`；MCP Host、容器和进程管理器应通过各自的 env 配置注入。运行后以 `yfy_status.runtime` 和 `capabilities` 为实际生效值。
 
@@ -36,7 +36,7 @@ YFY_TOOLSETS=drive
 |---|---|---|---|
 | `drive` | 只读和下载 | 临时 Resource | status、browse、search、resolve、get、versions、open、comments、shares、Resource release |
 | `workspace` | 只读 | 无 | Workspace 校验和成员关系 |
-| `inventory` | 递归只读扫描 | SQLite | freshness、完整性、搜索和取消 |
+| `inventory` | 递归只读扫描 | SQLite | refresh、完整性、固定水位搜索、取消和释放 |
 | `evidence` | 下载 | 临时 Resource | Workspace-bound Capture 和共享 Resource release |
 | `organization` | 只读 | 无 | department、user、group 明确工具 |
 | `collaboration` | 读写 | 无 | 协作读取和变更 |
@@ -96,7 +96,9 @@ YFY_WORKSPACES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","acce
 
 Workspace 不会授予 Provider 权限。启动后使用 `yfy_workspace_validate` 验证目录、业务路径和身份可达性。
 
-普通位置引用为 `workspace:<id>`。Drive 工具可从该位置开始，但只有 Workspace/Inventory/Capture 工具提供范围保证。
+普通位置引用为 `workspace:<id>`。Workspace、Inventory 和 Capture 工具也只接受该完整 Ref，不接受裸 `id`。Drive 工具可从该位置开始，但只有 Workspace/Inventory/Capture 工具提供范围保证。
+
+Workspace 的 `root_folder_id`、`access_context` 或身份配置变化后，旧 ItemRef、InventoryRef 和 Inventory cursor 不应继续使用。调用 `yfy_status` 获取新的 PlaceRef，并从 Browse、Resolve、Search 或 Inventory 结果重新发现项目。
 
 ## Inventory
 
@@ -107,11 +109,25 @@ Workspace 不会授予 Provider 权限。启动后使用 `yfy_workspace_validate
 | `YFY_INVENTORY_TTL_SECONDS` | `604800` | Inventory 本地状态的失效/保留时间 | 正整数；运行任务会刷新活动 TTL，终态超过 TTL 后清理；不等同于 freshness |
 | `YFY_MAX_STATE_BYTES` | `2147483648` | SQLite 主文件、WAL 和索引增长的物理配额 | 正整数；达到上限时任务失败为 `YFY_INVENTORY_STORAGE_INSUFFICIENT`，不会静默丢项 |
 
-保留期决定状态何时删除；`yfy_inventory_create.freshness.max_age_seconds` 决定本次调用是否接受复用。
+保留期决定本地状态何时可清理；`yfy_inventory_create.refresh.max_age_seconds` 决定本次调用是否接受复用。两者是独立概念：TTL 长并不表示观察仍足够新，freshness 短也不会立即删除旧状态。
 
-beta.6 SQLite schema 为 3。`0.4.0` 状态库会返回 `YFY_STATE_SCHEMA_MISMATCH`，不会自动迁移。进程锁为空、owner 仍存活或无法确认死亡时都会保守返回 `YFY_STATE_DB_IN_USE`；只有可验证的死进程旧锁才自动恢复。
+beta.7 SQLite schema 为 4。`0.4.0` 和 beta.6 状态库会返回 `YFY_STATE_SCHEMA_MISMATCH`，不会自动迁移、覆盖或删除。升级时必须停止旧进程并配置新的空 `YFY_STATE_DB`；确认不再回滚后再人工清理旧数据库及其 `-wal`、`-shm` 和进程锁伴生文件。
 
-工具级默认值不由环境变量控制：`yfy_inventory_create` 默认 `max_item_depth=8/max_items=10000`，`yfy_inventory_search` 默认 `limit=25`。需要更大范围时在调用参数中显式提高，并确认本地状态配额和 Provider 速率允许。
+`yfy_inventory_create` 不提供隐藏的 limits 默认值，每次调用必须显式传：
+
+```json
+{
+  "workspace":"workspace:tender_public",
+  "refresh":{"mode":"reuse_if_fresh","max_age_seconds":300},
+  "limits":{"max_item_depth":8,"max_items":10000}
+}
+```
+
+`max_item_depth` 允许 1-100，`max_items` 允许 1-1,000,000。达到任一边界会使 Inventory 不完整，因此 limits 是业务证明边界，不只是性能配置。`reuse_if_fresh.max_age_seconds` 允许 0-604800，省略时为 300；`force_refresh` 不接收 max age，并始终创建新任务。
+
+`yfy_inventory_search` 的 first request 默认 `limit=25`，最大 100；默认搜索 name 和 path，大小写不敏感。cursor 固定首次查询的 commit watermark，后台扫描新增提交不会改变已有分页视图。
+
+物理配额以 `retention.storage.database_bytes`、`logical_bytes` 和 `wal_bytes` 观察。`database_bytes` 代表 SQLite 活动文件占用，WAL 单独报告；达到 `YFY_MAX_STATE_BYTES` 时任务显式失败，不会通过丢弃 item 或 receipt 继续。
 
 ## Content Resource
 
@@ -188,7 +204,9 @@ HTTP 端点为 `POST/GET/DELETE /mcp`、`GET /health` 和 `GET /metrics`。Beare
 - CSV 变量按逗号拆分并去除空白；空字符串等同未配置。
 - JSON 变量必须是合法 JSON 数组，字段名和类型严格按本页 schema；重复 Context/Workspace ID 会导致启动失败。
 - 路径会通过 `path.resolve` 规范化。生产环境应显式配置绝对路径，避免工作目录变化导致状态或临时文件落到不同位置。
-- 配置修改只在新进程启动时生效，不支持热重载。重启后旧 Resource token 不可用；`YFY_CLIENT_SECRET` 变化还会使旧 cursor 和 Inventory ref 失效。
+- 配置修改只在新进程启动时生效，不支持热重载。重启后旧 Resource token 不可用；`YFY_CLIENT_SECRET` 变化会使旧普通 cursor、Inventory ref 和 Inventory cursor 失效。
+- `yfy_status.server.config_fingerprint` 可用于判断影响 Agent 契约的配置是否变化。它不包含 secret 明文，但不应被解释为 Provider 内容版本。
+- Context-bound ItemRef 中的身份指纹必须与当前 Access Context 匹配；身份配置变化后调用方应重新发现 Ref，而不是修改 Ref 字符串。
 
 ## 示例
 

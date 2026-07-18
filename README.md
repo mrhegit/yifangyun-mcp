@@ -2,7 +2,7 @@
 
 亿方云 OpenAPI 的通用 MCP Server。默认提供轻量 Drive 平面；需要范围证明、完整性判断或原件固化时，可启用 Workspace、Inventory 和 Evidence 平面。
 
-当前开发版本：`1.0.0-beta.6`。该版本收紧 Agent-facing 输出预算、路径、游标、错误和 Inventory manifest 契约；从 `0.4.0` 升级时按迁移文档整体切换。
+当前开发版本：`1.0.0-beta.7`。该版本统一 context-bound Ref、互斥分页请求、三态 Workspace 证明和固定观察水位 Inventory；这是不兼容契约升级。
 
 ## Interface
 
@@ -26,7 +26,7 @@
 | Toolset | 工具 |
 |---|---|
 | `workspace` | `yfy_workspace_validate`、`yfy_membership_check` |
-| `inventory` | `yfy_inventory_create`、`yfy_inventory_get`、`yfy_inventory_search`、`yfy_inventory_cancel` |
+| `inventory` | `yfy_inventory_create`、`yfy_inventory_get`、`yfy_inventory_search`、`yfy_inventory_cancel`、`yfy_inventory_release` |
 | `evidence` | `yfy_capture` |
 | `organization` | 明确的 department、user、group 工具，不使用 action union |
 
@@ -40,19 +40,21 @@
 personal
 collaboration
 department:480
-folder:501000715605
+folder:501000715605@default.aaaaaaaaaaaaaaaaaaaaaaaa
 workspace:tender_public
 ```
 
 文件和版本引用：
 
 ```text
-file:501
-folder:502
-version:501:7001
+file:501@default.aaaaaaaaaaaaaaaaaaaaaaaa
+folder:502@default.aaaaaaaaaaaaaaaaaaaaaaaa
+version:7001@ZmlsZTo1MDFAZGVmYXVsdC5hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh
 ```
 
-普通分页只暴露 `limit`、`cursor` 和 `next_action`。Provider 页码、实际 page capacity、过滤后的页内 offset 和签名细节都由服务端隐藏。
+ItemRef 绑定 `access_context` 和身份指纹。不要构造或修改 Ref；Context 配置变化后应重新发现项目。
+
+分页输入使用互斥请求：首次调用传 `request.mode=first_request`，续页只执行返回的 `next_action`，其参数为 `request.mode=continuation` 和 cursor。Provider 页码、页内 offset 和签名细节由服务端隐藏。
 
 Drive 列表默认每页 10 条，Inventory 列表默认每页 25 条。`yfy_browse` 和 `yfy_search` 默认 `detail=basic`；需要 owner、space 等字段时显式请求 `standard` 或 `full`。
 
@@ -67,22 +69,22 @@ Provider 返回的路径明确投影为 `provider_path_chain` 和 `path_basis=pr
 
 文本 Resource 返回 MCP `text`，二进制返回 `blob`。大文件返回 multipart manifest，调用方按 manifest 中的 part URI 分段读取；任何结果都不暴露服务器 `local_path`。二进制是否能直接呈现取决于 MCP 客户端附件能力，服务端不把成功下载等同于模型已读取正文。
 
-## Inventory Freshness
+## Inventory Refresh
 
-`yfy_inventory_create.freshness`：
+`yfy_inventory_create.refresh`：
 
 ```json
-{"max_age_seconds":300,"mode":"reuse_if_fresh"}
+{"mode":"reuse_if_fresh","max_age_seconds":300}
 ```
 
 - `reuse_if_fresh`：只复用未超过调用方新鲜度要求的完整 Inventory，或加入仍在运行的等价 Inventory。
 - `force_refresh`：始终创建新 Inventory。
-- `partial`、`cancelled`、`failed`、`expired` 永不自动复用。
+- `partial`、`cancelled`、`failed` 永不自动复用。
 - 对终态调用 `yfy_inventory_cancel` 是真正 no-op，不改变状态、revision 或时间戳。
 
 只有终态结果中 `safe_to_claim_absence=true` 时，才能在该 Workspace 和观察窗口内声明未找到。
 
-Inventory 默认上限为 `max_item_depth=8`、`max_items=10000`。更大范围必须由调用方显式提高，避免普通查找误触发高成本递归扫描。
+Inventory 不再提供隐藏上限默认值。每次创建都必须显式传 `limits.max_item_depth` 和 `limits.max_items`，因为它们直接决定是否可以证明不存在。查询 cursor 固定首次查询时的 `commit_watermark`，后台继续扫描不会使续页失效；新查询才会看到后续提交。完成后可调用 `yfy_inventory_release` 立即回收本地状态。
 
 ## Toolsets
 
@@ -128,7 +130,7 @@ Workspace 只收窄已有 Provider 权限，不授予新权限。普通 Drive �
 完整性审计：
 
 1. `yfy_workspace_validate`
-2. `yfy_inventory_create`
+2. `yfy_inventory_create({workspace,refresh,limits})`
 3. 跟随 `next_action` 直到 `terminal=true`
 4. 对每个材料类别调用 `yfy_inventory_search`
 5. 仅在 `safe_to_claim_absence=true` 时声明缺失
@@ -166,4 +168,4 @@ npm pack --dry-run
 - [架构与安全](docs/architecture-security.md)
 - [部署](docs/deployment.md)
 - [OpenAPI 覆盖](docs/openapi-coverage.md)
-- [从 0.4.0 迁移到 1.0.0-beta.6](docs/migration-v1.md)
+- [从 0.4.0 迁移到 1.0.0-beta.7](docs/migration-v1.md)

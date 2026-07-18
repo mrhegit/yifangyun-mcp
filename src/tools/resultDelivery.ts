@@ -13,6 +13,17 @@ const PREVIEW_OPTIONS: PreviewOptions[] = [
   { arrayItems: 1, depth: 3, objectFields: 15, stringCharacters: 128 }
 ];
 
+const ANCHOR_FIELDS = new Set(["id", "ref", "name", "type", "file", "item", "inventory", "workspace", "path", "path_display", "provider_path_chain", "relative_ancestor_chain", "page", "next_action", "completeness", "view", "outcome", "status", "verdict"]);
+
+function terminalPreview(value: unknown, options: PreviewOptions, depth = 0): unknown {
+  if (typeof value === "string") return value.length <= options.stringCharacters ? value : `${value.slice(0, options.stringCharacters)}...[${value.length - options.stringCharacters} characters omitted]`;
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return { item_count: value.length, items: value.slice(0, Math.max(1, options.arrayItems)).map((entry) => terminalPreview(entry, options, depth + 1)), omitted_count: Math.max(0, value.length - Math.max(1, options.arrayItems)) };
+  const entries = Object.entries(value as Record<string, unknown>);
+  const anchors = entries.filter(([key, entry]) => ANCHOR_FIELDS.has(key) || entry === null || typeof entry !== "object").slice(0, options.objectFields);
+  return Object.fromEntries(anchors.map(([key, entry]) => [key, depth < 2 ? terminalPreview(entry, options, depth + 1) : entry === null || typeof entry !== "object" ? terminalPreview(entry, options, depth + 1) : { omitted: true }]));
+}
+
 function preview(value: unknown, options: PreviewOptions, depth = 0): unknown {
   if (typeof value === "string") {
     return value.length <= options.stringCharacters
@@ -20,7 +31,7 @@ function preview(value: unknown, options: PreviewOptions, depth = 0): unknown {
       : `${value.slice(0, options.stringCharacters)}...[${value.length - options.stringCharacters} characters omitted]`;
   }
   if (value === null || typeof value !== "object") return value;
-  if (depth >= options.depth) return Array.isArray(value) ? { item_count: value.length, omitted: true } : { omitted: true };
+  if (depth >= options.depth) return terminalPreview(value, options);
   if (Array.isArray(value)) {
     return {
       item_count: value.length,
@@ -29,7 +40,8 @@ function preview(value: unknown, options: PreviewOptions, depth = 0): unknown {
     };
   }
   const entries = Object.entries(value as Record<string, unknown>);
-  return Object.fromEntries(entries.slice(0, options.objectFields).map(([key, entry]) => [key, preview(entry, options, depth + 1)]).concat(
+  const prioritized = [...entries.filter(([key]) => ANCHOR_FIELDS.has(key)), ...entries.filter(([key]) => !ANCHOR_FIELDS.has(key))];
+  return Object.fromEntries(prioritized.slice(0, options.objectFields).map(([key, entry]) => [key, preview(entry, options, depth + 1)]).concat(
     entries.length > options.objectFields ? [["omitted_field_count", entries.length - options.objectFields]] : []
   ));
 }
@@ -63,6 +75,7 @@ export function serializeToolText(tool: string, output: Record<string, unknown>,
       full_result_available_in: "structuredContent"
     },
     top_level_fields: Object.keys(output),
+    identity: Object.fromEntries(Object.entries(output).filter(([key]) => ["file", "item", "inventory", "workspace", "outcome", "status", "verdict"].includes(key))),
     page: output.page,
     next_action: output.next_action,
     completeness: output.completeness
@@ -72,6 +85,10 @@ export function serializeToolText(tool: string, output: Record<string, unknown>,
     status: "success",
     tool,
     text_delivery: { mode: "metadata_only", original_characters: serialized.length, full_result_available_in: "structuredContent" },
-    top_level_fields: Object.keys(output)
+    top_level_fields: Object.keys(output),
+    identity: Object.fromEntries(Object.entries(output).filter(([key]) => ["file", "item", "inventory", "workspace", "outcome", "status", "verdict"].includes(key))),
+    page: output.page,
+    next_action: output.next_action,
+    completeness: output.completeness
   });
 }

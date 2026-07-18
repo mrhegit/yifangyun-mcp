@@ -3,10 +3,8 @@ import type { ScopePageReceipt, ScopeScanPolicy } from "./types.js";
 
 export function projectInventoryPolicy(policy: ScopeScanPolicy): JsonObject {
   return {
-    case_sensitive: policy.caseSensitive,
     include_files: policy.includeFiles,
     include_folders: policy.includeFolders,
-    match_fields: policy.matchFields,
     max_item_depth: policy.maxItemDepth,
     max_items: policy.maxItems,
     page_capacity: policy.pageCapacity

@@ -10,6 +10,7 @@ import { loadConfig } from "./config.js";
 import { AppRuntime } from "./runtime/runtime.js";
 import { registerCatalog } from "./tools/registerCatalog.js";
 import { SERVER_VERSION } from "./version.js";
+import { formatItemRef } from "./domain/refs.js";
 
 function loadDotEnv(filePath: string): void {
   for (const line of fs.readFileSync(filePath, "utf8").split(/\r?\n/)) {
@@ -23,7 +24,7 @@ function loadDotEnv(filePath: string): void {
   }
 }
 
-test("live MCP protocol exposes and executes the beta.6 capture workflow", { skip: process.env.YFY_LIVE_MCP_TESTS !== "enabled" }, async () => {
+test("live MCP protocol exposes and executes the beta.7 capture workflow", { skip: process.env.YFY_LIVE_MCP_TESTS !== "enabled" }, async () => {
   const envPath = process.env.YFY_LIVE_ENV_PATH ?? path.resolve(process.cwd(), ".env");
   assert.ok(fs.existsSync(envPath), `Live env file not found: ${envPath}`);
   loadDotEnv(envPath);
@@ -51,9 +52,10 @@ test("live MCP protocol exposes and executes the beta.6 capture workflow", { ski
     }
     const status = await client.callTool({ name: "yfy_status", arguments: {} });
     assert.equal(((status.structuredContent as Record<string, unknown>).server as Record<string, unknown>).version, SERVER_VERSION);
-    const root = await client.callTool({ name: "yfy_browse", arguments: { at: "workspace:live_scope", limit: 5 } });
+    const root = await client.callTool({ name: "yfy_browse", arguments: { request: { mode: "first_request", at: "workspace:live_scope", limit: 5 } } });
     assert.notEqual(root.isError, true, JSON.stringify(root.content));
-    const locked = await client.callTool({ name: "yfy_capture", arguments: { file: `file:${fileId}`, workspace: "live_scope" } });
+    const access = runtime.access.resolveContext("default");
+    const locked = await client.callTool({ name: "yfy_capture", arguments: { file: formatItemRef("file", fileId, access.context.id, access.identityRef), workspace: "workspace:live_scope" } });
     assert.notEqual(locked.isError, true, JSON.stringify(locked.content));
     const resource = (locked.structuredContent as Record<string, unknown>).resource as Record<string, unknown>;
     assert.match(String(resource.sha256), /^[a-f\d]{64}$/);

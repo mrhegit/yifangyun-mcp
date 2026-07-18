@@ -15,7 +15,7 @@ type ToolHandler = (args: Record<string, unknown>, extra: ToolExtra) => Promise<
 
 export interface ToolDefinition {
   description: string;
-  inputSchema: Record<string, z.ZodTypeAny>;
+  inputSchema: Record<string, z.ZodTypeAny> | z.ZodTypeAny;
   outputSchema: Record<string, z.ZodTypeAny> | z.ZodObject<z.ZodRawShape>;
   title: string;
 }
@@ -44,11 +44,13 @@ function errorCategory(error: YifangyunError, normalizedCode: string): string {
   if (normalizedCode.includes("CANCEL")) return "cancelled";
   if (normalizedCode.includes("TIMEOUT")) return "timeout";
   if (normalizedCode.includes("NOT_FOUND") || error.statusCode === 404) return "not_found";
+  if (normalizedCode === "YFY_WORKSPACE_MEMBERSHIP_UNAVAILABLE") return "provider_contract";
   if (error.statusCode === 401 || normalizedCode.includes("AUTHENTICATION")) return "authentication";
   if (error.statusCode === 403 || normalizedCode.includes("PERMISSION") || normalizedCode.includes("MEMBERSHIP") || normalizedCode.includes("ACCESS_DENIED") || normalizedCode.includes("FORBIDDEN")) return "authorization";
   if (error.statusCode === 429) return "rate_limited";
   if (error.statusCode !== undefined && error.statusCode >= 500) return "provider_unavailable";
   if (normalizedCode.includes("INPUT") || normalizedCode.includes("PATH_INVALID")) return "invalid_input";
+  if (normalizedCode.includes("REF_IDENTITY_MISMATCH")) return "stale_state";
   if (normalizedCode.endsWith("_CURSOR_STALE") || normalizedCode.includes("STALE") || normalizedCode.includes("REVISION_CONFLICT")) return "stale_state";
   if (normalizedCode.includes("TOO_LARGE") || normalizedCode.includes("QUOTA") || normalizedCode.includes("CAPACITY") || normalizedCode.includes("STORAGE_INSUFFICIENT")) return "capacity_limit";
   if (normalizedCode.includes("CONTENT_MISMATCH") || normalizedCode.includes("FALLBACK_DETECTED") || normalizedCode.includes("HISTORICAL_CAPTURE")) return "provider_contract";
@@ -100,7 +102,12 @@ export function registerTool(
   const outputValidator = definition.outputSchema instanceof z.ZodObject
     ? definition.outputSchema.strict()
     : z.object(definition.outputSchema).strict();
-  server.registerTool(name, {
+  const sdkRegisterTool = server.registerTool.bind(server) as unknown as (
+    toolName: string,
+    toolDefinition: Record<string, unknown>,
+    toolHandler: (args: Record<string, unknown>, extra: ToolExtra) => Promise<Record<string, unknown>>
+  ) => void;
+  sdkRegisterTool(name, {
     ...definition,
     outputSchema: definition.outputSchema,
     annotations: {
@@ -110,11 +117,13 @@ export function registerTool(
       readOnlyHint: options.readOnly
     }
   }, async (args, extra) => {
+    let produced: Record<string, unknown> | undefined;
+    let cleanupRequired = false;
     try {
-      const result = await handler(args as Record<string, unknown>, extra as ToolExtra);
-      const validated = outputValidator.safeParse(result);
+      produced = await handler(args, extra);
+      cleanupRequired = true;
+      const validated = outputValidator.safeParse(produced);
       if (!validated.success) {
-        await options.onInvalidOutput?.(result).catch(() => undefined);
         logEvent("error", "tool_output_schema_invalid", { issues: validated.error.issues.map((issue) => ({ code: issue.code, path: issue.path.join(".") })), tool: name });
         throw new YifangyunError("The tool produced a result that violates its declared output contract.", {
           code: "YFY_TOOL_OUTPUT_INVALID",
@@ -130,6 +139,7 @@ export function registerTool(
       const delivery = resource?.delivery ?? artifact?.delivery;
       const resourceReadable = delivery === undefined || delivery === "mcp_resource" || delivery === "multipart_resource";
       const text = serializeToolText(name, output);
+      cleanupRequired = false;
       return {
         content: [
           { type: "text" as const, text },
@@ -138,6 +148,11 @@ export function registerTool(
         structuredContent: output
       };
     } catch (error) {
+      if (cleanupRequired && produced && options.onInvalidOutput) {
+        await options.onInvalidOutput(produced).catch((cleanupError) => {
+          logEvent("error", "tool_output_cleanup_failed", { error: redactSensitiveText(cleanupError instanceof Error ? cleanupError.message : String(cleanupError)), tool: name });
+        });
+      }
       if (!(error instanceof YifangyunError)) {
         logEvent("error", "tool_unexpected_error", { error: redactSensitiveText(error instanceof Error ? error.message : String(error)), tool: name });
       }

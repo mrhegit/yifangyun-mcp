@@ -7,7 +7,7 @@ import type { JsonObject } from "../types.js";
 import type { ScopeItemCursor, ScopeItemPage, ScopePageArtifact, ScopePageReceipt, ScopeScanFrontier, ScopeScanRepository, ScopeScanState, ScopeSeenItem } from "./types.js";
 
 type Row = Record<string, unknown>;
-const SNAPSHOT_SCHEMA_VERSION = 3;
+const SNAPSHOT_SCHEMA_VERSION = 4;
 
 function normalizeText(value: string, caseSensitive: boolean): string {
   const normalized = value.normalize("NFKC")
@@ -41,10 +41,6 @@ function itemDigest(item: JsonObject): string {
   })).digest("hex");
 }
 
-function seenBytes(item: ScopeSeenItem): number {
-  return jsonBytes(item.id) + jsonBytes(item.type) + jsonBytes(item.digest);
-}
-
 function frontierKey(cursor: ScopeScanFrontier): string {
   return `${cursor.folderId}:${cursor.pageId}`;
 }
@@ -73,7 +69,7 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
       throw error;
     }
     try {
-    this.database.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;");
+    this.database.exec("PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;");
     this.assertSchemaVersion();
     if (databasePath !== ":memory:") {
       for (const filePath of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
@@ -84,6 +80,7 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
       CREATE TABLE IF NOT EXISTS snapshots (
         scan_id TEXT PRIMARY KEY,
         access_identity_ref TEXT NOT NULL,
+        workspace_fingerprint TEXT NOT NULL,
         root_folder_id TEXT NOT NULL,
         policy_hash TEXT NOT NULL,
         status TEXT NOT NULL,
@@ -91,14 +88,13 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
         updated_at_ms INTEGER NOT NULL,
         state_json TEXT NOT NULL
       ) STRICT;
-      CREATE INDEX IF NOT EXISTS snapshots_reuse_idx ON snapshots(access_identity_ref, root_folder_id, policy_hash, updated_at_ms DESC);
+      CREATE INDEX IF NOT EXISTS snapshots_reuse_idx ON snapshots(workspace_fingerprint, policy_hash, updated_at_ms DESC);
       CREATE INDEX IF NOT EXISTS snapshots_status_idx ON snapshots(status, expires_at_ms);
       CREATE TABLE IF NOT EXISTS snapshot_pages (
         scan_id TEXT NOT NULL REFERENCES snapshots(scan_id) ON DELETE CASCADE,
         page_key TEXT NOT NULL,
         folder_id TEXT NOT NULL DEFAULT '',
         commit_seq INTEGER NOT NULL DEFAULT 0,
-        artifact_json TEXT NOT NULL,
         receipt_json TEXT NOT NULL,
         PRIMARY KEY (scan_id, page_key)
       ) STRICT;
@@ -107,6 +103,10 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
         item_id TEXT NOT NULL,
         item_type TEXT NOT NULL,
         page_key TEXT NOT NULL,
+        commit_seq INTEGER NOT NULL,
+        item_digest TEXT NOT NULL,
+        name_text TEXT NOT NULL,
+        path_text TEXT NOT NULL,
         name_normalized TEXT NOT NULL,
         path_normalized TEXT NOT NULL,
         sort_path TEXT NOT NULL,
@@ -115,8 +115,8 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
       ) STRICT;
       CREATE INDEX IF NOT EXISTS snapshot_pages_commit_idx ON snapshot_pages(scan_id, commit_seq, page_key);
       CREATE INDEX IF NOT EXISTS snapshot_pages_folder_idx ON snapshot_pages(scan_id, folder_id);
-      CREATE INDEX IF NOT EXISTS snapshot_items_sort_idx ON snapshot_items(scan_id, sort_path, item_id);
-      CREATE INDEX IF NOT EXISTS snapshot_items_type_sort_idx ON snapshot_items(scan_id, item_type, sort_path, item_id);
+      CREATE INDEX IF NOT EXISTS snapshot_items_sort_idx ON snapshot_items(scan_id, commit_seq, sort_path, item_id);
+      CREATE INDEX IF NOT EXISTS snapshot_items_type_sort_idx ON snapshot_items(scan_id, item_type, commit_seq, sort_path, item_id);
       CREATE INDEX IF NOT EXISTS snapshot_items_page_idx ON snapshot_items(scan_id, page_key);
       CREATE VIRTUAL TABLE IF NOT EXISTS snapshot_items_fts USING fts5(
         scan_id UNINDEXED,
@@ -156,14 +156,6 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
         UNIQUE (scan_id, sequence)
       ) STRICT;
       CREATE INDEX IF NOT EXISTS snapshot_frontier_fifo_idx ON snapshot_frontier(scan_id, sequence);
-      CREATE TABLE IF NOT EXISTS snapshot_seen_items (
-        scan_id TEXT NOT NULL REFERENCES snapshots(scan_id) ON DELETE CASCADE,
-        item_id TEXT NOT NULL,
-        item_type TEXT NOT NULL,
-        item_digest TEXT NOT NULL,
-        byte_size INTEGER NOT NULL,
-        PRIMARY KEY (scan_id, item_id)
-      ) STRICT;
       CREATE TABLE IF NOT EXISTS snapshot_storage (
         scan_id TEXT PRIMARY KEY REFERENCES snapshots(scan_id) ON DELETE CASCADE,
         logical_bytes INTEGER NOT NULL
@@ -193,9 +185,9 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
     this.assertCapacity(this.storageBytes() + bytes);
     this.transaction(() => {
       this.database.prepare(`
-        INSERT INTO snapshots(scan_id, access_identity_ref, root_folder_id, policy_hash, status, expires_at_ms, updated_at_ms, state_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(state.scanId, state.accessIdentityRef, state.rootFolderId, state.policyHash, state.status, Date.parse(state.expiresAt), Date.parse(state.updatedAt), stateJson);
+        INSERT INTO snapshots(scan_id, access_identity_ref, workspace_fingerprint, root_folder_id, policy_hash, status, expires_at_ms, updated_at_ms, state_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(state.scanId, state.accessIdentityRef, state.workspaceFingerprint, state.rootFolderId, state.policyHash, state.status, Date.parse(state.expiresAt), Date.parse(state.updatedAt), stateJson);
       const insertFrontier = this.database.prepare(`
         INSERT INTO snapshot_frontier(scan_id, sequence, cursor_key, attempt, depth, folder_id, page_id, path_display)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -229,20 +221,12 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
 
   async commitPage(scanId: string, artifact: ScopePageArtifact, seenItems: ScopeSeenItem[], state: ScopeScanState, current: ScopeScanFrontier, append: ScopeScanFrontier[]): Promise<void> {
     state.expiresAt = this.makeExpiry();
-    const artifactJson = JSON.stringify(artifact);
     const receiptJson = JSON.stringify(artifact.receipt);
     const itemJson = [...artifact.folders, ...artifact.files].map((item) => JSON.stringify(item));
     const previousState = this.database.prepare("SELECT state_json FROM snapshots WHERE scan_id = ?").get(scanId) as Row | undefined;
-    const previousPage = this.database.prepare("SELECT artifact_json, receipt_json FROM snapshot_pages WHERE scan_id = ? AND page_key = ?").get(scanId, artifact.pageKey) as Row | undefined;
-    const previousItems = this.database.prepare("SELECT item_json FROM snapshot_items WHERE scan_id = ? AND page_key = ?").all(scanId, artifact.pageKey) as Row[];
-    const existingSeen = await this.findSeenItems(scanId, seenItems.map((item) => item.id));
-    const newSeen = seenItems.filter((item) => !existingSeen.has(item.id));
-    const previousBytes = jsonBytes(String(previousState?.state_json ?? ""))
-      + (previousPage ? jsonBytes(String(previousPage.artifact_json)) + jsonBytes(String(previousPage.receipt_json)) : 0)
-      + previousItems.reduce((sum, row) => sum + jsonBytes(String(row.item_json)), 0);
-    const serializedGrowth = jsonBytes(JSON.stringify(state)) + jsonBytes(artifactJson) + jsonBytes(receiptJson)
+    const previousBytes = jsonBytes(String(previousState?.state_json ?? ""));
+    const serializedGrowth = jsonBytes(JSON.stringify(state)) + jsonBytes(receiptJson)
       + itemJson.reduce((sum, value) => sum + jsonBytes(value), 0)
-      + newSeen.reduce((sum, item) => sum + seenBytes(item), 0)
       + append.reduce((sum, cursor) => sum + frontierBytes(cursor), 0);
     const walGrowthReservation = 1_048_576 + serializedGrowth * 8;
     this.assertCapacity(this.storageBytes() + walGrowthReservation);
@@ -267,20 +251,17 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
       }
       state.frontierCount = Math.max(0, state.frontierCount - Number(removed.changes) + insertedFrontier);
       const stateJson = JSON.stringify(state);
-      const incomingBytes = jsonBytes(stateJson) + jsonBytes(artifactJson) + jsonBytes(receiptJson)
-        + itemJson.reduce((sum, value) => sum + jsonBytes(value), 0)
-        + newSeen.reduce((sum, item) => sum + seenBytes(item), 0);
+      const incomingBytes = jsonBytes(stateJson) + jsonBytes(receiptJson) + itemJson.reduce((sum, value) => sum + jsonBytes(value), 0);
       const delta = incomingBytes - previousBytes + frontierDelta;
       this.assertCapacity(this.storageBytes() + delta);
       this.database.prepare(`
-        INSERT INTO snapshot_pages(scan_id, page_key, folder_id, commit_seq, artifact_json, receipt_json) VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(scan_id, page_key) DO UPDATE SET folder_id=excluded.folder_id, commit_seq=excluded.commit_seq, artifact_json=excluded.artifact_json, receipt_json=excluded.receipt_json
-      `).run(scanId, artifact.pageKey, artifact.receipt.folderId, state.pageReceiptCount, artifactJson, receiptJson);
-      this.database.prepare("DELETE FROM snapshot_items WHERE scan_id = ? AND page_key = ?").run(scanId, artifact.pageKey);
+        INSERT INTO snapshot_pages(scan_id, page_key, folder_id, commit_seq, receipt_json) VALUES (?, ?, ?, ?, ?)
+      `).run(scanId, artifact.pageKey, artifact.receipt.folderId, state.commitWatermark, receiptJson);
       const insertItem = this.database.prepare(`
-        INSERT INTO snapshot_items(scan_id, item_id, item_type, page_key, name_normalized, path_normalized, sort_path, item_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO snapshot_items(scan_id, item_id, item_type, page_key, commit_seq, item_digest, name_text, path_text, name_normalized, path_normalized, sort_path, item_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
+      const digestByKey = new Map(seenItems.map((item) => [item.id, item.digest]));
       for (const item of [...artifact.folders, ...artifact.files]) {
         const itemId = String(item.id ?? "");
         const itemType = String(item.type ?? "");
@@ -288,23 +269,22 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
           continue;
         }
         const itemPath = String(item.path_display ?? "");
+        const itemName = String(item.name ?? "");
+        const itemKey = `${itemType}:${itemId}`;
         insertItem.run(
           scanId,
-          `${itemType}:${itemId}`,
+          itemKey,
           itemType,
           artifact.pageKey,
-          normalizeText(String(item.name ?? ""), state.policy.caseSensitive),
-          normalizeText(itemPath, state.policy.caseSensitive),
+          state.commitWatermark,
+          digestByKey.get(itemKey) ?? itemDigest(item),
+          normalizeText(itemName, true),
+          normalizeText(itemPath, true),
+          normalizeText(itemName, false),
+          normalizeText(itemPath, false),
           itemPath,
           JSON.stringify(item)
         );
-      }
-      const insertSeen = this.database.prepare(`
-        INSERT OR IGNORE INTO snapshot_seen_items(scan_id, item_id, item_type, item_digest, byte_size)
-        VALUES (?, ?, ?, ?, ?)
-      `);
-      for (const item of newSeen) {
-        insertSeen.run(scanId, item.id, item.type, item.digest, seenBytes(item));
       }
       this.updateState(state, stateJson);
       this.updateStorage(scanId, this.scanStorage(scanId) + delta);
@@ -344,7 +324,7 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
     if (itemIds.length === 0) return new Map();
     const unique = [...new Set(itemIds)];
     const rows = this.database.prepare(`
-      SELECT item_id, item_type, item_digest FROM snapshot_seen_items
+      SELECT item_id, item_type, item_digest FROM snapshot_items
       WHERE scan_id = ? AND item_id IN (${unique.map(() => "?").join(",")})
     `).all(scanId, ...unique) as Row[];
     return new Map(rows.map((row) => [String(row.item_id), {
@@ -366,25 +346,20 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
     return Boolean(this.database.prepare("SELECT 1 AS found FROM snapshot_pages WHERE scan_id = ? AND page_key = ?").get(scanId, pageKey));
   }
 
-  async listPages(scanId: string): Promise<ScopePageArtifact[]> {
-    const rows = this.database.prepare("SELECT artifact_json FROM snapshot_pages WHERE scan_id = ? ORDER BY commit_seq, page_key").all(scanId) as Row[];
-    return rows.map((row) => parseJson<ScopePageArtifact>(row.artifact_json));
-  }
-
-  async listReceiptSummary(scanId: string, limit: number): Promise<{ receipts: ScopePageReceipt[]; total: number }> {
+  async listReceiptSummary(scanId: string, offset: number, limit: number): Promise<{ receipts: ScopePageReceipt[]; total: number }> {
     const totalRow = this.database.prepare("SELECT count(*) AS total FROM snapshot_pages WHERE scan_id = ?").get(scanId) as Row;
-    const rows = this.database.prepare("SELECT receipt_json FROM snapshot_pages WHERE scan_id = ? ORDER BY commit_seq, page_key LIMIT ?").all(scanId, limit) as Row[];
+    const rows = this.database.prepare("SELECT receipt_json FROM snapshot_pages WHERE scan_id = ? ORDER BY commit_seq, page_key LIMIT ? OFFSET ?").all(scanId, limit, offset) as Row[];
     return { receipts: rows.map((row) => parseJson<ScopePageReceipt>(row.receipt_json)), total: Number(totalRow.total) };
   }
 
-  async findReusable(accessIdentityRef: string, rootFolderId: string, policyHash: string, updatedAfterMs: number): Promise<ScopeScanState | undefined> {
+  async findReusable(workspaceFingerprint: string, policyHash: string, updatedAfterMs: number): Promise<ScopeScanState | undefined> {
     const row = this.database.prepare(`
       SELECT state_json FROM snapshots
-      WHERE access_identity_ref = ? AND root_folder_id = ? AND policy_hash = ?
-        AND (status IN ('running', 'paused_retryable') OR (status = 'complete' AND updated_at_ms >= ?))
+      WHERE workspace_fingerprint = ? AND policy_hash = ?
+        AND (status IN ('running', 'retry_wait') OR (status = 'complete' AND updated_at_ms >= ?))
         AND expires_at_ms > ?
       ORDER BY updated_at_ms DESC LIMIT 1
-    `).get(accessIdentityRef, rootFolderId, policyHash, updatedAfterMs, Date.now()) as Row | undefined;
+    `).get(workspaceFingerprint, policyHash, updatedAfterMs, Date.now()) as Row | undefined;
     return row ? parseJson<ScopeScanState>(row.state_json) : undefined;
   }
 
@@ -393,10 +368,27 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
     if (Number(result.changes) > 0) this.database.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum;");
   }
 
+  async pruneSuperseded(workspaceFingerprint: string, policyHash: string, keepScanId: string): Promise<void> {
+    const rows = this.database.prepare(`SELECT scan_id FROM snapshots WHERE workspace_fingerprint = ? AND policy_hash = ? AND scan_id <> ? AND status IN ('complete','partial','failed','cancelled') ORDER BY updated_at_ms DESC`).all(workspaceFingerprint, policyHash, keepScanId) as Row[];
+    const stale = rows.slice(1).map((row) => String(row.scan_id));
+    if (stale.length === 0) return;
+    this.transaction(() => {
+      const statement = this.database.prepare("DELETE FROM snapshots WHERE scan_id = ?");
+      for (const scanId of stale) statement.run(scanId);
+    });
+    this.database.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum;");
+  }
+
+  async release(scanId: string): Promise<boolean> {
+    const result = this.database.prepare("DELETE FROM snapshots WHERE scan_id = ?").run(scanId);
+    if (Number(result.changes) > 0) this.database.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum;");
+    return Number(result.changes) > 0;
+  }
+
   async listRunnable(): Promise<ScopeScanState[]> {
     const rows = this.database.prepare(`
       SELECT state_json FROM snapshots
-      WHERE status IN ('running', 'paused_retryable') AND expires_at_ms > ?
+      WHERE status IN ('running', 'retry_wait') AND expires_at_ms > ?
       ORDER BY updated_at_ms
     `).all(Date.now()) as Row[];
     return rows.map((row) => parseJson<ScopeScanState>(row.state_json));
@@ -409,7 +401,8 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
     type: "file" | "folder" | "all",
     cursor: ScopeItemCursor | undefined,
     limit: number,
-    caseSensitive: boolean
+    caseSensitive: boolean,
+    watermark: number
   ): Promise<ScopeItemPage> {
     if (queries.length === 0) {
       return { items: [], total: 0 };
@@ -428,25 +421,25 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
         return `(${fields.join(" OR ")})`;
       }).join(" OR ");
       from = "snapshot_items i JOIN snapshot_items_fts ON snapshot_items_fts.scan_id = i.scan_id AND snapshot_items_fts.item_id = i.item_id";
-      where = "i.scan_id = ? AND snapshot_items_fts MATCH ?";
-      parameters = [scanId, expression];
+      where = "i.scan_id = ? AND i.commit_seq <= ? AND snapshot_items_fts MATCH ?";
+      parameters = [scanId, watermark, expression];
     } else {
       const clauses: string[] = [];
-      parameters = [scanId];
+      parameters = [scanId, watermark];
       for (const query of queries) {
         const fields: string[] = [];
         if (matchFields.includes("name")) {
-          fields.push("instr(i.name_normalized, ?) > 0");
+          fields.push(`instr(i.${caseSensitive ? "name_text" : "name_normalized"}, ?) > 0`);
           parameters.push(query.normalized);
         }
         if (matchFields.includes("path")) {
-          fields.push("instr(i.path_normalized, ?) > 0");
+          fields.push(`instr(i.${caseSensitive ? "path_text" : "path_normalized"}, ?) > 0`);
           parameters.push(query.normalized);
         }
         clauses.push(`(${fields.join(" OR ")})`);
       }
       from = "snapshot_items i";
-      where = `i.scan_id = ? AND (${clauses.join(" OR ")})`;
+      where = `i.scan_id = ? AND i.commit_seq <= ? AND (${clauses.join(" OR ")})`;
     }
     if (type !== "all") {
       where += " AND i.item_type = ?";
@@ -455,37 +448,40 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
     const total = cursor?.total ?? Number((this.database.prepare(`SELECT count(*) AS total FROM ${from} WHERE ${where}`).get(...parameters) as Row).total ?? 0);
     const cursorClause = cursor ? " AND (i.sort_path, i.item_id) > (?, ?)" : "";
     const cursorParameters = cursor ? [cursor.sortPath, cursor.itemId] : [];
-    const rows = this.database.prepare(`SELECT i.item_id, i.item_json, i.name_normalized, i.path_normalized, i.sort_path FROM ${from} WHERE ${where}${cursorClause} ORDER BY i.sort_path, i.item_id LIMIT ?`)
+    const rows = this.database.prepare(`SELECT i.item_id, i.item_json, i.name_text, i.path_text, i.name_normalized, i.path_normalized, i.sort_path FROM ${from} WHERE ${where}${cursorClause} ORDER BY i.sort_path, i.item_id LIMIT ?`)
       .all(...parameters, ...cursorParameters, limit + 1) as Row[];
     const pageRows = rows.slice(0, limit);
     const items = pageRows.map((row) => {
       const item = parseJson<JsonObject>(row.item_json);
-      const name = String(row.name_normalized ?? "");
-      const itemPath = String(row.path_normalized ?? "");
-      const matched = queries.filter((query) => (matchFields.includes("name") && name.includes(query.normalized)) || (matchFields.includes("path") && itemPath.includes(query.normalized))).map((query) => query.original);
-      return { ...item, matched_queries: matched };
+      const name = String(row[caseSensitive ? "name_text" : "name_normalized"] ?? "");
+      const itemPath = String(row[caseSensitive ? "path_text" : "path_normalized"] ?? "");
+      const matches = queries.flatMap((query) => {
+        const fields = [...(matchFields.includes("name") && name.includes(query.normalized) ? ["name"] : []), ...(matchFields.includes("path") && itemPath.includes(query.normalized) ? ["path"] : [])];
+        return fields.length > 0 ? [{ query: query.original, fields }] : [];
+      });
+      return { ...item, match: { matches, case_sensitive: caseSensitive } };
     });
     const last = pageRows.at(-1);
     return {
       items,
-      ...(rows.length > limit && last ? { nextCursor: { itemId: String(last.item_id), revision: cursor?.revision ?? 0, sortPath: String(last.sort_path), total } } : {}),
+      ...(rows.length > limit && last ? { nextCursor: { itemId: String(last.item_id), sortPath: String(last.sort_path), total, watermark } } : {}),
       total
     };
   }
 
-  async listItems(scanId: string, type: "file" | "folder" | "all", cursor: ScopeItemCursor | undefined, limit: number): Promise<ScopeItemPage> {
+  async listItems(scanId: string, type: "file" | "folder" | "all", cursor: ScopeItemCursor | undefined, limit: number, watermark: number): Promise<ScopeItemPage> {
     const typeClause = type === "all" ? "" : " AND item_type = ?";
-    const parameters: Array<string | number> = type === "all" ? [scanId] : [scanId, type];
-    const total = cursor?.total ?? Number((this.database.prepare(`SELECT count(*) AS total FROM snapshot_items WHERE scan_id = ?${typeClause}`).get(...parameters) as Row).total ?? 0);
+    const parameters: Array<string | number> = type === "all" ? [scanId, watermark] : [scanId, watermark, type];
+    const total = cursor?.total ?? Number((this.database.prepare(`SELECT count(*) AS total FROM snapshot_items WHERE scan_id = ? AND commit_seq <= ?${typeClause}`).get(...parameters) as Row).total ?? 0);
     const cursorClause = cursor ? " AND (sort_path, item_id) > (?, ?)" : "";
     const cursorParameters = cursor ? [cursor.sortPath, cursor.itemId] : [];
-    const rows = this.database.prepare(`SELECT item_id, item_json, sort_path FROM snapshot_items WHERE scan_id = ?${typeClause}${cursorClause} ORDER BY sort_path, item_id LIMIT ?`)
+    const rows = this.database.prepare(`SELECT item_id, item_json, sort_path FROM snapshot_items WHERE scan_id = ? AND commit_seq <= ?${typeClause}${cursorClause} ORDER BY sort_path, item_id LIMIT ?`)
       .all(...parameters, ...cursorParameters, limit + 1) as Row[];
     const pageRows = rows.slice(0, limit);
     const last = pageRows.at(-1);
     return {
       items: pageRows.map((row) => parseJson<JsonObject>(row.item_json)),
-      ...(rows.length > limit && last ? { nextCursor: { itemId: String(last.item_id), revision: cursor?.revision ?? 0, sortPath: String(last.sort_path), total } } : {}),
+      ...(rows.length > limit && last ? { nextCursor: { itemId: String(last.item_id), sortPath: String(last.sort_path), total, watermark } } : {}),
       total
     };
   }
@@ -514,15 +510,21 @@ export class SqliteScopeScanStore implements ScopeScanRepository {
   }
 
   storageBytes(): number {
+    const stats = this.storageStats();
+    return Math.max(stats.logical_bytes, stats.database_bytes + stats.wal_bytes);
+  }
+
+  storageStats(): { database_bytes: number; logical_bytes: number; wal_bytes: number } {
     const row = this.database.prepare("SELECT coalesce(sum(logical_bytes), 0) AS bytes FROM snapshot_storage").get() as Row;
     const logicalBytes = Number(row.bytes ?? 0);
-    if (this.databasePath === ":memory:") return logicalBytes;
+    if (this.databasePath === ":memory:") return { database_bytes: 0, logical_bytes: logicalBytes, wal_bytes: 0 };
     const pageCount = Number((this.database.prepare("PRAGMA page_count").get() as Row).page_count ?? 0);
-    const freePages = Number((this.database.prepare("PRAGMA freelist_count").get() as Row).freelist_count ?? 0);
     const pageSize = Number((this.database.prepare("PRAGMA page_size").get() as Row).page_size ?? 0);
-    let physicalBytes = Math.max(0, pageCount - freePages) * pageSize;
-    try { physicalBytes += statSync(`${this.databasePath}-wal`).size; } catch {}
-    return Math.max(logicalBytes, physicalBytes);
+    const databaseBytes = Math.max(0, pageCount) * pageSize;
+    let walBytes = 0;
+    try { walBytes += statSync(`${this.databasePath}-wal`).size; } catch {}
+    try { walBytes += statSync(`${this.databasePath}-shm`).size; } catch {}
+    return { database_bytes: databaseBytes, logical_bytes: logicalBytes, wal_bytes: walBytes };
   }
 
   private updateState(state: ScopeScanState, stateJson: string): void {

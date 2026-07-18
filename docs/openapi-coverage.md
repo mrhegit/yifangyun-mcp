@@ -1,6 +1,6 @@
 # OpenAPI 覆盖矩阵
 
-beta.6 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Drive、Inventory、Content 和 Organization Module 内。
+beta.7 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Drive、Workspace、Inventory、Content 和 Organization Module 内。所有项目工具使用 context-bound Ref，分页工具统一使用严格的 first request/continuation 契约。
 
 ## Drive
 
@@ -8,9 +8,9 @@ beta.6 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Driv
 |---|---|---|
 | personal/collaboration/department/folder/workspace roots | `yfy_browse` | 已覆盖 |
 | folder/file info | `yfy_get`、`yfy_get_many` | 已覆盖 |
-| indexed search | `yfy_search` | 已覆盖，非穷尽 |
-| exact path traversal | `yfy_resolve` | 组合覆盖 |
-| version list | `yfy_versions` | 已覆盖，稳定 VersionRef |
+| indexed search | `yfy_search` | 已覆盖，非穷尽；返回字段级 match evidence |
+| exact path traversal | `yfy_resolve` | 组合覆盖；同名候选返回 ambiguous |
+| version list | `yfy_versions` | 已覆盖，VersionRef 绑定完整 FileRef |
 | current/historical download | `yfy_open` | 组合覆盖并校验内容 |
 | comments/shares | `yfy_comments`、`yfy_shares` | 已覆盖，分享敏感字段脱敏 |
 
@@ -18,12 +18,13 @@ beta.6 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Driv
 
 | Provider 能力 | 工具 | 状态 |
 |---|---|---|
-| folder/department ancestry | `yfy_workspace_validate` | 组合覆盖 |
-| file path membership | `yfy_membership_check` | 组合覆盖 |
-| recursive complete observation | `yfy_inventory_*` | SQLite 后台覆盖，支持 freshness |
+| folder/department ancestry | `yfy_workspace_validate` | 组合覆盖，检查为 pass/fail/unavailable |
+| file path membership | `yfy_membership_check` | 组合覆盖，结果为 inside/outside/unavailable |
+| recursive complete observation | `yfy_inventory_*` | SQLite schema 4 后台覆盖，支持 refresh、固定 commit watermark 和显式 release |
 | validated current/historical bytes | `yfy_capture` | Workspace-bound 组合覆盖 |
 | expected metadata/content assertions | `yfy_capture.expected` | mismatch 为错误并回滚 |
 | resource lifecycle | `yfy_resource_release` | 单体和 multipart 均覆盖 |
+| inventory artifact lifecycle | `yfy_inventory_release` | Inventory、cursor、manifest 和 receipt 一并失效 |
 
 ## Organization 与写入
 

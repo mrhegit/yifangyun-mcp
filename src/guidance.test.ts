@@ -18,14 +18,14 @@ test("tender prompt accepts MCP string arguments", async () => {
   registerGuidance(server as unknown as McpServer, runtime);
   const handler = server.prompts.get("yfy_tender_material_audit");
   assert.ok(handler);
-  const result = await handler({ workspace: "tender", required_materials: "qualification certificate", max_item_depth: "5", max_items: "100" });
+  const result = await handler({ workspace: "workspace:tender", required_materials: "qualification certificate", max_item_depth: "5", max_items: "100" });
   assert.ok(result);
   assert.match(JSON.stringify(result), /Hard rules/);
-  assert.match(JSON.stringify(result), /max_item_depth=5/);
+  assert.match(JSON.stringify(result), /limits=\{max_item_depth:5,max_items:100\}/);
   const compare = server.prompts.get("yfy_tender_compare_versions");
   assert.ok(compare);
-  const comparison = await compare({ file: "file:501", workspace: "tender", expected_sha256: "a".repeat(64) });
-  assert.match(JSON.stringify(comparison), /Workspace: tender/);
+  const comparison = await compare({ file: `file:501@default.${"a".repeat(24)}`, workspace: "workspace:tender", expected_sha256: "a".repeat(64) });
+  assert.match(JSON.stringify(comparison), /Workspace: workspace:tender/);
   assert.match(JSON.stringify(comparison), /yfy_capture/);
 });
 
@@ -39,7 +39,8 @@ test("tender prompts are absent when the profile is not configured", () => {
 test("server instructions only recommend available and ready capabilities", () => {
   const evidenceOnly = { config: { toolsets: ["evidence"], workflowProfiles: [], authorityScopes: [] } } as unknown as AppRuntime;
   const instructions = serverInstructions(evidenceOnly);
-  assert.doesNotMatch(instructions, /yfy_status|inventory|yfy_capture/);
+  assert.match(instructions, /yfy_status/);
+  assert.doesNotMatch(instructions, /inventory|yfy_capture/);
   const ready = { config: { toolsets: ["drive", "inventory", "evidence"], workflowProfiles: [], authorityScopes: [{ id: "workspace" }] } } as unknown as AppRuntime;
   const readyInstructions = serverInstructions(ready);
   assert.match(readyInstructions, /ItemRef.*yfy_get/);

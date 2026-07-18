@@ -7,6 +7,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { loadConfig } from "./config.js";
 import { AppRuntime } from "./runtime/runtime.js";
 import { registerCatalog } from "./tools/registerCatalog.js";
+import { formatItemRef } from "./domain/refs.js";
 
 type Handler = (args: Record<string, unknown>, extra: { signal: AbortSignal; sendNotification: () => Promise<void> }) => Promise<{ structuredContent?: Record<string, unknown>; isError?: boolean }>;
 class FakeServer {
@@ -46,23 +47,25 @@ test("live evidence tools download and hash a controlled file", { skip: process.
   registerCatalog(server as unknown as McpServer, runtime);
   const resourceUris: string[] = [];
   try {
+    const access = runtime.access.resolveContext("default");
+    const fileRef = formatItemRef("file", fileId, access.context.id, access.identityRef);
     const handler = server.tools.get("yfy_capture")!;
-    const result = await handler({ file: `file:${fileId}`, workspace: "evidence_scope" }, { signal: new AbortController().signal, sendNotification: async () => undefined });
+    const result = await handler({ file: fileRef, workspace: "workspace:evidence_scope" }, { signal: new AbortController().signal, sendNotification: async () => undefined });
     assert.notEqual(result.isError, true, JSON.stringify(result.structuredContent));
     const resource = result.structuredContent?.resource as Record<string, unknown>;
     assert.match(String(resource.sha256), /^[a-f0-9]{64}$/i);
     assert.equal(resource.local_path, undefined);
     if (typeof resource.resource_uri === "string") resourceUris.push(resource.resource_uri);
-    const verified = await handler({ file: `file:${fileId}`, workspace: "evidence_scope", expected: { sha256: String(resource.sha256), size_bytes: Number(resource.size_bytes) } }, { signal: new AbortController().signal, sendNotification: async () => undefined });
+    const verified = await handler({ file: fileRef, workspace: "workspace:evidence_scope", expected: { sha256: String(resource.sha256), size_bytes: Number(resource.size_bytes) } }, { signal: new AbortController().signal, sendNotification: async () => undefined });
     assert.notEqual(verified.isError, true, JSON.stringify(verified.structuredContent));
     assert.equal((verified.structuredContent?.expectation as Record<string, unknown>).verdict, "matched");
     const verifiedResource = verified.structuredContent?.resource as Record<string, unknown>;
     if (typeof verifiedResource?.resource_uri === "string") resourceUris.push(verifiedResource.resource_uri);
     const versionsHandler = server.tools.get("yfy_versions")!;
-    const versionsResult = await versionsHandler({ file: `file:${fileId}` }, { signal: new AbortController().signal, sendNotification: async () => undefined });
+    const versionsResult = await versionsHandler({ request: { mode: "first_request", file: fileRef } }, { signal: new AbortController().signal, sendNotification: async () => undefined });
     const versions = versionsResult.structuredContent?.versions as Array<Record<string, unknown>>;
     if (process.env.YFY_LIVE_HISTORY_TESTS === "enabled" && versions.length > 1 && typeof versions[1]?.ref === "string") {
-      const historical = await handler({ file: `file:${fileId}`, workspace: "evidence_scope", version: versions[1].ref }, { signal: new AbortController().signal, sendNotification: async () => undefined });
+      const historical = await handler({ file: fileRef, workspace: "workspace:evidence_scope", version: versions[1].ref }, { signal: new AbortController().signal, sendNotification: async () => undefined });
       assert.notEqual(historical.isError, true, JSON.stringify(historical.structuredContent));
       const historicalResource = historical.structuredContent?.resource as Record<string, unknown>;
       assert.equal(historicalResource.sha1, versions[1]?.sha1);

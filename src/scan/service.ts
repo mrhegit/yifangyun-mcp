@@ -7,10 +7,10 @@ import type { ScopeItemCursor, ScopeItemPage, ScopeScanPolicy, ScopeScanReposito
 
 export interface CreateSnapshotInput {
   accessContextId: string;
-  caseSensitive: boolean;
+  caseSensitive?: boolean;
   includeFiles: boolean;
   includeFolders: boolean;
-  matchFields: Array<"name" | "path">;
+  matchFields?: Array<"name" | "path">;
   maxAgeSeconds?: number;
   forceRefresh?: boolean;
   maxItemDepth: number;
@@ -18,6 +18,9 @@ export interface CreateSnapshotInput {
   pageCapacity: number;
   rootFolderId: string;
   signal?: AbortSignal;
+  workspaceFingerprint?: string;
+  workspaceId?: string;
+  workspaceRef?: string;
 }
 
 export class SnapshotService {
@@ -42,10 +45,8 @@ export class SnapshotService {
   async create(input: CreateSnapshotInput): Promise<{ reuseReason: "fresh_complete" | "running_join" | "new"; reused: boolean; state: ScopeScanState }> {
     const resolved = this.access.resolveContext(input.accessContextId);
     const policy: ScopeScanPolicy = {
-      caseSensitive: input.caseSensitive,
       includeFiles: input.includeFiles,
       includeFolders: input.includeFolders,
-      matchFields: input.matchFields,
       maxItemDepth: input.maxItemDepth,
       maxItems: input.maxItems,
       pageCapacity: input.pageCapacity
@@ -59,7 +60,10 @@ export class SnapshotService {
       policy,
       rootFolderId: input.rootFolderId,
       signal: input.signal,
-      userId: resolved.context.userId
+      userId: resolved.context.userId,
+      workspaceFingerprint: input.workspaceFingerprint ?? `internal:${resolved.identityRef}:${input.rootFolderId}`,
+      workspaceId: input.workspaceId ?? "internal",
+      workspaceRef: input.workspaceRef ?? "workspace:internal"
     });
     this.launch(started.state.scanId);
     return started;
@@ -77,47 +81,25 @@ export class SnapshotService {
     limit: number;
     mode: "search" | "list";
     queries?: string[];
+    matchFields?: Array<"name" | "path">;
+    caseSensitive?: boolean;
     scanId: string;
     type?: "file" | "folder" | "all";
   }): Promise<ScopeItemPage & { state: ScopeScanState }> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const state = await this.get(input.scanId, input.accessContextId);
-      if (input.cursor && input.cursor.revision !== state.revision) {
-        throw new YifangyunError("Inventory changed after this cursor was issued.", {
-          code: "YFY_INVENTORY_CURSOR_STALE",
-          phase: "inventory_query",
-          scanId: state.scanId,
-          agentDetails: { current_revision: state.revision, cursor_revision: input.cursor.revision, restart_required: true },
-          suggestedAction: "Repeat the same inventory query without cursor to restart from the first stable page."
-        });
-      }
-      const queries = input.queries ?? [];
-      if (input.mode === "search" && queries.length === 0) {
-        throw new YifangyunError("Inventory search requires at least one query.", { code: "YFY_INVENTORY_QUERY_EMPTY", phase: "inventory_query", scanId: state.scanId, suggestedAction: "Provide queries, or use mode=list to enumerate inventory items." });
-      }
-      const result = input.mode === "search"
-        ? await this.engine.search(input.scanId, queries, input.type ?? "all", input.cursor, input.limit)
-        : await this.engine.listItems(input.scanId, input.type ?? "all", input.cursor, input.limit);
-      const after = await this.get(input.scanId, input.accessContextId);
-      if (after.revision === state.revision) {
-        return { ...result, ...(result.nextCursor ? { nextCursor: { ...result.nextCursor, revision: state.revision } } : {}), state };
-      }
-      if (input.cursor) {
-        throw new YifangyunError("Inventory changed after this cursor was issued.", {
-          code: "YFY_INVENTORY_CURSOR_STALE",
-          phase: "inventory_query",
-          scanId: state.scanId,
-          agentDetails: { current_revision: after.revision, cursor_revision: input.cursor.revision, restart_required: true },
-          suggestedAction: "Repeat the same inventory query without cursor to restart from the first stable page."
-        });
-      }
-    }
-    throw new YifangyunError("Inventory is changing too quickly to return a consistent page.", { code: "YFY_INVENTORY_QUERY_BUSY", phase: "inventory_query", retryable: true, scanId: input.scanId, suggestedAction: "Retry after the inventory reaches complete or partial status." });
+    const state = await this.get(input.scanId, input.accessContextId);
+    const watermark = input.cursor?.watermark ?? state.commitWatermark;
+    if (watermark > state.commitWatermark) throw new YifangyunError("Inventory cursor references an uncommitted observation watermark.", { code: "YFY_INVENTORY_CURSOR_INVALID", phase: "inventory_query", scanId: state.scanId });
+    const queries = input.queries ?? [];
+    if (input.mode === "search" && queries.length === 0) throw new YifangyunError("Inventory search requires at least one query.", { code: "YFY_INVENTORY_QUERY_EMPTY", phase: "inventory_query", scanId: state.scanId });
+    const result = input.mode === "search"
+      ? await this.engine.search(input.scanId, queries, input.matchFields ?? ["name", "path"], input.caseSensitive ?? false, input.type ?? "all", input.cursor, input.limit, watermark)
+      : await this.engine.listItems(input.scanId, input.type ?? "all", input.cursor, input.limit, watermark);
+    return { ...result, ...(result.nextCursor ? { nextCursor: { ...result.nextCursor, watermark } } : {}), state };
   }
 
   async cancel(scanId: string, accessContextId?: string): Promise<ScopeScanState> {
     const state = await this.get(scanId, accessContextId);
-    if (["complete", "partial", "cancelled", "failed", "expired"].includes(state.status)) return state;
+    if (["complete", "partial", "cancelled", "failed"].includes(state.status)) return state;
     this.controllers.get(scanId)?.abort("snapshot cancelled");
     return this.engine.cancel(scanId);
   }
@@ -129,6 +111,28 @@ export class SnapshotService {
   async manifest(scanId: string, accessContextId?: string): Promise<JsonObject> {
     await this.get(scanId, accessContextId);
     return this.engine.manifest(scanId);
+  }
+
+  async receipts(scanId: string, accessContextId: string, page: number, pageSize = 25) {
+    await this.get(scanId, accessContextId);
+    return this.repository.listReceiptSummary(scanId, page * pageSize, pageSize);
+  }
+
+  async release(scanId: string, accessContextId: string): Promise<boolean> {
+    try {
+      await this.get(scanId, accessContextId);
+    } catch (error) {
+      if (error instanceof YifangyunError && error.code === "YFY_INVENTORY_NOT_FOUND") return false;
+      throw error;
+    }
+    const worker = this.workers.get(scanId);
+    this.controllers.get(scanId)?.abort("inventory released");
+    await worker;
+    return this.repository.release(scanId);
+  }
+
+  storageStats() {
+    return this.repository.storageStats();
   }
 
   async close(): Promise<void> {
@@ -169,7 +173,7 @@ export class SnapshotService {
     let retryCount = 0;
     while (!signal.aborted && !this.closed) {
       const state = await this.engine.get(scanId);
-      if (!["running", "paused_retryable"].includes(state.status)) {
+      if (!["running", "retry_wait"].includes(state.status)) {
         return;
       }
       const access = this.access.resolveContext(state.accessContextId);
@@ -182,18 +186,20 @@ export class SnapshotService {
         signal,
         userId: access.context.userId as IdLike
       });
-      if (advanced.status === "paused_retryable") {
-        retryCount += 1;
+      if (advanced.status === "retry_wait") {
+        retryCount = advanced.retryCount + 1;
         if (retryCount > 3) {
           await this.engine.fail(scanId, new YifangyunError("Inventory retry budget was exhausted.", { code: "YFY_INVENTORY_RETRY_EXHAUSTED", phase: "inventory_worker" }));
           return;
         }
+        const delayMs = Math.min(5000, 250 * 2 ** retryCount);
+        await this.engine.scheduleRetry(scanId, retryCount, new Date(Date.now() + delayMs).toISOString());
         await new Promise<void>((resolve) => {
           if (signal.aborted) {
             resolve();
             return;
           }
-          const timeout = setTimeout(resolve, Math.min(5000, 250 * 2 ** retryCount));
+          const timeout = setTimeout(resolve, delayMs);
           signal.addEventListener("abort", () => {
             clearTimeout(timeout);
             resolve();
@@ -201,6 +207,7 @@ export class SnapshotService {
         });
       } else {
         retryCount = 0;
+        if (advanced.status === "complete") await this.repository.pruneSuperseded(advanced.workspaceFingerprint, advanced.policyHash, advanced.scanId);
       }
     }
   }

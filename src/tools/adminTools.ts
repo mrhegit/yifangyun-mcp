@@ -1,14 +1,26 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { YifangyunError } from "../client.js";
+import { decodeCursor, encodeCursor } from "../domain/cursors.js";
 import { arrayValue, objectValue, projectDepartment, projectGroup, projectPage, projectUser, provenance } from "../domain/projectors.js";
 import type { AppRuntime } from "../runtime/runtime.js";
 import type { JsonArray, JsonObject, JsonValue } from "../types.js";
+import { continuationAction, pageOutput, paginatedRequestSchema, parsePaginatedRequest } from "./pagination.js";
 import { registerTool } from "./tooling.js";
-import { DepartmentSchema, GroupSchema, JsonValueSchema, PageInputShape, PageSchema, ProvenanceSchema, UserSchema } from "./schemas.js";
+import { DepartmentSchema, GroupSchema, JsonValueSchema, NextActionSchema, ProvenanceSchema, SimplePageSchema, UserSchema } from "./schemas.js";
 
 const IdSchema = z.string().trim().regex(/^\d+$/);
 const JsonObjectSchema = z.record(z.unknown());
+const AdminLimitSchema = z.number().int().min(1).max(100).default(25);
+const AdminPageOutputShape = { page: SimplePageSchema.optional(), next_action: NextActionSchema.optional() };
+const DepartmentUsersRequest = paginatedRequestSchema({ department_id: IdSchema, include_contact: z.boolean().default(false), limit: AdminLimitSchema });
+const DepartmentUsersCursor = z.object({ department_id: IdSchema, include_contact: z.boolean(), page_id: z.number().int().nonnegative(), limit: z.number().int().min(1).max(100) }).strict();
+const GroupListRequest = paginatedRequestSchema({ query: z.string().max(200).optional(), limit: AdminLimitSchema });
+const GroupUsersRequest = paginatedRequestSchema({ group_id: IdSchema, include_contact: z.boolean().default(false), limit: AdminLimitSchema });
+const GroupListCursor = z.object({ query: z.string().optional(), page_id: z.number().int().nonnegative(), limit: z.number().int().min(1).max(100) }).strict();
+const GroupUsersCursor = z.object({ group_id: IdSchema, include_contact: z.boolean(), page_id: z.number().int().nonnegative(), limit: z.number().int().min(1).max(100) }).strict();
+const AdminLogRequest = paginatedRequestSchema({ start_date: z.string().length(10).optional(), end_date: z.string().length(10).optional(), date: z.string().length(10).optional(), limit: AdminLimitSchema });
+const AdminLogCursor = z.object({ action: z.enum(["list", "list_paginated"]), start_date: z.string().optional(), end_date: z.string().optional(), date: z.string().optional(), page_id: z.number().int().nonnegative(), limit: z.number().int().min(1).max(100) }).strict();
 
 function providerId(value: unknown): string | number {
   const text = String(value);
@@ -49,13 +61,17 @@ function optionalBody(args: Record<string, unknown>, fields: string[]): JsonObje
   return output;
 }
 
-function pageCapacity(runtime: AppRuntime, value: unknown): number {
-  return Math.min(typeof value === "number" ? value : 50, runtime.config.maxPageCapacity);
+function pageCapacity(runtime: AppRuntime, limit: number): number {
+  return Math.min(limit, runtime.config.maxPageCapacity);
 }
 
 function resultCount(value: JsonValue): number {
   const source = objectValue(value) ?? {};
   return Math.max(...["items", "users", "groups", "departments", "logs", "results", "user_activities"].map((key) => arrayValue(source[key]).length), 0);
+}
+
+function hasMore(value: JsonObject): boolean {
+  return value.has_more === true || typeof value.next_page_id === "number";
 }
 
 export function registerAdminTools(server: McpServer, runtime: AppRuntime): void {
@@ -73,17 +89,27 @@ function registerDepartmentTools(server: McpServer, runtime: AppRuntime): void {
   registerTool(server, "yfy_admin_department_read", {
     title: "Read Yifangyun Admin Departments",
     description: "Get department metadata, children, users, or space usage through the enterprise plane.",
-    inputSchema: { action: z.enum(["get", "children", "users", "spaces"]), department_id: IdSchema.optional(), operator_id: IdSchema.optional(), include_contact: z.boolean().default(false), ...PageInputShape },
-    outputSchema: { department: DepartmentSchema.optional(), departments: z.array(DepartmentSchema).optional(), users: z.array(UserSchema).optional(), spaces: z.unknown().optional(), page: PageSchema.optional(), provenance: ProvenanceSchema }
+    inputSchema: z.object({ action: z.enum(["get", "children", "users", "spaces"]), department_id: IdSchema.optional(), operator_id: IdSchema.optional(), request: DepartmentUsersRequest.optional() }).strict().superRefine((value, context) => {
+      if (["get", "children"].includes(value.action) && !value.department_id) context.addIssue({ code: z.ZodIssueCode.custom, path: ["department_id"], message: "department_id is required." });
+      if (value.action === "spaces" && !value.operator_id) context.addIssue({ code: z.ZodIssueCode.custom, path: ["operator_id"], message: "operator_id is required." });
+      if (value.action === "users" && !value.request) context.addIssue({ code: z.ZodIssueCode.custom, path: ["request"], message: "request is required for paginated users." });
+      if (value.action !== "users" && value.request) context.addIssue({ code: z.ZodIssueCode.custom, path: ["request"], message: "request is only valid for users." });
+    }),
+    outputSchema: { department: DepartmentSchema.optional(), departments: z.array(DepartmentSchema).optional(), users: z.array(UserSchema).optional(), spaces: z.unknown().optional(), ...AdminPageOutputShape, provenance: ProvenanceSchema }
   }, { readOnly: true }, async (args, extra) => {
-    if (args.action !== "spaces") requireFields(args, ["department_id"], "admin_department_read");
-    if (args.action === "spaces") requireFields(args, ["operator_id"], "admin_department_read");
+    const request = args.action === "users" ? parsePaginatedRequest(DepartmentUsersRequest, args.request, "admin_department_users") : undefined;
+    const cursor = request?.mode === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "admin_department_users", request.cursor, DepartmentUsersCursor) : undefined;
+    const departmentId = cursor?.department_id ?? (request?.mode === "first_request" ? request.department_id : "");
+    const includeContact = cursor?.include_contact ?? (request?.mode === "first_request" && request.include_contact === true);
+    const pageId = cursor?.page_id ?? 0;
+    const limit = cursor?.limit ?? (request?.mode === "first_request" ? request.limit : 25);
     const endpoint = args.action === "get" ? `/v2/admin/department/${encodeURIComponent(String(args.department_id))}/info`
       : args.action === "children" ? `/v2/admin/department/${encodeURIComponent(String(args.department_id))}/children`
-        : args.action === "users" ? `/v2/admin/department/${encodeURIComponent(String(args.department_id))}/users`
+        : args.action === "users" ? `/v2/admin/department/${encodeURIComponent(departmentId)}/users`
           : "/v2/admin/department/space_list";
+    const capacity = pageCapacity(runtime, limit);
     const response = await runtime.gateway.getEnterprise(endpoint, {
-      ...(args.action === "users" ? { page_id: Number(args.page_id), page_capacity: pageCapacity(runtime, args.page_capacity) } : {}),
+      ...(args.action === "users" ? { page_id: pageId, page_capacity: capacity } : {}),
       ...(args.action === "spaces" ? { operator_id: String(args.operator_id) } : {})
     }, extra.signal);
     if (args.action === "get") return { department: projectDepartment(response.data), provenance: provenance(response.meta) };
@@ -93,8 +119,11 @@ function registerDepartmentTools(server: McpServer, runtime: AppRuntime): void {
     }
     if (args.action === "users") {
       const source = objectValue(response.data) ?? {};
-      const users = [...arrayValue(source.users), ...arrayValue(source.items)].map((value) => projectUser(value, args.include_contact === true));
-      return { users, page: projectPage(response.data, { itemCount: users.length, pageCapacity: pageCapacity(runtime, args.page_capacity), requestedPageCapacity: Number(args.page_capacity), pageId: Number(args.page_id) }), provenance: provenance(response.meta) };
+      const users = [...arrayValue(source.users), ...arrayValue(source.items)].map((value) => projectUser(value, includeContact));
+      const providerPage = projectPage(response.data, { itemCount: users.length, pageCapacity: capacity, requestedPageCapacity: capacity, pageId });
+      const nextCursor = hasMore(providerPage) ? encodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "admin_department_users", { department_id: departmentId, include_contact: includeContact, page_id: Number(providerPage.next_page_id ?? pageId + 1), limit }) : undefined;
+      const next = continuationAction("yfy_admin_department_read", nextCursor, { action: "users" });
+      return { users, page: pageOutput(users.length, nextCursor), ...(next ? { next_action: next } : {}), provenance: provenance(response.meta) };
     }
     return { spaces: sanitize(response.data), provenance: provenance(response.meta) };
   });
@@ -145,21 +174,39 @@ function registerGroupTools(server: McpServer, runtime: AppRuntime): void {
   registerTool(server, "yfy_admin_group_read", {
     title: "Read Yifangyun Admin Groups",
     description: "List groups, get group metadata, or list group users.",
-    inputSchema: { action: z.enum(["list", "get", "users"]), group_id: IdSchema.optional(), query: z.string().max(200).optional(), include_contact: z.boolean().default(false), ...PageInputShape },
-    outputSchema: { group: GroupSchema.optional(), groups: z.array(GroupSchema).optional(), users: z.array(UserSchema).optional(), page: PageSchema.optional(), provenance: ProvenanceSchema }
+    inputSchema: z.object({ action: z.enum(["list", "get", "users"]), group_id: IdSchema.optional(), request: z.union([GroupListRequest, GroupUsersRequest]).optional() }).strict().superRefine((value, context) => {
+      if (value.action === "get" && !value.group_id) context.addIssue({ code: z.ZodIssueCode.custom, path: ["group_id"], message: "group_id is required for get." });
+      if (value.action !== "get" && !value.request) context.addIssue({ code: z.ZodIssueCode.custom, path: ["request"], message: "request is required for paginated actions." });
+      if (value.action === "get" && value.request) context.addIssue({ code: z.ZodIssueCode.custom, path: ["request"], message: "request is not valid for get." });
+    }),
+    outputSchema: { group: GroupSchema.optional(), groups: z.array(GroupSchema).optional(), users: z.array(UserSchema).optional(), ...AdminPageOutputShape, provenance: ProvenanceSchema }
   }, { readOnly: true }, async (args, extra) => {
-    if (args.action !== "list") requireFields(args, ["group_id"], "admin_group_read");
-    const endpoint = args.action === "list" ? "/v2/admin/group/list" : args.action === "get" ? `/v2/admin/group/${encodeURIComponent(String(args.group_id))}/info` : `/v2/admin/group/${encodeURIComponent(String(args.group_id))}/users`;
-    const capacity = pageCapacity(runtime, args.page_capacity);
-    const response = await runtime.gateway.getEnterprise(endpoint, args.action === "get" ? {} : { query_words: typeof args.query === "string" ? args.query : undefined, page_id: Number(args.page_id), page_capacity: capacity }, extra.signal);
+    const request = args.action === "list" ? parsePaginatedRequest(GroupListRequest, args.request, "admin_group_list")
+      : args.action === "users" ? parsePaginatedRequest(GroupUsersRequest, args.request, "admin_group_users") : undefined;
+    const listCursor = args.action === "list" && request?.mode === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "admin_group_list", request.cursor, GroupListCursor) : undefined;
+    const usersCursor = args.action === "users" && request?.mode === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "admin_group_users", request.cursor, GroupUsersCursor) : undefined;
+    const groupId = usersCursor?.group_id ?? (request?.mode === "first_request" && "group_id" in request ? request.group_id : "");
+    const query = listCursor?.query ?? (request?.mode === "first_request" && "query" in request ? request.query : undefined);
+    const includeContact = usersCursor?.include_contact ?? (request?.mode === "first_request" && "include_contact" in request && request.include_contact === true);
+    const pageId = listCursor?.page_id ?? usersCursor?.page_id ?? 0;
+    const limit = listCursor?.limit ?? usersCursor?.limit ?? (request?.mode === "first_request" ? request.limit : 25);
+    const endpoint = args.action === "list" ? "/v2/admin/group/list" : args.action === "get" ? `/v2/admin/group/${encodeURIComponent(String(args.group_id))}/info` : `/v2/admin/group/${encodeURIComponent(groupId)}/users`;
+    const capacity = pageCapacity(runtime, limit);
+    const response = await runtime.gateway.getEnterprise(endpoint, args.action === "get" ? {} : { query_words: query, page_id: pageId, page_capacity: capacity }, extra.signal);
     if (args.action === "get") return { group: projectGroup(response.data), provenance: provenance(response.meta) };
     const source = objectValue(response.data) ?? {};
     if (args.action === "list") {
       const groups = [...arrayValue(source.groups), ...arrayValue(source.items)].map(projectGroup);
-      return { groups, page: projectPage(response.data, { itemCount: groups.length, pageCapacity: capacity, requestedPageCapacity: Number(args.page_capacity), pageId: Number(args.page_id) }), provenance: provenance(response.meta) };
+      const providerPage = projectPage(response.data, { itemCount: groups.length, pageCapacity: capacity, requestedPageCapacity: capacity, pageId });
+      const nextCursor = hasMore(providerPage) ? encodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "admin_group_list", { ...(query ? { query } : {}), page_id: Number(providerPage.next_page_id ?? pageId + 1), limit }) : undefined;
+      const next = continuationAction("yfy_admin_group_read", nextCursor, { action: "list" });
+      return { groups, page: pageOutput(groups.length, nextCursor), ...(next ? { next_action: next } : {}), provenance: provenance(response.meta) };
     }
-    const users = [...arrayValue(source.users), ...arrayValue(source.items)].map((value) => projectUser(value, args.include_contact === true));
-    return { users, page: projectPage(response.data, { itemCount: users.length, pageCapacity: capacity, requestedPageCapacity: Number(args.page_capacity), pageId: Number(args.page_id) }), provenance: provenance(response.meta) };
+    const users = [...arrayValue(source.users), ...arrayValue(source.items)].map((value) => projectUser(value, includeContact));
+    const providerPage = projectPage(response.data, { itemCount: users.length, pageCapacity: capacity, requestedPageCapacity: capacity, pageId });
+    const nextCursor = hasMore(providerPage) ? encodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "admin_group_users", { group_id: groupId, include_contact: includeContact, page_id: Number(providerPage.next_page_id ?? pageId + 1), limit }) : undefined;
+    const next = continuationAction("yfy_admin_group_read", nextCursor, { action: "users" });
+    return { users, page: pageOutput(users.length, nextCursor), ...(next ? { next_action: next } : {}), provenance: provenance(response.meta) };
   });
 
   registerTool(server, "yfy_admin_group_mutate", {
@@ -221,11 +268,25 @@ function registerLogTools(server: McpServer, runtime: AppRuntime): void {
   registerTool(server, "yfy_admin_log_query", {
     title: "Query Yifangyun Admin Logs",
     description: "Resolve action types or query admin logs through official read-oriented POST endpoints.",
-    inputSchema: { action: z.enum(["action_types", "info", "list", "list_paginated"]), body: JsonObjectSchema.optional(), action_types: z.array(z.number().int().nonnegative()).optional(), start_date: z.string().length(10).optional(), end_date: z.string().length(10).optional(), date: z.string().length(10).optional(), ...PageInputShape },
-    outputSchema: { result: JsonValueSchema, page: PageSchema.optional(), provenance: ProvenanceSchema }
+    inputSchema: z.object({ action: z.enum(["action_types", "info", "list", "list_paginated"]), body: JsonObjectSchema.optional(), action_types: z.array(z.number().int().nonnegative()).optional(), request: AdminLogRequest.optional() }).strict().superRefine((value, context) => {
+      if (value.action === "info" && !value.body) context.addIssue({ code: z.ZodIssueCode.custom, path: ["body"], message: "body is required for info." });
+      if (["list", "list_paginated"].includes(value.action) && !value.request) context.addIssue({ code: z.ZodIssueCode.custom, path: ["request"], message: "request is required for paginated logs." });
+      if (!["list", "list_paginated"].includes(value.action) && value.request) context.addIssue({ code: z.ZodIssueCode.custom, path: ["request"], message: "request is only valid for paginated logs." });
+    }),
+    outputSchema: { result: JsonValueSchema, ...AdminPageOutputShape, provenance: ProvenanceSchema }
   }, { readOnly: true }, async (args, extra) => {
     let endpoint: string;
     let body: JsonObject;
+    const paged = args.action === "list" || args.action === "list_paginated";
+    const request = paged ? parsePaginatedRequest(AdminLogRequest, args.request, "admin_log_query") : undefined;
+    const cursor = request?.mode === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "admin_log_query", request.cursor, AdminLogCursor) : undefined;
+    const action = cursor?.action ?? args.action as "action_types" | "info" | "list" | "list_paginated";
+    if (cursor && action !== args.action) throw new YifangyunError("Admin log cursor action does not match the requested action.", { code: "YFY_CURSOR_INVALID", phase: "admin_log_query" });
+    const startDate = cursor?.start_date ?? (request?.mode === "first_request" ? request.start_date : undefined);
+    const endDate = cursor?.end_date ?? (request?.mode === "first_request" ? request.end_date : undefined);
+    const date = cursor?.date ?? (request?.mode === "first_request" ? request.date : undefined);
+    const pageId = cursor?.page_id ?? 0;
+    const limit = cursor?.limit ?? (request?.mode === "first_request" ? request.limit : 25);
     if (args.action === "action_types") {
       endpoint = "/v2/admin/log/action_type_info";
       body = { is_all: !Array.isArray(args.action_types), ...(Array.isArray(args.action_types) ? { action_types: args.action_types as JsonArray } : {}) };
@@ -234,18 +295,21 @@ function registerLogTools(server: McpServer, runtime: AppRuntime): void {
       endpoint = "/v2/admin/log/log_info";
       body = args.body as JsonObject;
     } else if (args.action === "list") {
-      requireFields(args, ["start_date", "end_date"], "admin_log_query");
+      if (!startDate || !endDate) throw new YifangyunError("start_date and end_date are required for list.", { code: "YFY_INPUT_INVALID", phase: "admin_log_query" });
       endpoint = "/v2/admin/log/log_list";
-      body = { start_date: String(args.start_date), end_date: String(args.end_date), page_id: Number(args.page_id) + 1, page_capacity: Number(args.page_capacity) };
+      body = { start_date: startDate, end_date: endDate, page_id: pageId + 1, page_capacity: pageCapacity(runtime, limit) };
     } else {
-      requireFields(args, ["date"], "admin_log_query");
+      if (!date) throw new YifangyunError("date is required for list_paginated.", { code: "YFY_INPUT_INVALID", phase: "admin_log_query" });
       endpoint = "/v2/admin/log/log_list_by_pagination";
-      body = { date: String(args.date), pagination: Number(args.page_id) + 1, page_capacity: Number(args.page_capacity) };
+      body = { date, pagination: pageId + 1, page_capacity: pageCapacity(runtime, limit) };
     }
     const response = await runtime.gateway.postEnterprise(endpoint, body, {}, extra.signal);
     const result = sanitize(response.data);
-    const paged = args.action === "list" || args.action === "list_paginated";
-    return { result, ...(paged ? { page: projectPage(undefined, { itemCount: resultCount(response.data), pageCapacity: Number(args.page_capacity), requestedPageCapacity: Number(args.page_capacity), pageId: Number(args.page_id) }) } : {}), provenance: provenance(response.meta) };
+    if (!paged) return { result, provenance: provenance(response.meta) };
+    const providerPage = projectPage(response.data, { itemCount: resultCount(response.data), pageCapacity: limit, requestedPageCapacity: limit, pageId });
+    const nextCursor = hasMore(providerPage) ? encodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "admin_log_query", { action: args.action as "list" | "list_paginated", ...(startDate ? { start_date: startDate } : {}), ...(endDate ? { end_date: endDate } : {}), ...(date ? { date } : {}), page_id: Number(providerPage.next_page_id ?? pageId + 1), limit }) : undefined;
+    const next = continuationAction("yfy_admin_log_query", nextCursor, { action: String(args.action) });
+    return { result, page: pageOutput(resultCount(response.data), nextCursor), ...(next ? { next_action: next } : {}), provenance: provenance(response.meta) };
   });
 }
 

@@ -54,7 +54,7 @@ test("live read-only catalog works against Yifangyun", { skip: process.env.YFY_L
   try {
     const status = await call(server, "yfy_status");
     assert.equal(status.connected, true);
-    const personal = await call(server, "yfy_browse", { at: "personal", limit: 5 });
+    const personal = await call(server, "yfy_browse", { request: { mode: "first_request", at: "personal", limit: 5 } });
     const items = Array.isArray(personal.items) ? personal.items as Array<Record<string, unknown>> : [];
     const files = items.filter((item) => item.type === "file");
     const folders = items.filter((item) => item.type === "folder");
@@ -62,48 +62,48 @@ test("live read-only catalog works against Yifangyun", { skip: process.env.YFY_L
     const personalPage = personal.page as Record<string, unknown>;
     assert.equal(typeof personalPage.has_more, "boolean");
     const query = process.env.YFY_LIVE_SEARCH_QUERY ?? "test";
-    const search = await call(server, "yfy_search", { query, in: "personal", limit: 5 });
+    const search = await call(server, "yfy_search", { request: { mode: "first_request", query, in: "personal", limit: 5 } });
     assert.deepEqual(search.coverage, { mode: "provider_index", exhaustive: false });
     if (candidate?.ref && candidate.type) {
       const item = await call(server, "yfy_get", { ref: String(candidate.ref) });
       assert.equal((item.item as Record<string, unknown>).id, String(candidate.id));
       if (typeof candidate.name === "string") {
         const resolved = await call(server, "yfy_resolve", { path: candidate.name, from: "personal" });
-        assert.equal(resolved.resolved, true);
+        assert.equal((resolved.outcome as Record<string, unknown>).status, "resolved");
       }
-      await call(server, "yfy_shares", { item: String(candidate.ref), limit: 5 });
+      await call(server, "yfy_shares", { request: { mode: "first_request", item: String(candidate.ref), limit: 5 } });
       if (candidate.type === "file") {
         const batch = await call(server, "yfy_get_many", { refs: [String(candidate.ref)] });
         assert.equal((batch.summary as Record<string, unknown>).success_count, 1);
-        await call(server, "yfy_versions", { file: String(candidate.ref) });
-        await call(server, "yfy_comments", { file: String(candidate.ref) });
+        await call(server, "yfy_versions", { request: { mode: "first_request", file: String(candidate.ref) } });
+        await call(server, "yfy_comments", { request: { mode: "first_request", file: String(candidate.ref) } });
       }
     }
     const folderCandidate = folders.find((entry) => entry.id && entry.type === "folder");
     if (folderCandidate?.id) {
-      const children = await call(server, "yfy_browse", { at: String(folderCandidate.ref), kind: "file", limit: 5 });
+      const children = await call(server, "yfy_browse", { request: { mode: "first_request", at: String(folderCandidate.ref), kind: "file", limit: 5 } });
       const child = Array.isArray(children.items) ? (children.items as Array<Record<string, unknown>>)[0] : undefined;
       if (child?.name) {
-        const scoped = await call(server, "yfy_search", { query: String(child.name), in: String(folderCandidate.ref), kind: "file", field: "name", exact_name: true, limit: 5 });
+        const scoped = await call(server, "yfy_search", { request: { mode: "first_request", query: String(child.name), in: String(folderCandidate.ref), kind: "file", field: "name", exact_name: true, limit: 5 } });
         const hits = Array.isArray(scoped.hits) ? scoped.hits as Array<Record<string, unknown>> : [];
         assert.ok(hits.every((hit) => (hit.item as Record<string, unknown>).name === child.name));
       }
     }
     if (rootFolderId) {
-      await call(server, "yfy_workspace_validate", { workspace: "live_scope" });
+      await call(server, "yfy_workspace_validate", { workspace: "workspace:live_scope" });
     }
     if (rootFolderId && process.env.YFY_LIVE_INVENTORY_TESTS === "enabled") {
-      const started = await call(server, "yfy_inventory_create", { workspace: "live_scope", max_item_depth: 1, max_items: 100, freshness: { max_age_seconds: 0, mode: "force_refresh" } });
+      const started = await call(server, "yfy_inventory_create", { workspace: "workspace:live_scope", refresh: { mode: "force_refresh" }, limits: { max_item_depth: 1, max_items: 100 } });
       const inventory = String(started.inventory);
       let status = String(started.status);
-      for (let attempt = 0; attempt < 20 && ["running", "paused_retryable"].includes(status); attempt += 1) {
+      for (let attempt = 0; attempt < 20 && ["running", "retry_wait"].includes(status); attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 250));
         const current = await call(server, "yfy_inventory_get", { inventory });
         status = String(current.status);
       }
       const finalState = await call(server, "yfy_inventory_get", { inventory });
       assert.ok(["complete", "partial"].includes(String(finalState.status)), `Unexpected live inventory status: ${finalState.status}`);
-      await call(server, "yfy_inventory_search", { inventory, query: "验收证书", kind: "all", limit: 10 });
+      await call(server, "yfy_inventory_search", { inventory, request: { mode: "first_request", query: "验收证书", kind: "all", limit: 10 } });
     }
   } finally {
     await runtime.close();
