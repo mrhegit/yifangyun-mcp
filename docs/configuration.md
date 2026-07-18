@@ -1,6 +1,6 @@
 # 配置指南
 
-beta.10 默认只启用轻量 Drive 平面。Workspace、Inventory、Capture、Organization 和写入能力都必须显式开启。`transfer` 不进 Tender 默认矩阵。
+`1.0.0` 默认只启用轻量 Drive 平面。Workspace、Inventory、Capture、Organization 和写入能力都必须显式开启。`transfer` 不进 Tender 默认矩阵。
 
 服务只读取当前进程环境变量，不会自动加载项目目录中的 `.env`。本地运行可使用 `node --env-file=.env dist/index.js`；MCP Host、容器和进程管理器应通过各自的 env 配置注入。运行后以 `yfy_status.runtime` 和 `capabilities` 为实际生效值。
 
@@ -118,7 +118,7 @@ Workspace 的 `root_folder_id`、`access_context` 或身份配置变化后，旧
 
 保留期决定本地状态何时可清理；`yfy_inventory_create.refresh.max_age_seconds` 决定本次调用是否接受复用。两者是独立概念：TTL 长并不表示观察仍足够新，freshness 短也不会立即删除旧状态。
 
-beta.10 重新建立内部状态和签名格式。`0.4.0` 的 `YFY_SCAN_DIR` 文件状态不兼容，不会自动迁移、覆盖或删除；升级时必须停止旧进程并配置新的空 `YFY_STATE_DB`。
+`1.0.0` 重新建立内部状态和签名格式。`0.4.0` 的 `YFY_SCAN_DIR` 文件状态不兼容，不会自动迁移、覆盖或删除；升级时必须停止旧进程并配置新的空 `YFY_STATE_DB`。
 
 `yfy_inventory_create` 不提供隐藏的 limits 默认值，每次调用必须显式传。可选 `root_folder` 将扫描限制在 Workspace 内已验证的子树（适合大资料库）：
 

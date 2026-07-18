@@ -58,9 +58,9 @@ function config(toolsets: AppConfig["toolsets"]): AppConfig {
   };
 }
 
-test("the final beta starts all internal format versions at one", () => {
+test("the stable release starts all internal format versions at one", () => {
   const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
-  assert.equal(SERVER_VERSION, "1.0.0-beta.10");
+  assert.equal(SERVER_VERSION, "1.0.0");
   assert.equal(packageJson.version, SERVER_VERSION);
   assert.deepEqual([
     CONTRACT_VERSION,

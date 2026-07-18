@@ -2,7 +2,7 @@
 
 亿方云 OpenAPI 的通用 MCP Server。默认提供轻量 Drive 平面；需要范围证明、完整性判断或原件固化时，可启用 Workspace、Inventory 和 Evidence 平面。
 
-当前开发版本：`1.0.0-beta.10`，作为 1.0 正式版前的最后一个 beta。当前契约包含稳定 MAC Inventory Ref、严格首次页/续页输入、可执行分页诊断、结构化结果校验和证据释放流程。`0.4.0` 的破坏性迁移见 `docs/migration-v1.md`。
+当前稳定版本：`1.0.0`。当前契约包含稳定 MAC Inventory Ref、严格首次页/续页输入、可执行分页诊断、结构化结果校验和证据释放流程。`0.4.0` 的破坏性迁移见 `docs/migration-v1.md`。
 
 ## 能力边界
 
@@ -61,7 +61,7 @@ version:7001@ZmlsZTo1MDFAZGVmYXVsdC5hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh
 
 ItemRef 绑定 `access_context` 和身份指纹。不要构造或修改 Ref；Context 配置变化后应重新发现项目。
 
-Inventory Ref（beta.10+）为稳定可复制形式：
+Inventory Ref（1.0.0+）为稳定可复制形式：
 
 ```text
 inventory:123e4567-e89b-12d3-a456-426614174000@default.a1b2c3d4e5f6789012345678

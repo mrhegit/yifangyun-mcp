@@ -1,6 +1,6 @@
 ﻿# OpenAPI 覆盖矩阵
 
-beta.10 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Drive、Workspace、Inventory、Content 和 Organization Module 内。所有项目工具使用 context-bound Ref，分页工具统一使用扁平 first 字段 / `cursor` 续页契约（见 `docs/migration-v1.md`）。当前服务器不包含 PDF/Office 正文解析、OCR 或 Provider 知识库训练/召回；知识库能力需要独立授权与状态工作流，不属于当前工具集。
+`1.0.0` 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Drive、Workspace、Inventory、Content 和 Organization Module 内。所有项目工具使用 context-bound Ref，分页工具统一使用扁平 first 字段 / `cursor` 续页契约（见 `docs/migration-v1.md`）。当前服务器不包含 PDF/Office 正文解析、OCR 或 Provider 知识库训练/召回；知识库能力需要独立授权与状态工作流，不属于当前工具集。
 
 ## Drive
 

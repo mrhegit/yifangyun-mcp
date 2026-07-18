@@ -1,6 +1,6 @@
-# 从 0.4.0 迁移到 1.0.0-beta.10
+# 从 0.4.0 迁移到 1.0.0
 
-`1.0.0-beta.10` 是 1.0 正式版前的最后一个 beta。无需安装任何中间 beta；从 `0.4.0` 直接切换服务、工具目录、配置、Ref、cursor 和本地状态。
+`1.0.0` 是新的稳定版本。无需安装任何中间 beta；从 `0.4.0` 直接切换服务、工具目录、配置、Ref、cursor 和本地状态。
 
 这是破坏性升级。不要把 `0.4.0` 的文件型 scan 状态当作新版 Inventory 数据库，不要复用旧 Prompt 参数模板、分页 cursor 或数字 ID。
 
@@ -8,13 +8,13 @@
 
 1. 停止 `0.4.0` 服务，确认没有进程写入旧 `YFY_SCAN_DIR`。
 2. 备份旧 scan 目录，保留到新版本验证完成；新版不会自动迁移或删除它。
-3. 为 beta.10 配置新的空 `YFY_STATE_DB`，不要放在旧 scan 目录或 Evidence artifacts 目录内。
-4. 更新 MCP Host 配置并固定版本：`yifangyun-mcp-server@1.0.0-beta.10`。
+3. 为 `1.0.0` 配置新的空 `YFY_STATE_DB`，不要放在旧 scan 目录或 Evidence artifacts 目录内。
+4. 更新 MCP Host 配置并固定版本：`yifangyun-mcp-server@1.0.0`。
 5. 删除 Host 缓存的旧 tools/list、Prompt 参数模板、Ref 和 cursor。
 
 ## 工具映射
 
-| 0.4.0 | beta.10 |
+| 0.4.0 | 1.0.0 |
 |---|---|
 | `yfy_connection_check`、`yfy_context_get` | `yfy_status` |
 | `yfy_root_list`、`yfy_folder_list` | `yfy_browse` |
@@ -104,7 +104,7 @@ inventory:123e4567-e89b-12d3-a456-426614174000@default.a1b2c3d4e5f6789012345678
 
 ## 验证清单
 
-1. `yfy_status` 返回 `server.version=1.0.0-beta.10` 和预期 capabilities。
+1. `yfy_status` 返回 `server.version=1.0.0` 和预期 capabilities。
 2. Host 的 tools/list 显示严格 object + `anyOf` 分页输入，以及 output schema 和 annotations。
 3. Browse/Search 首次调用成功，原样执行 `next_action` 可续页；混参返回 `pagination_mixed_args`。
 4. 旧 cursor、数字 ID、旧短 Ref 和旧 Inventory Ref 被拒绝。
@@ -117,4 +117,4 @@ inventory:123e4567-e89b-12d3-a456-426614174000@default.a1b2c3d4e5f6789012345678
 
 ## 回滚
 
-回滚必须整体切换服务版本、Host 工具目录、Prompt、Ref/cursor 保存和状态路径。`0.4.0` 继续使用备份的 scan 目录，beta.10 使用独立 SQLite；不要让同一客户端模板同时兼容两套工具契约。
+回滚必须整体切换服务版本、Host 工具目录、Prompt、Ref/cursor 保存和状态路径。`0.4.0` 继续使用备份的 scan 目录，`1.0.0` 使用独立 SQLite；不要让同一客户端模板同时兼容两套工具契约。

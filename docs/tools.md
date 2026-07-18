@@ -1,6 +1,6 @@
 # 工具参考
 
-`1.0.0-beta.10` 是 1.0 正式版前的最后一个 beta，使用轻量 Drive 平面与可选的 Workspace、Inventory、Evidence、Organization 平面。普通发现工具保持低成本；范围证明、完整性结论和原件固化必须进入对应的受约束工具。`0.4.0` 的破坏性迁移见 `docs/migration-v1.md`。
+`1.0.0` 是当前稳定版本，使用轻量 Drive 平面与可选的 Workspace、Inventory、Evidence、Organization 平面。普通发现工具保持低成本；范围证明、完整性结论和原件固化必须进入对应的受约束工具。`0.4.0` 的破坏性迁移见 `docs/migration-v1.md`。
 
 **能力边界：** 本服务不提供 PDF/Office 正文解析或 OCR。Provider 的知识库训练与召回属于独立授权和状态工作流，不在当前工具集内。`yfy_open` / `yfy_capture` 交付校验后的字节与可选小文本预览；二进制成功不等于模型已读正文。
 
