@@ -49,8 +49,11 @@ test("server instructions only recommend available and ready capabilities", () =
   assert.match(readyInstructions, /agent_guidance/);
   assert.match(readyInstructions, /claim_allowed=true/);
   assert.match(readyInstructions, /content_delivery/);
+  assert.match(readyInstructions, /agent_readable/);
   assert.match(readyInstructions, /must_release/);
+  assert.match(readyInstructions, /next_action \(yfy_resource_release\)/);
   assert.match(readyInstructions, /yfy_capture/);
-  assert.match(readyInstructions, /release every returned resource/i);
   assert.match(readyInstructions, /Do not use yfy_transfer_ticket_get/);
+  assert.match(readyInstructions, /usage_policy=special_integration_only/);
+  assert.match(readyInstructions, /do_not_echo_url/);
 });

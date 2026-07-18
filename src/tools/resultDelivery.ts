@@ -13,120 +13,251 @@ const PREVIEW_OPTIONS: PreviewOptions[] = [
   { arrayItems: 1, depth: 3, objectFields: 15, stringCharacters: 128 }
 ];
 
-const ANCHOR_FIELDS = new Set([
-  "id", "ref", "name", "type", "file", "item", "inventory", "workspace", "path", "path_display", "provider_path_chain", "relative_ancestor_chain",
-  "page", "next_action", "completeness", "view", "outcome", "status", "verdict",
-  "agent_warnings", "coverage", "must_release", "content_delivery", "resource", "assurance", "match", "trust",
-  "disambiguation_required", "claim_allowed", "unverified_hits", "agent_guidance", "suggested_wait_ms",
-  "agent_interpretation", "diagnostics", "contact_policy", "version_selection_rules",
-  "safe_to_claim_absence", "preview_complete", "usage", "inventory_id", "scan_root"
+/** Operational anchors are copied exactly so text-only hosts can continue safely. */
+const EXACT_CONTROL_KEYS = new Set([
+  "page",
+  "next_action",
+  "inventory",
+  "inventory_id",
+  "must_release",
+  "suggested_wait_ms",
+  "empty_result_meaning",
+  "empty_result_code",
+  "selection_policy",
+  "usage_policy",
+  "not_for_evidence",
+  "do_not_echo_url",
+  "manifest_uri",
+  "receipts_uri_template",
+  "outcome",
+  "status",
+  "verdict",
+  "safe_to_claim_absence",
+  "claim_allowed"
 ]);
 
-function terminalPreview(value: unknown, options: PreviewOptions, depth = 0): unknown {
-  if (typeof value === "string") return value.length <= options.stringCharacters ? value : `${value.slice(0, options.stringCharacters)}...[${value.length - options.stringCharacters} characters omitted]`;
-  if (value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return { item_count: value.length, items: value.slice(0, Math.max(1, options.arrayItems)).map((entry) => terminalPreview(entry, options, depth + 1)), omitted_count: Math.max(0, value.length - Math.max(1, options.arrayItems)) };
-  const entries = Object.entries(value as Record<string, unknown>);
-  const anchors = entries.filter(([key, entry]) => ANCHOR_FIELDS.has(key) || entry === null || typeof entry !== "object").slice(0, options.objectFields);
-  return Object.fromEntries(anchors.map(([key, entry]) => [key, depth < 2 ? terminalPreview(entry, options, depth + 1) : entry === null || typeof entry !== "object" ? terminalPreview(entry, options, depth + 1) : { omitted: true }]));
+/** Decision fields are compacted but kept ahead of ordinary result samples. */
+const PRIORITY_CONTROL_KEYS = new Set([
+  "content_delivery",
+  "completeness",
+  "agent_guidance",
+  "agent_warnings",
+  "disambiguation",
+  "content_search_policy",
+  "recommended_actions",
+  "planning",
+  "lifecycle",
+  "preferred_alternatives",
+  "coverage",
+  "workspace",
+  "scan_root",
+  "agent_interpretation",
+  "diagnostics",
+  "version_selection_rules",
+  "recommended_workflows"
+]);
+
+const RESOURCE_CONTROL_KEYS = new Set([
+  "resource_uri",
+  "delivery",
+  "expires_at",
+  "file_name",
+  "media_type",
+  "size_bytes",
+  "must_release",
+  "part_count",
+  "part_size_bytes"
+]);
+
+/** Sample-plane keys that may still hold full-fidelity refs when previewed. */
+const NEVER_TRUNCATE_STRING_KEYS = new Set([
+  "next_cursor",
+  "cursor",
+  "ref",
+  "inventory",
+  "resource_uri",
+  "manifest_uri",
+  "receipts_uri_template",
+  "file",
+  "item"
+]);
+
+const SAMPLE_BULK_KEYS = new Set([
+  "items",
+  "hits",
+  "unverified_hits",
+  "versions",
+  "comments",
+  "shares",
+  "departments",
+  "users",
+  "groups",
+  "results",
+  "places",
+  "profiles",
+  "capabilities"
+]);
+
+function deepCloneJson<T>(value: T): T {
+  return value === undefined ? value : JSON.parse(JSON.stringify(value)) as T;
 }
 
-function preview(value: unknown, options: PreviewOptions, depth = 0): unknown {
+export function continuationReady(control: Record<string, unknown>): boolean {
+  const page = control.page;
+  const nextAction = control.next_action;
+  if (!page || typeof page !== "object" || Array.isArray(page)) return false;
+  const pageObj = page as Record<string, unknown>;
+  if (pageObj.has_more !== true) return false;
+  if (typeof pageObj.next_cursor !== "string" || pageObj.next_cursor.length === 0) return false;
+  if (!nextAction || typeof nextAction !== "object" || Array.isArray(nextAction)) return false;
+  const action = nextAction as Record<string, unknown>;
+  if (typeof action.tool !== "string" || action.tool.length === 0) return false;
+  if (!action.arguments || typeof action.arguments !== "object" || Array.isArray(action.arguments)) return false;
+  return true;
+}
+
+function terminalPreview(value: unknown, options: PreviewOptions, depth = 0, parentKey?: string): unknown {
   if (typeof value === "string") {
+    if (parentKey && NEVER_TRUNCATE_STRING_KEYS.has(parentKey)) return value;
     return value.length <= options.stringCharacters
       ? value
       : `${value.slice(0, options.stringCharacters)}...[${value.length - options.stringCharacters} characters omitted]`;
   }
   if (value === null || typeof value !== "object") return value;
-  if (depth >= options.depth) return terminalPreview(value, options);
   if (Array.isArray(value)) {
     return {
       item_count: value.length,
-      items: value.slice(0, options.arrayItems).map((entry) => preview(entry, options, depth + 1)),
+      items: value.slice(0, Math.max(1, options.arrayItems)).map((entry) => terminalPreview(entry, options, depth + 1)),
+      omitted_count: Math.max(0, value.length - Math.max(1, options.arrayItems))
+    };
+  }
+  const entries = Object.entries(value as Record<string, unknown>);
+  const kept = entries.slice(0, options.objectFields);
+  return Object.fromEntries(kept.map(([key, entry]) => {
+    if (depth >= 2 && entry !== null && typeof entry === "object") {
+      if (NEVER_TRUNCATE_STRING_KEYS.has(key) && typeof entry === "string") return [key, entry];
+      if (typeof entry === "string") return [key, terminalPreview(entry, options, depth + 1, key)];
+      return [key, { omitted: true }];
+    }
+    return [key, terminalPreview(entry, options, depth + 1, key)];
+  }).concat(entries.length > options.objectFields ? [["omitted_field_count", entries.length - options.objectFields]] : []));
+}
+
+function previewSample(value: unknown, options: PreviewOptions, depth = 0, parentKey?: string): unknown {
+  if (typeof value === "string") {
+    if (parentKey && NEVER_TRUNCATE_STRING_KEYS.has(parentKey)) return value;
+    return value.length <= options.stringCharacters
+      ? value
+      : `${value.slice(0, options.stringCharacters)}...[${value.length - options.stringCharacters} characters omitted]`;
+  }
+  if (value === null || typeof value !== "object") return value;
+  if (depth >= options.depth) return terminalPreview(value, options, 0, parentKey);
+  if (Array.isArray(value)) {
+    return {
+      item_count: value.length,
+      items: value.slice(0, options.arrayItems).map((entry) => previewSample(entry, options, depth + 1)),
       omitted_count: Math.max(0, value.length - options.arrayItems)
     };
   }
   const entries = Object.entries(value as Record<string, unknown>);
-  const prioritized = [...entries.filter(([key]) => ANCHOR_FIELDS.has(key)), ...entries.filter(([key]) => !ANCHOR_FIELDS.has(key))];
-  return Object.fromEntries(prioritized.slice(0, options.objectFields).map(([key, entry]) => [key, preview(entry, options, depth + 1)]).concat(
+  // Prefer bulk sample keys and short identity fields for agent readability.
+  const prioritized = [
+    ...entries.filter(([key]) => SAMPLE_BULK_KEYS.has(key) || NEVER_TRUNCATE_STRING_KEYS.has(key) || key === "name" || key === "type" || key === "id" || key === "match"),
+    ...entries.filter(([key]) => !SAMPLE_BULK_KEYS.has(key) && !NEVER_TRUNCATE_STRING_KEYS.has(key) && key !== "name" && key !== "type" && key !== "id" && key !== "match")
+  ];
+  return Object.fromEntries(prioritized.slice(0, options.objectFields).map(([key, entry]) => [key, previewSample(entry, options, depth + 1, key)]).concat(
     entries.length > options.objectFields ? [["omitted_field_count", entries.length - options.objectFields]] : []
   ));
 }
 
-function compactEnvelope(tool: string, output: Record<string, unknown>, originalCharacters: number, options: PreviewOptions) {
+function projectResourceControl(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const resource = value as Record<string, unknown>;
+  const projected: Record<string, unknown> = {};
+  for (const key of RESOURCE_CONTROL_KEYS) {
+    if (resource[key] !== undefined) projected[key] = deepCloneJson(resource[key]);
+  }
+  return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
+export function extractControlPlane(output: Record<string, unknown>, options: PreviewOptions = PREVIEW_OPTIONS[0]!): Record<string, unknown> {
+  const control: Record<string, unknown> = {};
+  for (const key of EXACT_CONTROL_KEYS) {
+    if (output[key] !== undefined) control[key] = deepCloneJson(output[key]);
+  }
+  for (const key of PRIORITY_CONTROL_KEYS) {
+    if (output[key] !== undefined) control[key] = previewSample(output[key], options, 0, key);
+  }
+  const resource = projectResourceControl(output.resource);
+  if (resource) control.resource = resource;
+  return control;
+}
+
+function extractSamplePlane(output: Record<string, unknown>): Record<string, unknown> {
+  const sample: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(output)) {
+    if (EXACT_CONTROL_KEYS.has(key) || PRIORITY_CONTROL_KEYS.has(key) || key === "resource") continue;
+    sample[key] = value;
+  }
+  return sample;
+}
+
+function redactSensitiveValue(value: unknown, redactDownloadUrls: boolean): unknown {
+  if (Array.isArray(value)) return value.map((entry) => redactSensitiveValue(entry, redactDownloadUrls));
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+    key,
+    redactDownloadUrls && key === "download_url" && typeof entry === "string"
+      ? "***redacted***"
+      : redactSensitiveValue(entry, redactDownloadUrls)
+  ]));
+}
+
+/** Redact sensitive URL fields from a deep clone used only for the text channel. */
+export function redactSensitiveForText(output: Record<string, unknown>): Record<string, unknown> {
+  return redactSensitiveValue(output, output.do_not_echo_url === true) as Record<string, unknown>;
+}
+
+function compactEnvelope(
+  tool: string,
+  control: Record<string, unknown>,
+  samplePreview: unknown,
+  originalCharacters: number,
+  mode: "compact_preview" | "control_only"
+) {
   return {
     status: "success",
     tool,
     text_delivery: {
-      mode: "compact_preview",
+      mode,
       original_characters: originalCharacters,
-      full_result_available_in: "structuredContent"
+      full_result_available_in: "structuredContent",
+      continuation_ready: continuationReady(control)
     },
-    result_preview: preview(output, options)
+    control,
+    ...(mode === "compact_preview" ? { result_preview: samplePreview } : {})
   };
 }
 
 export function serializeToolText(tool: string, output: Record<string, unknown>, maxCharacters = DEFAULT_TEXT_BUDGET): string {
-  const serialized = JSON.stringify(output);
+  const textSafe = redactSensitiveForText(output);
+  const serialized = JSON.stringify(textSafe);
   if (serialized.length <= maxCharacters) return serialized;
+
+  const sample = extractSamplePlane(textSafe);
+  const originalCharacters = serialized.length;
+
   for (const options of PREVIEW_OPTIONS) {
-    const compact = JSON.stringify(compactEnvelope(tool, output, serialized.length, options));
+    const control = extractControlPlane(textSafe, options);
+    const samplePreview = previewSample(sample, options);
+    const compact = JSON.stringify(compactEnvelope(tool, control, samplePreview, originalCharacters, "compact_preview"));
     if (compact.length <= maxCharacters) return compact;
   }
-  const controlAnchors = controlAnchorsFromOutput(output);
-  const metadataOnly = JSON.stringify({
-    status: "success",
-    tool,
-    text_delivery: {
-      mode: "metadata_only",
-      original_characters: serialized.length,
-      full_result_available_in: "structuredContent"
-    },
-    top_level_fields: Object.keys(output),
-    identity: Object.fromEntries(Object.entries(output).filter(([key]) => ["file", "item", "inventory", "inventory_id", "workspace", "outcome", "status", "verdict"].includes(key))),
-    ...controlAnchors,
-    page: output.page,
-    next_action: output.next_action,
-    completeness: output.completeness
-  });
-  if (metadataOnly.length <= maxCharacters) return metadataOnly;
-  return JSON.stringify({
-    status: "success",
-    tool,
-    text_delivery: { mode: "metadata_only", original_characters: serialized.length, full_result_available_in: "structuredContent" },
-    top_level_fields: Object.keys(output),
-    identity: Object.fromEntries(Object.entries(output).filter(([key]) => ["file", "item", "inventory", "inventory_id", "workspace", "outcome", "status", "verdict"].includes(key))),
-    ...controlAnchors,
-    page: output.page,
-    next_action: output.next_action,
-    completeness: output.completeness
-  });
-}
 
-/** Keep release/fetch/guidance anchors even when the text channel collapses to metadata_only. */
-function controlAnchorsFromOutput(output: Record<string, unknown>): Record<string, unknown> {
-  const anchors: Record<string, unknown> = {};
-  if (output.must_release === true) anchors.must_release = true;
-  if (output.content_delivery && typeof output.content_delivery === "object" && !Array.isArray(output.content_delivery)) {
-    const delivery = output.content_delivery as Record<string, unknown>;
-    anchors.content_delivery = {
-      mode: delivery.mode,
-      resource_fetch_required: delivery.resource_fetch_required,
-      embedded_resource_in_tool_result: delivery.embedded_resource_in_tool_result,
-      still_must_release: delivery.still_must_release === true ? true : undefined,
-      next_step: typeof delivery.next_step === "string" ? delivery.next_step : undefined
-    };
-  }
-  if (output.resource && typeof output.resource === "object" && !Array.isArray(output.resource)) {
-    const resource = output.resource as Record<string, unknown>;
-    anchors.resource = {
-      ...(typeof resource.resource_uri === "string" ? { resource_uri: resource.resource_uri } : {}),
-      ...(typeof resource.delivery === "string" ? { delivery: resource.delivery } : {}),
-      ...(resource.must_release === true ? { must_release: true } : {})
-    };
-  }
-  if (Array.isArray(output.agent_warnings)) anchors.agent_warnings = output.agent_warnings.slice(0, 8);
-  if (output.agent_guidance && typeof output.agent_guidance === "object") anchors.agent_guidance = output.agent_guidance;
-  if (typeof output.suggested_wait_ms === "number") anchors.suggested_wait_ms = output.suggested_wait_ms;
-  return anchors;
+  const control = extractControlPlane(textSafe, PREVIEW_OPTIONS[PREVIEW_OPTIONS.length - 1]!);
+  const controlOnly = JSON.stringify(compactEnvelope(tool, control, undefined, originalCharacters, "control_only"));
+  if (controlOnly.length <= maxCharacters) return controlOnly;
+
+  // Control plane must never truncate operational anchors even if over budget.
+  return controlOnly;
 }

@@ -1,5 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { zodToJsonSchema } from "zod-to-json-schema";
 import { redactSensitiveText, YifangyunError } from "../client.js";
 import { logEvent } from "../observability.js";
 import type { JsonObject } from "../types.js";
@@ -15,7 +17,8 @@ type ToolHandler = (args: Record<string, unknown>, extra: ToolExtra) => Promise<
 
 export interface ToolDefinition {
   description: string;
-  inputSchema: Record<string, z.ZodTypeAny> | z.ZodTypeAny;
+  inputSchema: z.ZodRawShape;
+  inputValidator?: z.ZodTypeAny;
   outputSchema: Record<string, z.ZodTypeAny> | z.ZodObject<z.ZodRawShape>;
   title: string;
 }
@@ -26,6 +29,41 @@ export interface ToolRegistrationOptions {
   onInvalidOutput?: (result: Record<string, unknown>) => Promise<void>;
   openWorld?: boolean;
   readOnly: boolean;
+}
+
+interface ListedToolDefinition {
+  annotations: {
+    destructiveHint: boolean;
+    idempotentHint: boolean;
+    openWorldHint: boolean;
+    readOnlyHint: boolean;
+  };
+  description: string;
+  inputSchema: Record<string, unknown>;
+  name: string;
+  outputSchema: Record<string, unknown>;
+  title: string;
+}
+
+const listedTools = new WeakMap<object, Map<string, ListedToolDefinition>>();
+
+function protocolJsonSchema(schema: z.ZodTypeAny, requireObjectType: boolean): Record<string, unknown> {
+  const generated = zodToJsonSchema(schema, {
+    $refStrategy: "none",
+    strictUnions: true,
+    target: "jsonSchema7"
+  }) as Record<string, unknown>;
+  delete generated.$schema;
+  return requireObjectType ? { type: "object", ...generated } : generated;
+}
+
+export function installToolListHandler(server: McpServer): void {
+  const protocol = (server as unknown as { server?: McpServer["server"] }).server;
+  if (!protocol) return;
+  protocol.removeRequestHandler("tools/list");
+  protocol.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [...(listedTools.get(server)?.values() ?? [])]
+  }));
 }
 
 function normalizedErrorCode(error: YifangyunError, providerCode?: string): string {
@@ -99,6 +137,7 @@ export function registerTool(
   options: ToolRegistrationOptions,
   handler: ToolHandler
 ): void {
+  const inputSchema = z.object(definition.inputSchema).strict();
   const outputValidator = definition.outputSchema instanceof z.ZodObject
     ? definition.outputSchema.strict()
     : z.object(definition.outputSchema).strict();
@@ -107,20 +146,49 @@ export function registerTool(
     toolDefinition: Record<string, unknown>,
     toolHandler: (args: Record<string, unknown>, extra: ToolExtra) => Promise<Record<string, unknown>>
   ) => void;
+  const annotations = {
+    destructiveHint: options.destructive ?? false,
+    idempotentHint: options.idempotent ?? options.readOnly,
+    openWorldHint: options.openWorld ?? true,
+    readOnlyHint: options.readOnly
+  };
+  let registry = listedTools.get(server);
+  if (!registry) {
+    registry = new Map();
+    listedTools.set(server, registry);
+  }
+  registry.set(name, {
+    annotations,
+    description: definition.description,
+    inputSchema: protocolJsonSchema(definition.inputValidator ?? inputSchema, true),
+    name,
+    outputSchema: protocolJsonSchema(outputValidator, true),
+    title: definition.title
+  });
   sdkRegisterTool(name, {
-    ...definition,
+    title: definition.title,
+    description: definition.description,
+    inputSchema,
     outputSchema: definition.outputSchema,
-    annotations: {
-      destructiveHint: options.destructive ?? false,
-      idempotentHint: options.idempotent ?? options.readOnly,
-      openWorldHint: options.openWorld ?? true,
-      readOnlyHint: options.readOnly
-    }
+    annotations
   }, async (args, extra) => {
     let produced: Record<string, unknown> | undefined;
     let cleanupRequired = false;
     try {
-      produced = await handler(args, extra);
+      let validatedArgs = args;
+      if (definition.inputValidator) {
+        const parsed = definition.inputValidator.safeParse(args);
+        if (!parsed.success) {
+          throw new YifangyunError("Tool input is invalid.", {
+            code: "YFY_INPUT_INVALID",
+            phase: `${name}_input`,
+            agentDetails: { issues: parsed.error.issues.map((issue) => ({ code: issue.code, path: issue.path.join(".") })) },
+            suggestedAction: "Use the fields shown by tools/list. For pagination, pass first-page business fields or execute next_action with cursor exactly."
+          });
+        }
+        validatedArgs = parsed.data as Record<string, unknown>;
+      }
+      produced = await handler(validatedArgs, extra);
       cleanupRequired = true;
       const validated = outputValidator.safeParse(produced);
       if (!validated.success) {

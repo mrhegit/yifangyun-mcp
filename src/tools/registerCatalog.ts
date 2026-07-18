@@ -7,6 +7,7 @@ import { registerMutationTools } from "./mutationTools.js";
 import { registerOrganizationTools } from "./organizationTools.js";
 import { registerInventoryTools } from "./inventoryTools.js";
 import { registerTransferTools } from "./transferTools.js";
+import { installToolListHandler } from "./tooling.js";
 
 export function registerCatalog(server: McpServer, runtime: AppRuntime): void {
   if (runtime.config.toolsets.includes("drive")) {
@@ -22,4 +23,5 @@ export function registerCatalog(server: McpServer, runtime: AppRuntime): void {
   registerMutationTools(server, runtime);
   registerAdminTools(server, runtime);
   registerTransferTools(server, runtime);
+  installToolListHandler(server);
 }

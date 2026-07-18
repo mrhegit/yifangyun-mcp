@@ -1,6 +1,6 @@
 {
   "name": "yifangyun-mcp-server",
-  "version": "1.0.0-beta.8",
+  "version": "1.0.0-beta.9",
   "description": "MCP server for Yifangyun cloud drive access with enterprise JWT authentication.",
   "repository": {
     "type": "git",
@@ -44,7 +44,8 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "express": "^5.2.1",
     "undici": "^7.28.0",
-    "zod": "^3.25.76"
+    "zod": "^3.25.76",
+    "zod-to-json-schema": "^3.25.2"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

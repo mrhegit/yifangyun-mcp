@@ -93,23 +93,25 @@ function projectCollab(value: JsonValue | undefined): JsonObject {
   };
 }
 
-const CollaborationReadSchema = z.object({
+const CollaborationReadInputShape = {
   action: z.enum(["list_folder", "get"]),
   folder: FolderRefSchema.optional(),
   collaboration_id: IdSchema.optional(),
   access_context: AccessContextSchema
-}).strict().superRefine((value, context) => {
-  if (value.action === "list_folder") {
-    if (!value.folder) context.addIssue({ code: z.ZodIssueCode.custom, path: ["folder"], message: "folder is required for list_folder." });
-    if (value.collaboration_id) context.addIssue({ code: z.ZodIssueCode.custom, path: ["collaboration_id"], message: "collaboration_id is not valid for list_folder." });
-    if (value.access_context) context.addIssue({ code: z.ZodIssueCode.custom, path: ["access_context"], message: "The folder ref already selects the access identity." });
-  } else {
-    if (!value.collaboration_id) context.addIssue({ code: z.ZodIssueCode.custom, path: ["collaboration_id"], message: "collaboration_id is required for get." });
-    if (value.folder) context.addIssue({ code: z.ZodIssueCode.custom, path: ["folder"], message: "folder is not valid for get." });
-  }
-});
+};
+const CollaborationReadSchema = z.union([
+  z.object({ action: z.literal("list_folder"), folder: FolderRefSchema }).strict(),
+  z.object({ action: z.literal("get"), collaboration_id: IdSchema, access_context: AccessContextSchema }).strict()
+]);
 
-const CollaborationMutateSchema = z.object({
+const CollaborationTargetSchema = z.object({
+  type: z.enum(["user", "group", "department", "user_list", "group_list", "department_list"]),
+  id: IdSchema.optional(),
+  ids: z.array(IdSchema).optional(),
+  role: RoleSchema
+}).strict();
+
+const CollaborationMutateInputShape = {
   action: z.enum(["invite", "invite_batch", "update_role", "delete", "remove_batch"]),
   folder: FolderRefSchema.optional(),
   collaboration_id: IdSchema.optional(),
@@ -118,20 +120,18 @@ const CollaborationMutateSchema = z.object({
   target_type: z.enum(["user", "group", "department", "user_list", "group_list", "department_list"]).optional(),
   target_id: IdSchema.optional(),
   target_ids: z.array(IdSchema).min(1).max(100).optional(),
-  targets: z.array(z.object({ type: z.enum(["user", "group", "department", "user_list", "group_list", "department_list"]), id: IdSchema.optional(), ids: z.array(IdSchema).optional(), role: RoleSchema }).strict()).max(100).optional(),
+  targets: z.array(CollaborationTargetSchema).max(100).optional(),
   invitation_message: z.string().max(140).optional(),
   access_context: AccessContextSchema
-}).strict().superRefine((value, context) => {
-  const folderAction = ["invite", "invite_batch", "remove_batch"].includes(value.action);
-  if (folderAction && !value.folder) context.addIssue({ code: z.ZodIssueCode.custom, path: ["folder"], message: `folder is required for ${value.action}.` });
-  if (folderAction && value.access_context) context.addIssue({ code: z.ZodIssueCode.custom, path: ["access_context"], message: "The folder ref already selects the access identity." });
-  if (!folderAction && value.folder) context.addIssue({ code: z.ZodIssueCode.custom, path: ["folder"], message: `folder is not valid for ${value.action}.` });
-  if (["update_role", "delete"].includes(value.action) && !value.collaboration_id) context.addIssue({ code: z.ZodIssueCode.custom, path: ["collaboration_id"], message: `collaboration_id is required for ${value.action}.` });
-  if (value.action === "update_role" && !value.role) context.addIssue({ code: z.ZodIssueCode.custom, path: ["role"], message: "role is required for update_role." });
-  if (value.action === "remove_batch" && !value.collaboration_ids) context.addIssue({ code: z.ZodIssueCode.custom, path: ["collaboration_ids"], message: "collaboration_ids is required for remove_batch." });
-  if (value.action === "invite" && (!value.target_type || !value.role || (!value.target_id && !value.target_ids))) context.addIssue({ code: z.ZodIssueCode.custom, path: ["target_type"], message: "target_type, role and target_id or target_ids are required for invite." });
-  if (value.action === "invite_batch" && (!value.targets || value.targets.length === 0)) context.addIssue({ code: z.ZodIssueCode.custom, path: ["targets"], message: "targets is required for invite_batch." });
-});
+};
+const CollaborationMutateSchema = z.union([
+  z.object({ action: z.literal("invite"), folder: FolderRefSchema, role: RoleSchema, target_type: z.enum(["user", "group", "department", "user_list", "group_list", "department_list"]), target_id: IdSchema, invitation_message: z.string().max(140).optional() }).strict(),
+  z.object({ action: z.literal("invite"), folder: FolderRefSchema, role: RoleSchema, target_type: z.enum(["user", "group", "department", "user_list", "group_list", "department_list"]), target_ids: z.array(IdSchema).min(1).max(100), invitation_message: z.string().max(140).optional() }).strict(),
+  z.object({ action: z.literal("invite_batch"), folder: FolderRefSchema, targets: z.array(CollaborationTargetSchema).min(1).max(100), invitation_message: z.string().max(140).optional() }).strict(),
+  z.object({ action: z.literal("update_role"), collaboration_id: IdSchema, role: RoleSchema, access_context: AccessContextSchema }).strict(),
+  z.object({ action: z.literal("delete"), collaboration_id: IdSchema, access_context: AccessContextSchema }).strict(),
+  z.object({ action: z.literal("remove_batch"), folder: FolderRefSchema, collaboration_ids: z.array(IdSchema).min(1).max(100) }).strict()
+]);
 
 export function registerMutationTools(server: McpServer, runtime: AppRuntime): void {
   if (runtime.config.toolsets.includes("mutation")) {
@@ -280,7 +280,8 @@ function registerCollaborationTools(server: McpServer, runtime: AppRuntime): voi
   registerTool(server, "yfy_collaboration_read", {
     title: "Read Yifangyun Collaborations",
     description: "List folder collaboration members or get one collaboration record.",
-    inputSchema: CollaborationReadSchema,
+    inputSchema: CollaborationReadInputShape,
+    inputValidator: CollaborationReadSchema,
     outputSchema: { collaborations: z.array(z.object({ id: z.string().optional(), role: z.string().optional(), status: z.string().optional(), accessible_by: z.record(z.unknown()).optional() })), provenance: ProvenanceSchema }
   }, { readOnly: true }, async ({ action, folder, collaboration_id, access_context }, extra) => {
     if (action === "get" && folder) throw new YifangyunError("folder is not valid for get.", { code: "YFY_INPUT_INVALID", phase: "collaboration_read" });
@@ -301,7 +302,8 @@ function registerCollaborationTools(server: McpServer, runtime: AppRuntime): voi
   registerTool(server, "yfy_collaboration_mutate", {
     title: "Mutate Yifangyun Collaboration",
     description: "Invite, update, delete, or batch-remove folder collaborations.",
-    inputSchema: CollaborationMutateSchema,
+    inputSchema: CollaborationMutateInputShape,
+    inputValidator: CollaborationMutateSchema,
     outputSchema: { action: z.string(), success: z.boolean(), collaboration: z.record(z.unknown()), provenance: ProvenanceSchema }
   }, { readOnly: false, destructive: true, idempotent: false }, async (args, extra) => {
     const folderAction = ["invite", "invite_batch", "remove_batch"].includes(String(args.action));

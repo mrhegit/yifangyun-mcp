@@ -62,7 +62,7 @@ export function decodeCursor<T extends z.ZodTypeAny>(secret: string, configFinge
     throw new YifangyunError("Cursor is invalid or expired.", {
       code: "YFY_CURSOR_INVALID",
       phase: "cursor_decode",
-      suggestedAction: "Restart the same operation with request.mode=first_request.",
+      suggestedAction: "Restart the same operation with first-page business fields (omit cursor).",
       agentDetails: { reason }
     });
   }

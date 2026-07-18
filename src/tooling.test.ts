@@ -12,6 +12,7 @@ import type { AppRuntime } from "./runtime/runtime.js";
 import { registerWorkspaceContentTools } from "./tools/workspaceContentTools.js";
 import { registerDriveTools } from "./tools/driveTools.js";
 import { registerInventoryTools } from "./tools/inventoryTools.js";
+import { serializeToolText } from "./tools/resultDelivery.js";
 import { registerTool, serializeError } from "./tools/tooling.js";
 
 const IDENTITY_REF = "a".repeat(24);
@@ -110,11 +111,14 @@ test("large tool results retain useful data and continuation in compact text", a
     description: "Returns enough data to exercise compact text delivery.",
     inputSchema: {},
     outputSchema: { items: z.array(z.object({ id: z.string(), value: z.string(), provider_path_chain: z.array(z.object({ id: z.string(), name: z.string(), type: z.string() })) })), page: z.record(z.unknown()), next_action: z.record(z.unknown()) }
-  }, { readOnly: true }, async () => ({
-    items: Array.from({ length: 20 }, (_, index) => ({ id: `item-${index}`, value: "x".repeat(1000), provider_path_chain: [{ id: "501", name: "Workspace Root", type: "folder" }, { id: "502", name: "Bid Documents", type: "folder" }] })),
-    page: { returned_count: 20, has_more: true, next_cursor: "cursor" },
-    next_action: { tool: "large_result", arguments: { cursor: "cursor" } }
-  }));
+  }, { readOnly: true }, async () => {
+    const longCursor = `cursor-${"x".repeat(800)}`;
+    return {
+      items: Array.from({ length: 20 }, (_, index) => ({ id: `item-${index}`, value: "x".repeat(1000), provider_path_chain: [{ id: "501", name: "Workspace Root", type: "folder" }, { id: "502", name: "Bid Documents", type: "folder" }] })),
+      page: { returned_count: 20, has_more: true, next_cursor: longCursor },
+      next_action: { tool: "large_result", arguments: { cursor: longCursor } }
+    };
+  });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test-client", version: "1.0.0" });
   try {
@@ -122,20 +126,62 @@ test("large tool results retain useful data and continuation in compact text", a
     await client.connect(clientTransport);
     const result = await client.callTool({ name: "large_result", arguments: {} });
     const text = (result.content as Array<{ text?: string }>)[0]?.text ?? "{}";
-    const compact = JSON.parse(text) as Record<string, unknown>;
     assert.ok(text.length <= 12_000);
-    assert.equal(((compact.text_delivery as Record<string, unknown>).mode), "compact_preview");
-    const resultPreview = compact.result_preview as Record<string, unknown>;
-    const itemPreview = resultPreview.items as { items: Array<Record<string, unknown>>; omitted_count: number };
-    assert.equal(itemPreview.items[0]?.id, "item-0");
-    assert.match(JSON.stringify(itemPreview.items[0]?.provider_path_chain), /Workspace Root|501/);
-    assert.ok(itemPreview.omitted_count > 0);
-    assert.equal(((resultPreview.next_action as Record<string, unknown>).tool), "large_result");
+    const compact = JSON.parse(text) as Record<string, unknown>;
+    const delivery = compact.text_delivery as Record<string, unknown>;
+    assert.ok(["compact_preview", "control_only"].includes(String(delivery.mode)));
+    assert.equal(delivery.continuation_ready, true);
+    const control = compact.control as Record<string, unknown>;
+    assert.equal(((control.next_action as Record<string, unknown>).tool), "large_result");
+    const page = control.page as Record<string, unknown>;
+    assert.ok(String(page.next_cursor).length > 800);
+    assert.ok(!String(page.next_cursor).includes("characters omitted"));
+    if (compact.result_preview) {
+      const resultPreview = compact.result_preview as Record<string, unknown>;
+      const itemPreview = resultPreview.items as { items: Array<Record<string, unknown>>; omitted_count: number };
+      assert.equal(itemPreview.items[0]?.id, "item-0");
+      assert.ok(itemPreview.omitted_count > 0);
+    }
     assert.equal(((result.structuredContent as Record<string, unknown>).items as unknown[]).length, 20);
   } finally {
     await client.close();
     await server.close();
   }
+});
+
+test("compact text keeps resource operations without copying inline body text", () => {
+  const body = "sensitive-body-".repeat(4000);
+  const text = serializeToolText("yfy_open", {
+    must_release: true,
+    content_delivery: { mode: "inline_preview", agent_readable: true, model_has_body_text: true },
+    next_action: { tool: "yfy_resource_release", arguments: { resource_uri: "yfy://evidence/token" } },
+    resource: {
+      delivery: "mcp_resource",
+      resource_uri: "yfy://evidence/token",
+      file_name: "bid.txt",
+      media_type: "text/plain",
+      preview_text: body,
+      size_bytes: body.length,
+      must_release: true
+    }
+  }, 12_000);
+  const parsed = JSON.parse(text) as Record<string, unknown>;
+  const control = parsed.control as Record<string, unknown>;
+  const resource = control.resource as Record<string, unknown>;
+  assert.ok(text.length <= 12_000);
+  assert.equal(resource.resource_uri, "yfy://evidence/token");
+  assert.equal(resource.preview_text, undefined);
+  assert.doesNotMatch(text, /sensitive-body/);
+});
+
+test("text redaction removes nested transfer URLs", () => {
+  const text = serializeToolText("transfer", {
+    do_not_echo_url: true,
+    download_url: "https://download.example/root?token=secret",
+    nested: { download_url: "https://download.example/nested?token=secret" }
+  });
+  assert.doesNotMatch(text, /download\.example|token=secret/);
+  assert.equal((JSON.parse(text) as Record<string, unknown>).download_url, "***redacted***");
 });
 
 test("invalid successful output becomes a tool error and runs rollback", async () => {
@@ -228,14 +274,14 @@ test("the MCP client validates a paginated success result", async () => {
     await server.connect(serverTransport);
     await client.connect(clientTransport);
     await client.listTools();
-    const result = await client.callTool({ name: "yfy_shares", arguments: { request: { mode: "first_request", item: FILE_1, limit: 1 } } });
+    const result = await client.callTool({ name: "yfy_shares", arguments: { item: FILE_1, limit: 1 } });
     assert.equal(result.isError, undefined);
     const page = (result.structuredContent as Record<string, unknown>).page as Record<string, unknown>;
     assert.equal(page.returned_count, 1);
     assert.equal(page.has_more, true);
     assert.equal(typeof page.next_cursor, "string");
     const nextAction = (result.structuredContent as Record<string, unknown>).next_action as { tool: string; arguments: Record<string, unknown> };
-    assert.deepEqual(Object.keys(nextAction.arguments), ["request"]);
+    assert.deepEqual(Object.keys(nextAction.arguments), ["cursor"]);
     const mixed = await client.callTool({ name: nextAction.tool, arguments: { ...nextAction.arguments, limit: 5 } });
     assert.equal(mixed.isError, true);
     const second = await client.callTool({ name: nextAction.tool, arguments: nextAction.arguments });

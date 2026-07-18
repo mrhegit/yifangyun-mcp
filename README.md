@@ -2,7 +2,7 @@
 
 亿方云 OpenAPI 的通用 MCP Server。默认提供轻量 Drive 平面；需要范围证明、完整性判断或原件固化时，可启用 Workspace、Inventory 和 Evidence 平面。
 
-当前开发版本：`1.0.0-beta.8`（`contract_version=3`）。该版本强化 Agent 护栏：Search 将未验证索引候选物理分区并统一分页，Open/Capture 使用 MCP embedded resource + resource link 交付已验证内容，Membership 保守处理冲突证据，Inventory 将配置 Workspace 根和实际 scan root 分开持久化；这是不兼容契约升级。
+当前开发版本：`1.0.0-beta.9`（`contract_version=4`）。在 beta.8 Agent 护栏基础上：扁平分页输入、text 通道 control 平面永不截断操作锚点、Search `selection_policy` / content 策略、Open/Capture `agent_readable` 与释放 `next_action`、加密 opaque Inventory Ref 与空搜语义、Transfer 敏感 URL text 脱敏。破坏性变更见 `docs/migration-v1.md`。
 
 ## Interface
 
@@ -54,7 +54,7 @@ version:7001@ZmlsZTo1MDFAZGVmYXVsdC5hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh
 
 ItemRef 绑定 `access_context` 和身份指纹。不要构造或修改 Ref；Context 配置变化后应重新发现项目。
 
-分页输入使用互斥请求：首次调用传 `request.mode=first_request`，续页只执行返回的 `next_action`，其参数为 `request.mode=continuation` 和 cursor。Provider 页码、页内 offset 和签名细节由服务端隐藏。
+分页输入使用扁平字段：首次调用直接传业务参数（如 `at`/`query`/`limit`），续页只执行返回的 `next_action`（参数为 `cursor`，inventory 等固定字段除外）。Provider 页码、页内 offset 和签名细节由服务端隐藏。
 
 Drive 列表默认每页 10 条，Inventory 列表默认每页 25 条。`yfy_browse` 和 `yfy_search` 默认 `detail=basic`；需要 owner、space 等字段时显式请求 `standard` 或 `full`。
 
@@ -176,4 +176,4 @@ npm pack --dry-run
 - [架构与安全](docs/architecture-security.md)
 - [部署](docs/deployment.md)
 - [OpenAPI 覆盖](docs/openapi-coverage.md)
-- [从 0.4.0 迁移到 1.0.0-beta.8](docs/migration-v1.md)
+- [迁移到 1.0.0-beta.9](docs/migration-v1.md)

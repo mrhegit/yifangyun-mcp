@@ -62,7 +62,7 @@ test("live evidence tools download and hash a controlled file", { skip: process.
     const verifiedResource = verified.structuredContent?.resource as Record<string, unknown>;
     if (typeof verifiedResource?.resource_uri === "string") resourceUris.push(verifiedResource.resource_uri);
     const versionsHandler = server.tools.get("yfy_versions")!;
-    const versionsResult = await versionsHandler({ request: { mode: "first_request", file: fileRef } }, { signal: new AbortController().signal, sendNotification: async () => undefined });
+    const versionsResult = await versionsHandler({ file: fileRef }, { signal: new AbortController().signal, sendNotification: async () => undefined });
     const versions = versionsResult.structuredContent?.versions as Array<Record<string, unknown>>;
     if (process.env.YFY_LIVE_HISTORY_TESTS === "enabled" && versions.length > 1 && typeof versions[1]?.ref === "string") {
       const historical = await handler({ file: fileRef, workspace: "workspace:evidence_scope", version: versions[1].ref }, { signal: new AbortController().signal, sendNotification: async () => undefined });

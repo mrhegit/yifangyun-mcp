@@ -8,8 +8,9 @@ import { formatItemRef, formatVersionRef, parseItemRef, parseVersionRef } from "
 import { metrics } from "../observability.js";
 import type { AppRuntime } from "../runtime/runtime.js";
 import type { JsonObject } from "../types.js";
+import { toolAction } from "./pagination.js";
 import { registerTool } from "./tooling.js";
-import { CheckStatusSchema, FileRefSchema, FileVersionSchema, FolderRefSchema, ItemSchema, PathEntrySchema, ProvenanceSchema, VerificationStatusSchema, VersionRefSchema, VersionSelectionProofSchema, WorkspaceRefSchema } from "./schemas.js";
+import { CheckStatusSchema, FileRefSchema, FileVersionSchema, FolderRefSchema, ItemSchema, NextActionSchema, PathEntrySchema, ProvenanceSchema, VerificationStatusSchema, VersionRefSchema, VersionSelectionProofSchema, WorkspaceRefSchema } from "./schemas.js";
 
 function progressReporter(extra: { _meta?: { progressToken?: string | number }; sendNotification: (notification: unknown) => Promise<void>; signal: AbortSignal }) {
   const progressToken = extra._meta?.progressToken;
@@ -60,6 +61,41 @@ function spaceTypePresent(space: JsonObject | undefined): "collaboration" | "dep
   return undefined;
 }
 
+function membershipUnavailableNextSteps(reason: string): string[] {
+  switch (reason) {
+    case "missing_ancestor_chain":
+      return [
+        "Do not re-run yfy_membership_check on the same file ref; missing ancestry will not become path proof by retry.",
+        "Rediscover the file from the workspace with yfy_browse or yfy_resolve to obtain a path-backed ref.",
+        "Only re-check membership or call yfy_capture after you have a newly discovered workspace-path ref."
+      ];
+    case "incomplete_space_metadata":
+      return [
+        "Do not claim inside or outside, and do not assert outside from incomplete space metadata.",
+        "Call yfy_get on the file (and workspace root if needed) to inspect space metadata.",
+        "Rediscover from the workspace with yfy_browse/yfy_resolve; only check/capture with a newly path-backed ref."
+      ];
+    case "same_space_path_inconclusive":
+      return [
+        "Do not claim inside or outside from an inconclusive same-space path.",
+        "Resolve the exact relative path under the workspace root with yfy_resolve, or browse the parent directory with yfy_browse.",
+        "Only check membership or capture after the path under the configured root is proven."
+      ];
+    case "conflicting_membership_evidence":
+      return [
+        "Stop automatic capture; path and storage-space evidence conflict.",
+        "Preserve the membership diagnostics for human review.",
+        "Do not claim inside or outside until the conflict is resolved with a new path-backed discovery."
+      ];
+    default:
+      return [
+        "Do not claim the file is inside or outside the workspace.",
+        "Resolve the file via a path under the workspace root, or browse from the workspace to obtain a path-backed ref.",
+        "Retry after the Provider exposes a complete ancestry chain or space metadata."
+      ];
+  }
+}
+
 function buildMembershipInterpretation(status: MembershipStatus, reason: string): MembershipAgentInterpretation {
   if (status === "inside") {
     return {
@@ -96,11 +132,7 @@ function buildMembershipInterpretation(status: MembershipStatus, reason: string)
     may_claim_outside: false,
     may_capture: false,
     narrative: narratives[reason] ?? "Workspace membership could not be proven from Provider metadata. Do not claim inside or outside.",
-    next_steps: [
-      "Do not claim the file is inside or outside the workspace.",
-      "Resolve the file via a path under the workspace root, or browse from the workspace to obtain a path-backed ref.",
-      "Retry after the Provider exposes a complete ancestry chain or space metadata."
-    ]
+    next_steps: membershipUnavailableNextSteps(reason)
   };
 }
 
@@ -320,6 +352,8 @@ async function tryInlineTextPreview(runtime: AppRuntime, resourceUri: string, si
   return verified ? { preview_bytes: verified.bytes, preview_complete: true, preview_text: verified.text } : undefined;
 }
 
+const CONTENT_RELEASE_NEXT_STEP = "Execute next_action (yfy_resource_release) when finished.";
+
 function buildContentDelivery(resource: JsonObject, hasInlinePreview: boolean, previewRequested: boolean): JsonObject {
   const mediaType = typeof resource.media_type === "string" ? resource.media_type : "application/octet-stream";
   if (resource.delivery === "multipart_resource") {
@@ -329,7 +363,11 @@ function buildContentDelivery(resource: JsonObject, hasInlinePreview: boolean, p
       embedded_resource_in_tool_result: false,
       host_auto_fetch_not_guaranteed: true,
       still_must_release: true,
-      next_step: "Read the multipart manifest at resource.resource_uri, fetch each part URI, then call yfy_resource_release.",
+      agent_readable: false,
+      human_attachment_only: true,
+      model_has_body_text: false,
+      body_text_basis: "none",
+      next_step: `Read the multipart manifest at resource.resource_uri and fetch each part URI (agent_readable=false; human_attachment_only). ${CONTENT_RELEASE_NEXT_STEP}`,
       reason: "multipart_resources_never_inline"
     };
   }
@@ -340,7 +378,11 @@ function buildContentDelivery(resource: JsonObject, hasInlinePreview: boolean, p
       embedded_resource_in_tool_result: true,
       host_auto_fetch_not_guaranteed: true,
       still_must_release: true,
-      next_step: "Use the embedded text resource or resource.preview_text; still call yfy_resource_release when finished.",
+      agent_readable: true,
+      human_attachment_only: false,
+      model_has_body_text: true,
+      body_text_basis: "inline_preview",
+      next_step: `Use the embedded text resource or resource.preview_text (model_has_body_text via inline_preview). ${CONTENT_RELEASE_NEXT_STEP}`,
       preview_kind: mediaType,
       preview_bytes: resource.preview_bytes,
       preview_complete: true,
@@ -354,7 +396,11 @@ function buildContentDelivery(resource: JsonObject, hasInlinePreview: boolean, p
       embedded_resource_in_tool_result: false,
       host_auto_fetch_not_guaranteed: true,
       still_must_release: true,
-      next_step: "Host may not auto-read resource_link. Call resources/read on resource.resource_uri, then yfy_resource_release.",
+      agent_readable: false,
+      human_attachment_only: false,
+      model_has_body_text: false,
+      body_text_basis: "none",
+      next_step: `Host may not auto-read resource_link (agent_readable=false). Call resources/read on resource.resource_uri. ${CONTENT_RELEASE_NEXT_STEP}`,
       reason: previewRequested ? "preview_unavailable_use_resource_link" : "preview_disabled_by_request"
     };
   }
@@ -364,21 +410,43 @@ function buildContentDelivery(resource: JsonObject, hasInlinePreview: boolean, p
     embedded_resource_in_tool_result: false,
     host_auto_fetch_not_guaranteed: true,
     still_must_release: true,
-    next_step: "Call resources/read on resource.resource_uri for verified bytes, then yfy_resource_release. Binary rendering depends on client attachment support.",
+    agent_readable: false,
+    human_attachment_only: true,
+    model_has_body_text: false,
+    body_text_basis: "none",
+    next_step: `Tool success does not mean the model has read the body text (agent_readable=false; human_attachment_only). Binary rendering depends on client attachment support. ${CONTENT_RELEASE_NEXT_STEP}`,
     reason: "binary_or_non_previewable_media_type"
   };
+}
+
+function agentReadableFlagsConsistent(mode: unknown, delivery: JsonObject): boolean {
+  const agentReadable = delivery.agent_readable;
+  const humanOnly = delivery.human_attachment_only;
+  const modelHasBody = delivery.model_has_body_text;
+  const basis = delivery.body_text_basis;
+  if (mode === "inline_preview") {
+    return agentReadable === true && humanOnly === false && modelHasBody === true && basis === "inline_preview";
+  }
+  if (mode === "resource_link_only") {
+    return agentReadable === false && humanOnly === false && modelHasBody === false && basis === "none";
+  }
+  if (mode === "multipart_manifest_only" || mode === "binary_no_preview") {
+    return agentReadable === false && humanOnly === true && modelHasBody === false && basis === "none";
+  }
+  return false;
 }
 
 function assertContentDeliveryConsistency(resource: JsonObject, delivery: JsonObject): void {
   const mode = delivery.mode;
   const hasPreview = typeof resource.preview_text === "string" && resource.preview_complete === true;
-  const valid = mode === "inline_preview"
+  const baseValid = mode === "inline_preview"
     ? resource.delivery === "mcp_resource" && hasPreview && delivery.embedded_resource_in_tool_result === true && delivery.resource_fetch_required === false
     : mode === "multipart_manifest_only"
       ? resource.delivery === "multipart_resource" && !hasPreview
       : (mode === "resource_link_only" || mode === "binary_no_preview")
         ? resource.delivery === "mcp_resource" && !hasPreview && delivery.resource_fetch_required === true
         : false;
+  const valid = baseValid && agentReadableFlagsConsistent(mode, delivery);
   if (!valid) {
     throw new YifangyunError("Content delivery state is internally inconsistent.", {
       code: "YFY_TOOL_OUTPUT_INVALID",
@@ -749,9 +817,7 @@ function registerAuthorityTools(server: McpServer, runtime: AppRuntime): void {
           membership: result.membership.status
         }),
         phase: "workspace_membership",
-        suggestedAction: result.membership.status === "unavailable"
-          ? "Do not claim inside or outside. Resolve via workspace path or wait for complete Provider ancestry/space metadata."
-          : "Do not claim this file is inside the workspace."
+        suggestedAction: result.membership.agent_interpretation.next_steps[0]
       });
     }
     const ancestorFolders = result.membership.ancestorIds.map((id) => formatItemRef("folder", id, result.scope.context.id, result.scope.identityRef));
@@ -801,9 +867,7 @@ async function captureVersionContent(runtime: AppRuntime, input: {
         root_folder_id: scopedBefore.scope.scope.rootFolderId,
         membership: scopedBefore.membership.status
       }),
-      suggestedAction: scopedBefore.membership.status === "unavailable"
-        ? "Do not claim inside or outside. Resolve via workspace path or wait for complete Provider ancestry/space metadata."
-        : "Do not claim this file is inside the workspace."
+      suggestedAction: scopedBefore.membership.agent_interpretation.next_steps[0]
     });
   }
   const versionsBefore = await observeVersions(runtime, item.id, access.context.id, input.signal);
@@ -914,10 +978,18 @@ async function captureVersionContent(runtime: AppRuntime, input: {
     };
     const contentDelivery = buildContentDelivery(resourceWithDelivery, Boolean(inlinePreview), input.includeTextPreview);
     assertContentDeliveryConsistency(resourceWithDelivery, contentDelivery);
+    const resourceUri = String(resourceWithDelivery.resource_uri);
     // must_release 置顶：序列化时优先提醒 Agent 释放资源
     return {
       must_release: true,
       content_delivery: contentDelivery,
+      next_action: toolAction("yfy_resource_release", { resource_uri: resourceUri }),
+      lifecycle: {
+        must_release: true,
+        release_tool: "yfy_resource_release",
+        resource_uri: resourceUri,
+        release_is_idempotent: true
+      },
       file: { ...after, ref: input.fileRef },
       version: { ...selected, ...(!selected.current ? { ref: formatVersionRef(input.fileRef, selected.provider_version_id!) } : {}) },
       selection: versionSelectionProof(selected, input.selector, downloaded.strategy),
@@ -966,6 +1038,10 @@ const ContentDeliverySchema = z.discriminatedUnion("mode", [
     embedded_resource_in_tool_result: z.literal(true),
     host_auto_fetch_not_guaranteed: z.literal(true),
     still_must_release: z.literal(true),
+    agent_readable: z.literal(true),
+    human_attachment_only: z.literal(false),
+    model_has_body_text: z.literal(true),
+    body_text_basis: z.literal("inline_preview"),
     next_step: z.string(),
     preview_kind: z.string(),
     preview_bytes: z.number().int().nonnegative(),
@@ -978,6 +1054,10 @@ const ContentDeliverySchema = z.discriminatedUnion("mode", [
     embedded_resource_in_tool_result: z.literal(false),
     host_auto_fetch_not_guaranteed: z.literal(true),
     still_must_release: z.literal(true),
+    agent_readable: z.literal(false),
+    human_attachment_only: z.literal(false),
+    model_has_body_text: z.literal(false),
+    body_text_basis: z.literal("none"),
     next_step: z.string(),
     reason: z.enum(["preview_unavailable_use_resource_link", "preview_disabled_by_request"])
   }).strict(),
@@ -987,6 +1067,10 @@ const ContentDeliverySchema = z.discriminatedUnion("mode", [
     embedded_resource_in_tool_result: z.literal(false),
     host_auto_fetch_not_guaranteed: z.literal(true),
     still_must_release: z.literal(true),
+    agent_readable: z.literal(false),
+    human_attachment_only: z.literal(true),
+    model_has_body_text: z.literal(false),
+    body_text_basis: z.literal("none"),
     next_step: z.string(),
     reason: z.literal("multipart_resources_never_inline")
   }).strict(),
@@ -996,14 +1080,27 @@ const ContentDeliverySchema = z.discriminatedUnion("mode", [
     embedded_resource_in_tool_result: z.literal(false),
     host_auto_fetch_not_guaranteed: z.literal(true),
     still_must_release: z.literal(true),
+    agent_readable: z.literal(false),
+    human_attachment_only: z.literal(true),
+    model_has_body_text: z.literal(false),
+    body_text_basis: z.literal("none"),
     next_step: z.string(),
     reason: z.literal("binary_or_non_previewable_media_type")
   }).strict()
 ]);
 
+const ContentLifecycleSchema = z.object({
+  must_release: z.literal(true),
+  release_tool: z.literal("yfy_resource_release"),
+  resource_uri: z.union([EvidenceResourceUriSchema, EvidenceManifestUriSchema]),
+  release_is_idempotent: z.literal(true)
+}).strict();
+
 const ContentResultSchema = z.object({
   must_release: z.literal(true),
   content_delivery: ContentDeliverySchema,
+  next_action: NextActionSchema,
+  lifecycle: ContentLifecycleSchema,
   file: ItemSchema.extend({ ref: FileRefSchema }),
   version: FileVersionSchema.extend({ ref: VersionRefSchema.optional() }),
   selection: VersionSelectionProofSchema,

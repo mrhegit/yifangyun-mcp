@@ -4,7 +4,7 @@ import { decodeCursor, encodeCursor } from "../domain/cursors.js";
 import { arrayValue, objectValue, projectDepartment, projectGroup, projectPage, projectUser, provenance } from "../domain/projectors.js";
 import type { AppRuntime } from "../runtime/runtime.js";
 import type { JsonObject, JsonValue } from "../types.js";
-import { continuationAction, pageOutput, paginatedRequestSchema, parsePaginatedRequest } from "./pagination.js";
+import { continuationAction, pageOutput, paginatedInputSchema, resolvePaginationArgs } from "./pagination.js";
 import { DepartmentSchema, GroupSchema, NextActionSchema, ProvenanceSchema, SimplePageSchema, UserSchema } from "./schemas.js";
 import { registerTool } from "./tooling.js";
 
@@ -13,11 +13,11 @@ const PageOutputShape = { page: SimplePageSchema, next_action: NextActionSchema.
 const LimitSchema = z.number().int().min(1).max(100).default(25);
 const AccessContextSchema = z.string().trim().min(1).optional();
 
-const DepartmentChildrenRequest = paginatedRequestSchema({ department_id: IdSchema.default("0"), limit: LimitSchema });
-const DepartmentUsersRequest = paginatedRequestSchema({ department_id: IdSchema, include_contact: z.boolean().default(false), limit: LimitSchema });
-const UserSearchRequest = paginatedRequestSchema({ query: z.string().trim().min(1).max(200), include_contact: z.boolean().default(false), limit: LimitSchema, access_context: AccessContextSchema });
-const GroupListRequest = paginatedRequestSchema({ query: z.string().trim().max(200).optional(), limit: LimitSchema, access_context: AccessContextSchema });
-const GroupUsersRequest = paginatedRequestSchema({ group_id: IdSchema, include_contact: z.boolean().default(false), limit: LimitSchema, access_context: AccessContextSchema });
+const DepartmentChildrenInput = paginatedInputSchema({ department_id: IdSchema.default("0"), limit: LimitSchema });
+const DepartmentUsersInput = paginatedInputSchema({ department_id: IdSchema, include_contact: z.boolean().default(false), limit: LimitSchema });
+const UserSearchInput = paginatedInputSchema({ query: z.string().trim().min(1).max(200), include_contact: z.boolean().default(false), limit: LimitSchema, access_context: AccessContextSchema });
+const GroupListInput = paginatedInputSchema({ query: z.string().trim().max(200).optional(), limit: LimitSchema, access_context: AccessContextSchema });
+const GroupUsersInput = paginatedInputSchema({ group_id: IdSchema, include_contact: z.boolean().default(false), limit: LimitSchema, access_context: AccessContextSchema });
 
 const DepartmentChildrenCursor = z.object({ department_id: IdSchema, offset: z.number().int().nonnegative(), limit: z.number().int().min(1).max(100) }).strict();
 const DepartmentUsersCursor = z.object({ department_id: IdSchema, include_contact: z.boolean(), page_id: z.number().int().nonnegative(), offset: z.number().int().nonnegative(), limit: z.number().int().min(1).max(100) }).strict();
@@ -74,13 +74,14 @@ export function registerOrganizationTools(server: McpServer, runtime: AppRuntime
 
   registerTool(server, "yfy_department_children", {
     title: "List Yifangyun Child Departments", description: "List direct child departments with a stable server-side cursor.",
-    inputSchema: z.object({ request: DepartmentChildrenRequest }).strict(), outputSchema: { departments: z.array(DepartmentSchema), ...PageOutputShape, provenance: ProvenanceSchema }
+    inputSchema: DepartmentChildrenInput.inputSchema, inputValidator: DepartmentChildrenInput.validator, outputSchema: { departments: z.array(DepartmentSchema), ...PageOutputShape, provenance: ProvenanceSchema }
   }, { readOnly: true }, async (args, extra) => {
-    const request = parsePaginatedRequest(DepartmentChildrenRequest, args.request, "department_children");
-    const cursor = request.mode === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "department_children", request.cursor, DepartmentChildrenCursor) : undefined;
-    const departmentId = cursor?.department_id ?? (request.mode === "first_request" ? request.department_id : "0");
+    const pageArgs = resolvePaginationArgs(args, "department_children");
+    const first = pageArgs.kind === "first" ? pageArgs.data as { department_id: string; limit: number } : undefined;
+    const cursor = pageArgs.kind === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "department_children", pageArgs.cursor, DepartmentChildrenCursor) : undefined;
+    const departmentId = cursor?.department_id ?? first?.department_id ?? "0";
     const offset = cursor?.offset ?? 0;
-    const limit = cursor?.limit ?? (request.mode === "first_request" ? request.limit : 25);
+    const limit = cursor?.limit ?? first?.limit ?? 25;
     const response = await runtime.gateway.getEnterprise(`/v2/admin/department/${encodeURIComponent(departmentId)}/children`, {}, extra.signal);
     const all = departments(response.data);
     const selected = all.slice(offset, offset + limit);
@@ -92,15 +93,16 @@ export function registerOrganizationTools(server: McpServer, runtime: AppRuntime
 
   registerTool(server, "yfy_department_users", {
     title: "List Yifangyun Department Users", description: "List users in one department. Contact fields require include_contact=true.",
-    inputSchema: z.object({ request: DepartmentUsersRequest }).strict(), outputSchema: { users: z.array(UserSchema), contact_policy: ContactPolicySchema, ...PageOutputShape, provenance: ProvenanceSchema }
+    inputSchema: DepartmentUsersInput.inputSchema, inputValidator: DepartmentUsersInput.validator, outputSchema: { users: z.array(UserSchema), contact_policy: ContactPolicySchema, ...PageOutputShape, provenance: ProvenanceSchema }
   }, { readOnly: true }, async (args, extra) => {
-    const request = parsePaginatedRequest(DepartmentUsersRequest, args.request, "department_users");
-    const cursor = request.mode === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "department_users", request.cursor, DepartmentUsersCursor) : undefined;
-    const departmentId = cursor?.department_id ?? (request.mode === "first_request" ? request.department_id : "");
-    const includeContact = cursor?.include_contact ?? (request.mode === "first_request" && request.include_contact);
+    const pageArgs = resolvePaginationArgs(args, "department_users");
+    const first = pageArgs.kind === "first" ? pageArgs.data as { department_id: string; include_contact: boolean; limit: number } : undefined;
+    const cursor = pageArgs.kind === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "department_users", pageArgs.cursor, DepartmentUsersCursor) : undefined;
+    const departmentId = cursor?.department_id ?? first?.department_id ?? "";
+    const includeContact = cursor?.include_contact ?? first?.include_contact === true;
     const pageId = cursor?.page_id ?? 0;
     const offset = cursor?.offset ?? 0;
-    const limit = cursor?.limit ?? (request.mode === "first_request" ? request.limit : 25);
+    const limit = cursor?.limit ?? first?.limit ?? 25;
     const response = await runtime.gateway.getEnterprise(`/v2/admin/department/${encodeURIComponent(departmentId)}/users`, { page_id: pageId }, extra.signal);
     const all = users(response.data, includeContact);
     const selected = all.slice(offset, offset + limit);
@@ -115,16 +117,17 @@ export function registerOrganizationTools(server: McpServer, runtime: AppRuntime
 
   registerTool(server, "yfy_user_search", {
     title: "Search Yifangyun Users", description: "Search visible enterprise users with a stable cursor.",
-    inputSchema: z.object({ request: UserSearchRequest }).strict(), outputSchema: { users: z.array(UserSchema), contact_policy: ContactPolicySchema, ...PageOutputShape, provenance: ProvenanceSchema }
+    inputSchema: UserSearchInput.inputSchema, inputValidator: UserSearchInput.validator, outputSchema: { users: z.array(UserSchema), contact_policy: ContactPolicySchema, ...PageOutputShape, provenance: ProvenanceSchema }
   }, { readOnly: true }, async (args, extra) => {
-    const request = parsePaginatedRequest(UserSearchRequest, args.request, "user_search");
-    const cursor = request.mode === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "user_search", request.cursor, UserSearchCursor) : undefined;
-    const query = cursor?.query ?? (request.mode === "first_request" ? request.query : "");
-    const includeContact = cursor?.include_contact ?? (request.mode === "first_request" && request.include_contact);
+    const pageArgs = resolvePaginationArgs(args, "user_search");
+    const first = pageArgs.kind === "first" ? pageArgs.data as { query: string; include_contact: boolean; limit: number; access_context?: string } : undefined;
+    const cursor = pageArgs.kind === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "user_search", pageArgs.cursor, UserSearchCursor) : undefined;
+    const query = cursor?.query ?? first?.query ?? "";
+    const includeContact = cursor?.include_contact ?? first?.include_contact === true;
     const pageId = cursor?.page_id ?? 0;
     const offset = cursor?.offset ?? 0;
-    const limit = cursor?.limit ?? (request.mode === "first_request" ? request.limit : 25);
-    const accessContext = cursor?.access_context ?? (request.mode === "first_request" ? request.access_context : undefined);
+    const limit = cursor?.limit ?? first?.limit ?? 25;
+    const accessContext = cursor?.access_context ?? first?.access_context;
     const access = runtime.gateway.context(accessContext);
     const capacity = Math.min(runtime.config.maxPageCapacity, Math.max(50, limit));
     const response = await runtime.gateway.getUser("/v2/user/search", access.context.id, { query_words: query, page_id: pageId, page_capacity: capacity }, extra.signal);
@@ -141,14 +144,15 @@ export function registerOrganizationTools(server: McpServer, runtime: AppRuntime
 
   registerTool(server, "yfy_group_list", {
     title: "List Yifangyun Groups", description: "List or filter visible groups with stable local pagination.",
-    inputSchema: z.object({ request: GroupListRequest }).strict(), outputSchema: { groups: z.array(GroupSchema), ...PageOutputShape, provenance: ProvenanceSchema }
+    inputSchema: GroupListInput.inputSchema, inputValidator: GroupListInput.validator, outputSchema: { groups: z.array(GroupSchema), ...PageOutputShape, provenance: ProvenanceSchema }
   }, { readOnly: true }, async (args, extra) => {
-    const request = parsePaginatedRequest(GroupListRequest, args.request, "group_list");
-    const cursor = request.mode === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "group_list", request.cursor, GroupListCursor) : undefined;
-    const query = cursor?.query ?? (request.mode === "first_request" ? request.query : undefined);
+    const pageArgs = resolvePaginationArgs(args, "group_list");
+    const first = pageArgs.kind === "first" ? pageArgs.data as { query?: string; limit: number; access_context?: string } : undefined;
+    const cursor = pageArgs.kind === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "group_list", pageArgs.cursor, GroupListCursor) : undefined;
+    const query = cursor?.query ?? first?.query;
     const offset = cursor?.offset ?? 0;
-    const limit = cursor?.limit ?? (request.mode === "first_request" ? request.limit : 25);
-    const accessContext = cursor?.access_context ?? (request.mode === "first_request" ? request.access_context : undefined);
+    const limit = cursor?.limit ?? first?.limit ?? 25;
+    const accessContext = cursor?.access_context ?? first?.access_context;
     const access = runtime.gateway.context(accessContext);
     const response = await runtime.gateway.getUser("/v2/group/list", access.context.id, { query_words: query }, extra.signal);
     const all = groups(response.data);
@@ -161,16 +165,17 @@ export function registerOrganizationTools(server: McpServer, runtime: AppRuntime
 
   registerTool(server, "yfy_group_users", {
     title: "List Yifangyun Group Users", description: "List members of one group with a stable cursor.",
-    inputSchema: z.object({ request: GroupUsersRequest }).strict(), outputSchema: { users: z.array(UserSchema), contact_policy: ContactPolicySchema, ...PageOutputShape, provenance: ProvenanceSchema }
+    inputSchema: GroupUsersInput.inputSchema, inputValidator: GroupUsersInput.validator, outputSchema: { users: z.array(UserSchema), contact_policy: ContactPolicySchema, ...PageOutputShape, provenance: ProvenanceSchema }
   }, { readOnly: true }, async (args, extra) => {
-    const request = parsePaginatedRequest(GroupUsersRequest, args.request, "group_users");
-    const cursor = request.mode === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "group_users", request.cursor, GroupUsersCursor) : undefined;
-    const groupId = cursor?.group_id ?? (request.mode === "first_request" ? request.group_id : "");
-    const includeContact = cursor?.include_contact ?? (request.mode === "first_request" && request.include_contact);
+    const pageArgs = resolvePaginationArgs(args, "group_users");
+    const first = pageArgs.kind === "first" ? pageArgs.data as { group_id: string; include_contact: boolean; limit: number; access_context?: string } : undefined;
+    const cursor = pageArgs.kind === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "group_users", pageArgs.cursor, GroupUsersCursor) : undefined;
+    const groupId = cursor?.group_id ?? first?.group_id ?? "";
+    const includeContact = cursor?.include_contact ?? first?.include_contact === true;
     const pageId = cursor?.page_id ?? 0;
     const offset = cursor?.offset ?? 0;
-    const limit = cursor?.limit ?? (request.mode === "first_request" ? request.limit : 25);
-    const accessContext = cursor?.access_context ?? (request.mode === "first_request" ? request.access_context : undefined);
+    const limit = cursor?.limit ?? first?.limit ?? 25;
+    const accessContext = cursor?.access_context ?? first?.access_context;
     const access = runtime.gateway.context(accessContext);
     const response = await runtime.gateway.getUser(`/v2/group/${encodeURIComponent(groupId)}/users`, access.context.id, { page_id: pageId }, extra.signal);
     const all = users(response.data, includeContact);

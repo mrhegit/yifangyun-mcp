@@ -4,6 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { McpServer as RealMcpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
 import type { AppConfig } from "./types.js";
 import { AppRuntime } from "./runtime/runtime.js";
 import { registerCatalog } from "./tools/registerCatalog.js";
@@ -17,6 +18,15 @@ class FakeServer {
   }
   registerResource(): void {}
   registerPrompt(): void {}
+}
+
+function schemaVariants(schema: Record<string, unknown>): Array<Record<string, unknown>> {
+  const variants = (schema.anyOf ?? schema.oneOf) as Array<Record<string, unknown>> | undefined;
+  return variants ?? [schema];
+}
+
+function schemaPropertyNames(schema: Record<string, unknown>): string[] {
+  return [...new Set(schemaVariants(schema).flatMap((variant) => Object.keys((variant.properties as Record<string, unknown> | undefined) ?? {})))].sort();
 }
 
 function config(toolsets: AppConfig["toolsets"]): AppConfig {
@@ -63,9 +73,10 @@ test("default catalog exposes the current tools and schemas", async () => {
     }
     assert.ok((server.tools.get("yfy_status")!.definition.outputSchema as Record<string, unknown>).places);
     assert.ok(server.tools.get("yfy_inventory_search")!.definition.outputSchema);
-    const inventoryInput = server.tools.get("yfy_inventory_search")!.definition.inputSchema as { shape: Record<string, unknown> };
-    assert.ok(inventoryInput.shape.request);
-    assert.deepEqual(Object.keys(server.tools.get("yfy_inventory_create")!.definition.inputSchema as Record<string, unknown>).sort(), ["limits", "refresh", "root_folder", "workspace"]);
+    const inventoryInput = server.tools.get("yfy_inventory_search")!.definition.inputSchema as z.ZodObject<z.ZodRawShape>;
+    assert.deepEqual(Object.keys(inventoryInput.shape).sort(), ["case_sensitive", "cursor", "inventory", "kind", "limit", "match_fields", "query"]);
+    const createInput = server.tools.get("yfy_inventory_create")!.definition.inputSchema as z.ZodObject<z.ZodRawShape>;
+    assert.deepEqual(Object.keys(createInput.shape).sort(), ["limits", "refresh", "root_folder", "workspace"]);
     assert.equal((server.tools.get("yfy_inventory_create")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
     assert.equal((server.tools.get("yfy_inventory_cancel")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
     assert.equal((server.tools.get("yfy_inventory_release")!.definition.annotations as { destructiveHint: boolean }).destructiveHint, true);
@@ -103,6 +114,27 @@ test("the MCP client compiles every catalog output schema", async () => {
     const listed = await client.listTools();
     assert.ok(listed.tools.length > 0);
     assert.ok(listed.tools.every((tool) => tool.outputSchema));
+    for (const tool of listed.tools) {
+      if (tool.name === "yfy_status") continue;
+      assert.equal(tool.inputSchema.type, "object");
+      assert.ok(schemaPropertyNames(tool.inputSchema as Record<string, unknown>).length > 0, `${tool.name} must expose discoverable input properties`);
+    }
+    const search = listed.tools.find((tool) => tool.name === "yfy_search")!;
+    assert.deepEqual(schemaPropertyNames(search.inputSchema as Record<string, unknown>), ["access_context", "cursor", "detail", "direction", "exact_name", "field", "in", "include_unverified_index_hits", "kind", "limit", "query", "sort"]);
+    const searchVariants = schemaVariants(search.inputSchema as Record<string, unknown>);
+    assert.ok(searchVariants.some((variant) => (variant.required as string[] | undefined)?.includes("query")));
+    assert.ok(searchVariants.some((variant) => (variant.required as string[] | undefined)?.includes("cursor")));
+    const exactNameVariants = searchVariants.filter((variant) => Object.prototype.hasOwnProperty.call((variant.properties as Record<string, unknown> | undefined) ?? {}, "exact_name"));
+    assert.equal(exactNameVariants.length, 1);
+    const exactField = ((exactNameVariants[0]!.properties as Record<string, Record<string, unknown>>).field);
+    assert.deepEqual(exactField.enum ?? [exactField.const], ["name"]);
+    const nonNameVariant = searchVariants.find((variant) => (variant.required as string[] | undefined)?.includes("query") && !Object.prototype.hasOwnProperty.call((variant.properties as Record<string, unknown> | undefined) ?? {}, "exact_name"))!;
+    assert.deepEqual(((nonNameVariant.properties as Record<string, Record<string, unknown>>).field).enum, ["content", "creator", "tag", "all"]);
+    const inventory = listed.tools.find((tool) => tool.name === "yfy_inventory_search")!;
+    assert.deepEqual(schemaPropertyNames(inventory.inputSchema as Record<string, unknown>), ["case_sensitive", "cursor", "inventory", "kind", "limit", "match_fields", "query"]);
+    const admin = listed.tools.find((tool) => tool.name === "yfy_admin_department_read")!;
+    assert.deepEqual(schemaPropertyNames(admin.inputSchema as Record<string, unknown>), ["action", "cursor", "department_id", "include_contact", "limit", "operator_id"]);
+    assert.ok(schemaVariants(admin.inputSchema as Record<string, unknown>).every((variant) => (variant.required as string[] | undefined)?.includes("action")));
   } finally {
     await client.close();
     await server.close();
@@ -121,6 +153,38 @@ test("drive tools are absent when the drive toolset is disabled", async () => {
     assert.ok(server.tools.has("yfy_status"));
   } finally {
     await runtime.close();
+  }
+});
+
+test("status enables only workflows whose complete tool chain is registered", async () => {
+  const cases: Array<{ enabled: string[]; toolsets: AppConfig["toolsets"] }> = [
+    { toolsets: ["evidence"], enabled: [] },
+    { toolsets: ["workspace", "evidence"], enabled: [] },
+    { toolsets: ["drive", "evidence"], enabled: ["read_small_text"] },
+    { toolsets: ["drive", "workspace", "evidence"], enabled: ["read_small_text", "capture_evidence"] },
+    { toolsets: ["inventory"], enabled: [] },
+    { toolsets: ["workspace", "inventory"], enabled: ["absence_audit"] }
+  ];
+  for (const item of cases) {
+    const appConfig = config(item.toolsets);
+    const runtime = {
+      access: {
+        listScopes: () => appConfig.authorityScopes,
+        resolveWorkspaceRef: () => { throw new Error("not called"); },
+        workspaceRef: (id: string) => `workspace:${id}`
+      },
+      client: { getEnterpriseToken: async () => { throw new Error("offline"); } },
+      config: appConfig,
+      configFingerprint: "a".repeat(64),
+      gateway: { context: () => ({ context: { id: "default", userId: "530" }, identityRef: "a".repeat(24) }) },
+      instanceId: "test-instance",
+      startedAtIso: "2026-07-18T00:00:00.000Z"
+    } as unknown as AppRuntime;
+    const server = new FakeServer();
+    registerCatalog(server as unknown as McpServer, runtime);
+    const result = await server.tools.get("yfy_status")!.handler({}, { signal: new AbortController().signal, sendNotification: async () => undefined });
+    const workflows = result.structuredContent?.recommended_workflows as Array<Record<string, unknown>>;
+    assert.deepEqual(workflows.filter((workflow) => workflow.enabled === true).map((workflow) => workflow.id), item.enabled);
   }
 });
 

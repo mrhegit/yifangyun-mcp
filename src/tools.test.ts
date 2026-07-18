@@ -123,7 +123,7 @@ test("drive search hides Provider pagination behind one cursor", async () => {
     }
   } as unknown as AppRuntime;
   registerDriveTools(server as unknown as McpServer, runtime);
-  const first = await call(server, "yfy_search", { request: { mode: "first_request", query: "candidate", in: "personal", limit: 2 } });
+  const first = await call(server, "yfy_search", { query: "candidate", in: "personal", limit: 2 });
   const coverage = first.structuredContent?.coverage as Record<string, unknown>;
   assert.equal(coverage.mode, "provider_index");
   assert.equal(coverage.exhaustive, false);
@@ -138,8 +138,16 @@ test("drive search hides Provider pagination behind one cursor", async () => {
     verified_hits: 3,
     unverified_index_hits: 0,
     scope_rejected: 0,
-    disambiguation_groups: 0
+    disambiguation_groups: 0,
+    filtered_out_reason_counts: {
+      exact_name_mismatch: 0,
+      scope_rejected: 0,
+      malformed_item: 0,
+      unverified_omitted_by_default: 0,
+      unverified_omitted_by_explicit_request: 0
+    }
   });
+  assert.equal(first.structuredContent?.selection_policy, "must_disambiguate");
   assert.equal(typeof coverage.note, "string");
   assert.ok(((first.structuredContent?.agent_warnings as string[]) ?? []).some((warning) => /non-exhaustive|candidates only/i.test(warning)));
   assert.equal((first.structuredContent?.hits as unknown[]).length, 2);
@@ -152,11 +160,95 @@ test("drive search hides Provider pagination behind one cursor", async () => {
   assert.ok(!Object.prototype.hasOwnProperty.call(page, "page_id"));
   assert.ok(!Object.prototype.hasOwnProperty.call(page, "page_capacity"));
   const cursor = String(page.next_cursor);
-  const second = await call(server, "yfy_search", { request: { mode: "continuation", cursor } });
+  const second = await call(server, "yfy_search", { cursor });
   assert.deepEqual((second.structuredContent?.hits as Array<Record<string, unknown>>).map((hit) => (hit.item as Record<string, unknown>).ref), [formatItemRef("file", "3", "default", IDENTITY_REF)]);
   assert.doesNotMatch(JSON.stringify(first.structuredContent), /login|secret/);
-  const standard = await call(server, "yfy_search", { request: { mode: "first_request", query: "candidate", in: "personal", detail: "standard" } });
+  const standard = await call(server, "yfy_search", { query: "candidate", in: "personal", detail: "standard" });
   assert.equal((((standard.structuredContent?.hits as Array<Record<string, unknown>>)[0]?.item as Record<string, unknown>).owned_by as Record<string, unknown>).name, "Owner");
+});
+
+test("drive search continues after an empty filtered Provider page", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["drive"] },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string, _context: string, params: Record<string, unknown>) => Number(params.page_id ?? 0) === 0
+        ? response(endpoint, { files: [{ id: 1, name: "other.pdf", type: "file" }], folders: [], page_id: 0, next_page_id: 1, page_capacity: 50, page_count: 2, total_count: 2 })
+        : response(endpoint, { files: [{ id: 2, name: "target.pdf", type: "file" }], folders: [] })
+    }
+  } as unknown as AppRuntime;
+  registerDriveTools(server as unknown as McpServer, runtime);
+  const first = await call(server, "yfy_search", { query: "target.pdf", in: "personal", field: "name", exact_name: true });
+  assert.equal(first.structuredContent?.selection_policy, "continue_search");
+  assert.equal((first.structuredContent?.page as Record<string, unknown>).has_more, true);
+  assert.match(((first.structuredContent?.recommended_actions as string[]) ?? []).join(" "), /execute next_action/i);
+  const cursor = String((first.structuredContent?.page as Record<string, unknown>).next_cursor);
+  const second = await call(server, "yfy_search", { cursor });
+  assert.equal(second.structuredContent?.selection_policy, "single_candidate_ok");
+  assert.equal((((second.structuredContent?.hits as Array<Record<string, unknown>>)[0]?.item as Record<string, unknown>).ref), FILE_2);
+});
+
+test("content search defaults to unverified candidates but honors explicit false", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["drive"] },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => response(endpoint, {
+        files: [{ id: 1, name: "document.pdf", type: "file", snippet: "contains target phrase" }],
+        folders: [], page_id: 0, page_capacity: 50, page_count: 1, total_count: 1
+      })
+    }
+  } as unknown as AppRuntime;
+  registerDriveTools(server as unknown as McpServer, runtime);
+  const defaults = await call(server, "yfy_search", { query: "target", field: "content", in: "personal" });
+  assert.equal((defaults.structuredContent?.unverified_hits as unknown[]).length, 1);
+  assert.equal((defaults.structuredContent?.content_search_policy as Record<string, unknown>).include_unverified_index_hits_effective, true);
+  const omitted = await call(server, "yfy_search", { query: "target", field: "content", in: "personal", include_unverified_index_hits: false });
+  assert.equal((omitted.structuredContent?.unverified_hits as unknown[]).length, 0);
+  assert.equal((omitted.structuredContent?.content_search_policy as Record<string, unknown>).include_unverified_index_hits_effective, false);
+  const omittedCounts = (((omitted.structuredContent?.coverage as Record<string, unknown>).counts as Record<string, unknown>).filtered_out_reason_counts as Record<string, unknown>);
+  assert.equal(omittedCounts.unverified_omitted_by_default, 0);
+  assert.equal(omittedCounts.unverified_omitted_by_explicit_request, 1);
+});
+
+test("drive search keeps must_disambiguate after candidates appear on different Provider pages", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["drive"] },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string, _context: string, params: Record<string, unknown>) => Number(params.page_id ?? 0) === 0
+        ? response(endpoint, { files: [{ id: 1, name: "target-a.pdf", type: "file" }], folders: [], page_id: 0, next_page_id: 1, page_count: 2, total_count: 2 })
+        : response(endpoint, { files: [{ id: 2, name: "target-b.pdf", type: "file" }], folders: [] })
+    }
+  } as unknown as AppRuntime;
+  registerDriveTools(server as unknown as McpServer, runtime);
+  const first = await call(server, "yfy_search", { query: "target", in: "personal" });
+  assert.equal(first.structuredContent?.selection_policy, "must_disambiguate");
+  const second = await call(server, "yfy_search", { cursor: String((first.structuredContent?.page as Record<string, unknown>).next_cursor) });
+  assert.equal(second.structuredContent?.selection_policy, "must_disambiguate");
+});
+
+test("drive search preserves cumulative selection policy when the final Provider page is empty", async () => {
+  for (const candidateCount of [1, 2]) {
+    const server = new FakeServer();
+    const runtime = {
+      config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["drive"] },
+      gateway: {
+        context: access,
+        getUser: async (endpoint: string, _context: string, params: Record<string, unknown>) => Number(params.page_id ?? 0) === 0
+          ? response(endpoint, { files: Array.from({ length: candidateCount }, (_, index) => ({ id: index + 1, name: `target-${index + 1}.pdf`, type: "file" })), folders: [], page_id: 0, page_count: 2, next_page_id: 1 })
+          : response(endpoint, { files: [], folders: [] })
+      }
+    } as unknown as AppRuntime;
+    registerDriveTools(server as unknown as McpServer, runtime);
+    const first = await call(server, "yfy_search", { query: "target", in: "personal" });
+    const second = await call(server, "yfy_search", { cursor: String((first.structuredContent?.page as Record<string, unknown>).next_cursor) });
+    assert.notEqual(second.isError, true, JSON.stringify(second.content));
+    assert.equal(second.structuredContent?.selection_policy, candidateCount === 1 ? "single_candidate_ok" : "must_disambiguate");
+  }
 });
 
 test("drive search excludes provider_index_only hits by default", async () => {
@@ -176,7 +268,7 @@ test("drive search excludes provider_index_only hits by default", async () => {
     }
   } as unknown as AppRuntime;
   registerDriveTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_search", { request: { mode: "first_request", query: "candidate", in: "personal", limit: 10 } });
+  const result = await call(server, "yfy_search", { query: "candidate", in: "personal", limit: 10 });
   const hits = result.structuredContent?.hits as Array<Record<string, unknown>>;
   assert.equal(hits.length, 1);
   assert.equal((hits[0]?.item as Record<string, unknown>).ref, FILE_2);
@@ -188,19 +280,19 @@ test("drive search excludes provider_index_only hits by default", async () => {
   assert.equal(counts.unverified_index_hits, 2);
   assert.equal(counts.returned, 1);
 
-  const included = await call(server, "yfy_search", { request: { mode: "first_request", query: "candidate", in: "personal", include_unverified_index_hits: true, limit: 10 } });
+  const included = await call(server, "yfy_search", { query: "candidate", in: "personal", include_unverified_index_hits: true, limit: 10 });
   assert.equal((included.structuredContent?.hits as unknown[]).length, 1);
   const unverified = included.structuredContent?.unverified_hits as Array<Record<string, unknown>>;
   assert.equal(unverified.length, 2);
   assert.equal((unverified[0]?.match as Record<string, unknown>).claim_allowed, false);
   assert.equal((unverified[0]?.match as Record<string, unknown>).trust, "unverified_index_hit");
 
-  const orderedFirst = await call(server, "yfy_search", { request: { mode: "first_request", query: "candidate", in: "personal", include_unverified_index_hits: true, limit: 1 } });
+  const orderedFirst = await call(server, "yfy_search", { query: "candidate", in: "personal", include_unverified_index_hits: true, limit: 1 });
   assert.equal((orderedFirst.structuredContent?.hits as unknown[]).length, 0);
   assert.equal((((orderedFirst.structuredContent?.unverified_hits as Array<Record<string, unknown>>)[0]?.item as Record<string, unknown>).ref), FILE_1);
-  const orderedSecond = await call(server, "yfy_search", { request: { mode: "continuation", cursor: String((orderedFirst.structuredContent?.page as Record<string, unknown>).next_cursor) } });
+  const orderedSecond = await call(server, "yfy_search", { cursor: String((orderedFirst.structuredContent?.page as Record<string, unknown>).next_cursor) });
   assert.equal((((orderedSecond.structuredContent?.hits as Array<Record<string, unknown>>)[0]?.item as Record<string, unknown>).ref), FILE_2);
-  const orderedThird = await call(server, "yfy_search", { request: { mode: "continuation", cursor: String((orderedSecond.structuredContent?.page as Record<string, unknown>).next_cursor) } });
+  const orderedThird = await call(server, "yfy_search", { cursor: String((orderedSecond.structuredContent?.page as Record<string, unknown>).next_cursor) });
   assert.equal((((orderedThird.structuredContent?.unverified_hits as Array<Record<string, unknown>>)[0]?.item as Record<string, unknown>).ref), formatItemRef("file", "3", "default", IDENTITY_REF));
 });
 
@@ -221,7 +313,7 @@ test("drive search marks same-name hits for disambiguation", async () => {
     }
   } as unknown as AppRuntime;
   registerDriveTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_search", { request: { mode: "first_request", query: "招标公告.pdf", in: "personal", field: "name", exact_name: true, limit: 10 } });
+  const result = await call(server, "yfy_search", { query: "招标公告.pdf", in: "personal", field: "name", exact_name: true, limit: 10 });
   const hits = result.structuredContent?.hits as Array<Record<string, unknown>>;
   assert.equal(hits.length, 2);
   for (const hit of hits) {
@@ -232,6 +324,8 @@ test("drive search marks same-name hits for disambiguation", async () => {
     assert.equal(match.claim_allowed, true);
   }
   assert.equal(((result.structuredContent?.coverage as Record<string, unknown>).counts as Record<string, unknown>).disambiguation_groups, 1);
+  assert.equal(result.structuredContent?.selection_policy, "must_disambiguate");
+  assert.ok(((result.structuredContent?.recommended_actions as string[]) ?? []).some((item) => /must_disambiguate|path uniqueness/i.test(item)));
 });
 
 test("drive search preserves disambiguation and total limits across verified and unverified continuation", async () => {
@@ -252,17 +346,17 @@ test("drive search preserves disambiguation and total limits across verified and
   } as unknown as AppRuntime;
   registerDriveTools(server as unknown as McpServer, runtime);
 
-  const first = await call(server, "yfy_search", { request: { mode: "first_request", query: "same", in: "personal", field: "all", include_unverified_index_hits: true, limit: 1 } });
+  const first = await call(server, "yfy_search", { query: "same", in: "personal", field: "all", include_unverified_index_hits: true, limit: 1 });
   const firstHit = ((first.structuredContent?.hits as Array<Record<string, unknown>>)[0]?.match as Record<string, unknown>);
   assert.equal(firstHit.disambiguation_required, true);
   assert.equal(firstHit.same_name_hit_count_in_provider_page, 2);
   assert.equal((first.structuredContent?.page as Record<string, unknown>).returned_count, 1);
 
-  const second = await call(server, "yfy_search", { request: { mode: "continuation", cursor: String((first.structuredContent?.page as Record<string, unknown>).next_cursor) } });
+  const second = await call(server, "yfy_search", { cursor: String((first.structuredContent?.page as Record<string, unknown>).next_cursor) });
   assert.equal((second.structuredContent?.page as Record<string, unknown>).returned_count, 1);
   assert.equal((((second.structuredContent?.hits as Array<Record<string, unknown>>)[0]?.match as Record<string, unknown>).disambiguation_required), true);
 
-  const third = await call(server, "yfy_search", { request: { mode: "continuation", cursor: String((second.structuredContent?.page as Record<string, unknown>).next_cursor) } });
+  const third = await call(server, "yfy_search", { cursor: String((second.structuredContent?.page as Record<string, unknown>).next_cursor) });
   assert.equal((third.structuredContent?.hits as unknown[]).length, 0);
   assert.equal((third.structuredContent?.unverified_hits as unknown[]).length, 1);
   assert.equal((third.structuredContent?.page as Record<string, unknown>).returned_count, 1);
@@ -277,7 +371,7 @@ test("ordinary cursors are invalid after the effective configuration changes", a
     gateway: { context: access, getUser: async (endpoint: string) => response(endpoint, { files: [{ id: 1, name: "one.pdf", type: "file" }, { id: 2, name: "two.pdf", type: "file" }], folders: [], page_id: 0, page_capacity: 50, page_count: 1, total_count: 2 }) }
   } as unknown as AppRuntime;
   registerDriveTools(firstServer as unknown as McpServer, firstRuntime);
-  const first = await call(firstServer, "yfy_browse", { request: { mode: "first_request", at: "personal", limit: 1 } });
+  const first = await call(firstServer, "yfy_browse", { at: "personal", limit: 1 });
   const cursor = String((first.structuredContent?.page as Record<string, unknown>).next_cursor);
 
   const secondServer = new FakeServer();
@@ -287,7 +381,7 @@ test("ordinary cursors are invalid after the effective configuration changes", a
     gateway: { context: access, getUser: async () => { throw new Error("stale cursor must fail before Provider I/O"); } }
   } as unknown as AppRuntime;
   registerDriveTools(secondServer as unknown as McpServer, secondRuntime);
-  const continued = await call(secondServer, "yfy_browse", { request: { mode: "continuation", cursor } });
+  const continued = await call(secondServer, "yfy_browse", { cursor });
   assert.equal(errorCode(continued), "YFY_CURSOR_INVALID");
   const errorText = JSON.stringify(continued.content);
   assert.match(errorText, /Cursor is invalid or expired\./);
@@ -305,11 +399,115 @@ test("admin log pagination counts user activity rows", async () => {
     }
   } as unknown as AppRuntime;
   registerAdminTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_admin_log_query", { action: "list", request: { mode: "first_request", start_date: "2026-07-01", end_date: "2026-07-02", limit: 2 } });
+  const result = await call(server, "yfy_admin_log_query", { action: "list", start_date: "2026-07-01", end_date: "2026-07-02", limit: 2 });
   const page = result.structuredContent?.page as Record<string, unknown>;
   assert.equal(page.returned_count, 2);
   assert.equal(page.has_more, true);
   assert.equal(((result.structuredContent?.next_action as Record<string, unknown>).arguments as Record<string, unknown>).action, "list");
+});
+
+test("admin log pagination uses the capacity actually sent to Provider", async () => {
+  const server = new FakeServer();
+  let providerBody!: Record<string, unknown>;
+  const runtime = {
+    config: { clientSecret: "secret", maxPageCapacity: 2, toolsets: ["admin"] },
+    configFingerprint: "a".repeat(64),
+    gateway: {
+      postEnterprise: async (endpoint: string, body: Record<string, unknown>) => {
+        providerBody = body;
+        return response(endpoint, { user_activities: [{ id: 1 }, { id: 2 }] });
+      }
+    }
+  } as unknown as AppRuntime;
+  registerAdminTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_admin_log_query", { action: "list", start_date: "2026-07-01", end_date: "2026-07-02", limit: 100 });
+  assert.equal(providerBody.page_capacity, 2);
+  assert.equal((result.structuredContent?.page as Record<string, unknown>).has_more, true);
+});
+
+test("admin list tools enforce local limit when Provider ignores page capacity", async () => {
+  const server = new FakeServer();
+  let providerParams!: Record<string, unknown>;
+  const runtime = {
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["admin"] },
+    configFingerprint: "a".repeat(64),
+    gateway: {
+      getEnterprise: async (endpoint: string, params: Record<string, unknown>) => {
+        providerParams = params;
+        return response(endpoint, { groups: [{ id: 1, name: "A" }, { id: 2, name: "B" }, { id: 3, name: "C" }] });
+      }
+    }
+  } as unknown as AppRuntime;
+  registerAdminTools(server as unknown as McpServer, runtime);
+  const first = await call(server, "yfy_admin_group_read", { action: "list", limit: 1 });
+  assert.equal((first.structuredContent?.groups as unknown[]).length, 1);
+  assert.equal((first.structuredContent?.page as Record<string, unknown>).returned_count, 1);
+  assert.equal(providerParams.page_capacity, undefined);
+  const cursor = String((first.structuredContent?.page as Record<string, unknown>).next_cursor);
+  const second = await call(server, "yfy_admin_group_read", { action: "list", cursor });
+  assert.equal((((second.structuredContent?.groups as Array<Record<string, unknown>>)[0]?.name)), "B");
+});
+
+test("admin lists without pagination metadata continue to an empty page", async () => {
+  const cases = [
+    { action: "list", endpoint: "/v2/admin/group/list", firstKey: "groups", toolArgs: { action: "list", limit: 100 } },
+    { action: "users", endpoint: "/v2/admin/group/7/users", firstKey: "users", toolArgs: { action: "users", group_id: "7", limit: 100 } },
+    { action: "users", endpoint: "/v2/admin/department/8/users", firstKey: "users", toolArgs: { action: "users", department_id: "8", limit: 100 } }
+  ] as const;
+  for (const item of cases) {
+    const server = new FakeServer();
+    const runtime = {
+      config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["admin"] },
+      configFingerprint: "a".repeat(64),
+      gateway: {
+        getEnterprise: async (endpoint: string, params: Record<string, unknown>) => {
+          assert.equal(endpoint, item.endpoint);
+          const pageId = Number(params.page_id ?? 0);
+          return response(endpoint, pageId === 0 ? { [item.firstKey]: [{ id: 1, name: "A" }] } : pageId === 1 ? { [item.firstKey]: [{ id: 2, name: "B" }] } : { [item.firstKey]: [] });
+        }
+      }
+    } as unknown as AppRuntime;
+    registerAdminTools(server as unknown as McpServer, runtime);
+    const tool = item.endpoint.includes("department") ? "yfy_admin_department_read" : "yfy_admin_group_read";
+    const first = await call(server, tool, item.toolArgs);
+    assert.equal((first.structuredContent?.page as Record<string, unknown>).has_more, true);
+    const second = await call(server, tool, { action: item.action, cursor: String((first.structuredContent?.page as Record<string, unknown>).next_cursor) });
+    assert.equal((second.structuredContent?.page as Record<string, unknown>).has_more, true);
+    const third = await call(server, tool, { action: item.action, cursor: String((second.structuredContent?.page as Record<string, unknown>).next_cursor) });
+    assert.equal((third.structuredContent?.page as Record<string, unknown>).has_more, false);
+  }
+});
+
+test("admin pagination rejects a repeated Provider page", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["admin"] },
+    configFingerprint: "a".repeat(64),
+    gateway: { getEnterprise: async (endpoint: string) => response(endpoint, { groups: [{ id: 1, name: "same" }] }) }
+  } as unknown as AppRuntime;
+  registerAdminTools(server as unknown as McpServer, runtime);
+  const first = await call(server, "yfy_admin_group_read", { action: "list", limit: 100 });
+  const second = await call(server, "yfy_admin_group_read", { action: "list", cursor: String((first.structuredContent?.page as Record<string, unknown>).next_cursor) });
+  assert.equal(errorCode(second), "YFY_PROVIDER_PAGINATION_STALLED");
+  assert.equal(errorCategory(second), "provider_contract");
+});
+
+test("admin action validators reject fields that would be ignored", async () => {
+  const server = new FakeServer();
+  let providerCalled = false;
+  const runtime = {
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["admin"] },
+    gateway: {
+      getEnterprise: async () => { providerCalled = true; return response("/unexpected", {}); },
+      postEnterprise: async () => { providerCalled = true; return response("/unexpected", {}); }
+    }
+  } as unknown as AppRuntime;
+  registerAdminTools(server as unknown as McpServer, runtime);
+  const group = await call(server, "yfy_admin_group_read", { action: "get", group_id: "1", query: "ignored" });
+  assert.equal(errorCode(group), "YFY_INPUT_INVALID");
+  const logs = await call(server, "yfy_admin_log_query", { action: "list", start_date: "2026-07-01", end_date: "2026-07-02", date: "2026-07-01" });
+  assert.equal(errorCode(logs), "YFY_INPUT_INVALID");
+  assert.equal(providerCalled, false);
 });
 
 test("drive search enforces folder scope and exact names", async () => {
@@ -329,7 +527,7 @@ test("drive search enforces folder scope and exact names", async () => {
     }
   } as unknown as AppRuntime;
   registerDriveTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_search", { request: { mode: "first_request", query: "test.docx", in: FOLDER_10, kind: "file", field: "name", exact_name: true, limit: 5 } });
+  const result = await call(server, "yfy_search", { query: "test.docx", in: FOLDER_10, kind: "file", field: "name", exact_name: true, limit: 5 });
   const item = ((result.structuredContent?.hits as Array<Record<string, unknown>>)[0]?.item as Record<string, unknown>);
   assert.equal(item.ref, FILE_1);
   assert.equal(item.path_basis, "provider_supplied");
@@ -387,7 +585,7 @@ test("current file versions omit historical VersionRef values", async () => {
     }
   } as unknown as AppRuntime;
   registerDriveTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_versions", { request: { mode: "first_request", file: FILE_10 } });
+  const result = await call(server, "yfy_versions", { file: FILE_10 });
   assert.notEqual(result.isError, true, JSON.stringify(result.content));
   const versions = result.structuredContent?.versions as Array<Record<string, unknown>>;
   assert.equal(versions[0]?.current, true);
@@ -474,12 +672,16 @@ test("workspace membership reports unavailable when ancestry is incomplete", asy
   assert.equal(interpretation.may_claim_inside, false);
   assert.equal(interpretation.may_claim_outside, false);
   assert.equal(interpretation.may_capture, false);
+  const nextSteps = interpretation.next_steps as string[];
+  assert.match(nextSteps[0] ?? "", /Do not re-run yfy_membership_check on the same file ref/i);
+  assert.match(nextSteps.join(" "), /yfy_browse|yfy_resolve/);
   const assertion = await call(server, "yfy_membership_check", { file: FILE_10, workspace: WORKSPACE_TENDER, mode: "assert" });
   assert.equal(errorCode(assertion), "YFY_WORKSPACE_MEMBERSHIP_UNAVAILABLE");
   assert.equal(errorCategory(assertion), "provider_contract");
-  const diagnostics = JSON.parse(assertion.content?.find((entry) => entry.type === "text")?.text ?? "{}") as { error?: { diagnostics?: Record<string, unknown> } };
+  const diagnostics = JSON.parse(assertion.content?.find((entry) => entry.type === "text")?.text ?? "{}") as { error?: { diagnostics?: Record<string, unknown>; suggested_action?: string } };
   assert.equal(diagnostics.error?.diagnostics?.reason, "missing_ancestor_chain");
   assert.equal((diagnostics.error?.diagnostics?.agent_interpretation as Record<string, unknown> | undefined)?.may_claim_outside, false);
+  assert.equal(diagnostics.error?.suggested_action, nextSteps[0]);
 });
 
 test("workspace membership rejects conflicting path and storage-space evidence", async () => {
@@ -499,6 +701,9 @@ test("workspace membership rejects conflicting path and storage-space evidence",
   assert.equal(interpretation.may_claim_inside, false);
   assert.equal(interpretation.may_claim_outside, false);
   assert.equal(interpretation.may_capture, false);
+  const nextSteps = interpretation.next_steps as string[];
+  assert.match(nextSteps[0] ?? "", /Stop automatic capture/i);
+  assert.match(nextSteps.join(" "), /diagnostics/i);
 });
 
 test("workspace validation keeps missing evidence unavailable instead of invalid", async () => {
@@ -562,7 +767,9 @@ test("inventory search returns a signed context-bound cursor", async () => {
   assert.equal((created.structuredContent?.agent_guidance as Record<string, unknown>)?.may_claim_absence, true);
   assert.equal((created.structuredContent?.scan_root as Record<string, unknown>)?.id, "10");
   const inventory = String(created.structuredContent?.inventory);
-  const first = await call(server, "yfy_inventory_search", { inventory, request: { mode: "first_request", query: "证书", kind: "all", limit: 1 } });
+  assert.notEqual(inventory, `inventory:${String(state.scanId)}`);
+  assert.equal(created.structuredContent?.inventory_id, state.scanId);
+  const first = await call(server, "yfy_inventory_search", { inventory, query: "证书", kind: "all", limit: 1 });
   assert.equal((first.structuredContent?.scan_root as Record<string, unknown>)?.id, "10");
   assert.equal((first.structuredContent?.agent_guidance as Record<string, unknown>)?.may_claim_absence, true);
   assert.equal(((first.structuredContent?.completeness as Record<string, unknown>)?.scope), "observed_subtree");
@@ -573,12 +780,78 @@ test("inventory search returns a signed context-bound cursor", async () => {
   assert.equal((manifest.agent_guidance as Record<string, unknown>).may_claim_absence, true);
   const cursor = String((first.structuredContent?.page as Record<string, unknown>).next_cursor);
   assert.ok(cursor.length > 20);
-  const second = await call(server, "yfy_inventory_search", { inventory, request: { mode: "continuation", cursor } });
+  const second = await call(server, "yfy_inventory_search", { inventory, cursor });
   assert.notEqual(second.isError, true, JSON.stringify(second.content));
   assert.deepEqual(receivedCursor, { itemId: "file:10", sortPath: "Root/A", total: 2, watermark: 1 });
-  const invalid = await call(server, "yfy_inventory_search", { inventory, request: { mode: "continuation", cursor: "%%%" } });
+  const invalid = await call(server, "yfy_inventory_search", { inventory, cursor: "%%%" });
   const error = JSON.parse(invalid.content?.find((entry) => entry.type === "text")?.text ?? "{}") as { error?: { diagnostics?: Record<string, unknown> } };
   assert.equal(error.error?.diagnostics?.reason, "not_base64url");
+});
+
+test("inventory refs preserve non-default identity across instances and release idempotently", async () => {
+  const server = new FakeServer();
+  const secondaryIdentity = "c".repeat(24);
+  const secondaryWorkspace = {
+    context: { id: "secondary", userId: "531" },
+    identityRef: secondaryIdentity,
+    scope: { id: "secondary-scope", rootFolderId: "901", accessContext: "secondary", tags: [] }
+  };
+  let exists = true;
+  let state!: Record<string, unknown>;
+  const snapshots = {
+    create: async (input: Record<string, unknown>) => {
+      state = {
+        accessContextId: "secondary", accessIdentityRef: secondaryIdentity, artifactToken: "token", commitWatermark: 1, createdAt: "2026-07-18T00:00:00.000Z", expiresAt: "2026-07-19T00:00:00.000Z",
+        fileCount: 1, folderCount: 0, frontierCount: 0, incompleteReasons: [], observationStartedAt: "2026-07-18T00:00:00.000Z", observationUpdatedAt: "2026-07-18T00:00:00.000Z",
+        pageReceiptCount: 1, policy: { caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"], maxItemDepth: 8, maxItems: 1000, pageCapacity: 500 },
+        policyHash: "hash", receiptDigest: "digest", revision: 1, retryCount: 0, rootFolder: {}, rootFolderId: "901", rootObservationDigest: "root", scanId: "123e4567-e89b-12d3-a456-426614174099",
+        status: "complete", updatedAt: "2026-07-18T00:00:00.000Z", workspaceFingerprint: input.workspaceFingerprint, workspaceId: "secondary-scope", workspaceRef: "workspace:secondary-scope", workspaceRootFolderId: "901"
+      };
+      return { reused: false, reuseReason: "new", state };
+    },
+    get: async (_inventoryId: string, accessContext: string) => {
+      if (accessContext !== "secondary") throw new YifangyunError("wrong context", { code: "YFY_INVENTORY_ACCESS_DENIED" });
+      if (!exists) throw new YifangyunError("missing", { code: "YFY_INVENTORY_NOT_FOUND" });
+      return state;
+    },
+    release: async (_inventoryId: string, accessContext: string) => {
+      if (accessContext !== "secondary") throw new YifangyunError("wrong context", { code: "YFY_INVENTORY_ACCESS_DENIED" });
+      if (!exists) return false;
+      exists = false;
+      return true;
+    },
+    summary: () => ({ terminal: true, completeness: { pagination_complete: true, safe_to_claim_absence: true, scope: "entire_observed_accessible_scope", consistency_level: "best_effort_complete_observation", incomplete_reasons: [] } }),
+    storageStats: () => ({ database_bytes: 0, logical_bytes: 0, wal_bytes: 0 })
+  };
+  const runtime = {
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["inventory"] },
+    access: { resolveWorkspaceRef: () => secondaryWorkspace },
+    snapshots
+  } as unknown as AppRuntime;
+  registerInventoryTools(server as unknown as McpServer, runtime);
+  const created = await call(server, "yfy_inventory_create", { workspace: "workspace:secondary-scope", refresh: { mode: "force_refresh" }, limits: { max_item_depth: 8, max_items: 1000 } });
+  const inventory = String(created.structuredContent?.inventory);
+  assert.doesNotMatch(Buffer.from(inventory.slice("inventory:".length), "base64url").toString("utf8"), /secondary|123e4567/);
+  const read = await call(server, "yfy_inventory_get", { inventory });
+  assert.notEqual(read.isError, true, JSON.stringify(read.content));
+  assert.equal((read.structuredContent?.workspace as Record<string, unknown>).access_context, "secondary");
+
+  const restartedServer = new FakeServer();
+  const restartedRuntime = { ...runtime } as AppRuntime;
+  registerInventoryTools(restartedServer as unknown as McpServer, restartedRuntime);
+  const durable = await call(restartedServer, "yfy_inventory_get", { inventory });
+  assert.notEqual(durable.isError, true, JSON.stringify(durable.content));
+
+  const wrongSecretServer = new FakeServer();
+  const wrongSecretRuntime = { ...runtime, config: { ...runtime.config, clientSecret: "different-secret" } } as AppRuntime;
+  registerInventoryTools(wrongSecretServer as unknown as McpServer, wrongSecretRuntime);
+  const wrongSecret = await call(wrongSecretServer, "yfy_inventory_get", { inventory });
+  assert.equal(errorCode(wrongSecret), "YFY_INPUT_INVALID");
+
+  const released = await call(server, "yfy_inventory_release", { inventory });
+  assert.equal(released.structuredContent?.status, "released");
+  const repeated = await call(server, "yfy_inventory_release", { inventory });
+  assert.equal(repeated.structuredContent?.status, "already_unavailable");
 });
 
 test("inventory refs become stale when the configured workspace root changes", async () => {
@@ -692,9 +965,25 @@ test("ordinary open does not require workspace ancestry metadata", async () => {
   assert.equal(delivery.mode, "binary_no_preview");
   assert.equal(delivery.resource_fetch_required, true);
   assert.equal(delivery.embedded_resource_in_tool_result, false);
-  assert.equal((result.structuredContent?.resource as Record<string, unknown>).must_release, true);
-  assert.equal((result.structuredContent?.resource as Record<string, unknown>).media_type, "application/pdf");
-  assert.equal((result.structuredContent?.resource as Record<string, unknown>).media_type_source, "file_extension");
+  assert.equal(delivery.agent_readable, false);
+  assert.equal(delivery.human_attachment_only, true);
+  assert.equal(delivery.model_has_body_text, false);
+  assert.equal(delivery.body_text_basis, "none");
+  assert.match(String(delivery.next_step), /does not mean the model has read the body text/i);
+  assert.match(String(delivery.next_step), /agent_readable=false/);
+  assert.match(String(delivery.next_step), /yfy_resource_release/);
+  const resource = result.structuredContent?.resource as Record<string, unknown>;
+  assert.equal(resource.must_release, true);
+  assert.equal(resource.media_type, "application/pdf");
+  assert.equal(resource.media_type_source, "file_extension");
+  const nextAction = result.structuredContent?.next_action as Record<string, unknown>;
+  assert.equal(nextAction.tool, "yfy_resource_release");
+  assert.equal((nextAction.arguments as Record<string, unknown>).resource_uri, resource.resource_uri);
+  const lifecycle = result.structuredContent?.lifecycle as Record<string, unknown>;
+  assert.equal(lifecycle.must_release, true);
+  assert.equal(lifecycle.release_tool, "yfy_resource_release");
+  assert.equal(lifecycle.resource_uri, resource.resource_uri);
+  assert.equal(lifecycle.release_is_idempotent, true);
 });
 
 test("open returns inline preview for small text and svg media types", async () => {
@@ -743,15 +1032,33 @@ test("open returns inline preview for small text and svg media types", async () 
     assert.equal(delivery.resource_fetch_required, false);
     assert.equal(delivery.embedded_resource_in_tool_result, true);
     assert.equal(delivery.preview_charset, "utf-8");
+    assert.equal(delivery.agent_readable, true);
+    assert.equal(delivery.human_attachment_only, false);
+    assert.equal(delivery.model_has_body_text, true);
+    assert.equal(delivery.body_text_basis, "inline_preview");
+    assert.match(String(delivery.next_step), /yfy_resource_release/);
+    const nextAction = result.structuredContent?.next_action as Record<string, unknown>;
+    assert.equal(nextAction.tool, "yfy_resource_release");
+    assert.equal((nextAction.arguments as Record<string, unknown>).resource_uri, resource.resource_uri);
+    assert.equal((result.structuredContent?.lifecycle as Record<string, unknown>).release_is_idempotent, true);
     const embedded = result.content?.find((entry) => entry.type === "resource");
     assert.equal(embedded?.resource?.text, svgBody);
     assert.match(String(embedded?.resource?.uri), /^yfy:\/\/evidence\//);
-    const textEnvelope = JSON.parse(result.content?.find((entry) => entry.type === "text")?.text ?? "{}") as { text_delivery?: { mode?: string } };
-    assert.equal(textEnvelope.text_delivery?.mode, "compact_preview");
+    const textEnvelope = JSON.parse(result.content?.find((entry) => entry.type === "text")?.text ?? "{}") as {
+      text_delivery?: { mode?: string; continuation_ready?: boolean };
+      control?: { next_action?: { tool?: string }; resource?: { resource_uri?: string } };
+    };
+    assert.ok(["compact_preview", "control_only"].includes(String(textEnvelope.text_delivery?.mode)));
+    assert.equal(textEnvelope.control?.next_action?.tool, "yfy_resource_release");
+    assert.equal(textEnvelope.control?.resource?.resource_uri, resource.resource_uri);
     const disabled = await call(server, "yfy_open", { file: FILE_10, include_text_preview: false });
     const disabledDelivery = disabled.structuredContent?.content_delivery as Record<string, unknown>;
     assert.equal(disabledDelivery.mode, "resource_link_only");
     assert.equal(disabledDelivery.reason, "preview_disabled_by_request");
+    assert.equal(disabledDelivery.agent_readable, false);
+    assert.equal(disabledDelivery.human_attachment_only, false);
+    assert.equal(disabledDelivery.model_has_body_text, false);
+    assert.equal(disabledDelivery.body_text_basis, "none");
     assert.equal((disabled.structuredContent?.resource as Record<string, unknown>).preview_text, undefined);
     assert.equal(disabled.content?.some((entry) => entry.type === "resource"), false);
   } finally {
@@ -970,6 +1277,14 @@ test("large captured content returns a multipart resource without a local path",
     assert.equal(delivery.resource_fetch_required, true);
     assert.equal(delivery.embedded_resource_in_tool_result, false);
     assert.equal(delivery.host_auto_fetch_not_guaranteed, true);
+    assert.equal(delivery.agent_readable, false);
+    assert.equal(delivery.human_attachment_only, true);
+    assert.equal(delivery.model_has_body_text, false);
+    assert.equal(delivery.body_text_basis, "none");
+    const nextAction = result.structuredContent?.next_action as Record<string, unknown>;
+    assert.equal(nextAction.tool, "yfy_resource_release");
+    assert.equal((nextAction.arguments as Record<string, unknown>).resource_uri, resource.resource_uri);
+    assert.equal((result.structuredContent?.lifecycle as Record<string, unknown>).resource_uri, resource.resource_uri);
     const link = result.content?.find((entry) => entry.type === "resource_link") as ({ mimeType?: string } | undefined);
     assert.equal(link?.mimeType, "application/json");
     assert.equal(resource.local_path, undefined);
@@ -988,12 +1303,12 @@ test("organization contact policy distinguishes omitted included and unavailable
     gateway: { getEnterprise: async (endpoint: string) => response(endpoint, { users: [{ id: 1, name: "User", ...(providerHasContact ? { email: "user@example.com" } : {}) }], page_id: 0, page_count: 1 }) }
   } as unknown as AppRuntime;
   registerOrganizationTools(server as unknown as McpServer, runtime);
-  const omitted = await call(server, "yfy_department_users", { request: { mode: "first_request", department_id: "1", include_contact: false } });
+  const omitted = await call(server, "yfy_department_users", { department_id: "1", include_contact: false });
   assert.deepEqual(omitted.structuredContent?.contact_policy, { requested: false, fields: "omitted_by_default" });
-  const included = await call(server, "yfy_department_users", { request: { mode: "first_request", department_id: "1", include_contact: true } });
+  const included = await call(server, "yfy_department_users", { department_id: "1", include_contact: true });
   assert.deepEqual(included.structuredContent?.contact_policy, { requested: true, fields: "included" });
   providerHasContact = false;
-  const unavailable = await call(server, "yfy_department_users", { request: { mode: "first_request", department_id: "1", include_contact: true } });
+  const unavailable = await call(server, "yfy_department_users", { department_id: "1", include_contact: true });
   assert.deepEqual(unavailable.structuredContent?.contact_policy, { requested: true, fields: "none_available" });
 });
 
@@ -1009,6 +1324,14 @@ test("transfer tickets are current-only and claim metadata-only validation", asy
   const result = await call(server, "yfy_transfer_ticket_get", { file: FILE_10 });
   assert.notEqual(result.isError, true, JSON.stringify(result.content));
   assert.equal((result.structuredContent?.selection as Record<string, unknown>).validation_level, "metadata_only");
+  assert.equal(result.structuredContent?.usage_policy, "special_integration_only");
+  assert.equal(result.structuredContent?.not_for_evidence, true);
+  assert.equal(result.structuredContent?.do_not_echo_url, true);
+  assert.deepEqual(result.structuredContent?.preferred_alternatives, { ordinary_read: "yfy_open", workspace_evidence: "yfy_capture" });
+  assert.equal(result.structuredContent?.download_url, "https://download.example/file");
+  const text = result.content?.find((entry) => entry.type === "text")?.text ?? "";
+  assert.ok(!text.includes("https://download.example/file"));
+  assert.match(text, /\*\*\*redacted\*\*\*|do_not_echo_url/);
 });
 
 test("mutation and admin grouped tools build official requests", async () => {

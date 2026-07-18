@@ -24,7 +24,7 @@ function loadDotEnv(filePath: string): void {
   }
 }
 
-test("live MCP protocol exposes and executes the beta.8 capture workflow", { skip: process.env.YFY_LIVE_MCP_TESTS !== "enabled" }, async () => {
+test("live MCP protocol exposes and executes the beta.9 capture workflow", { skip: process.env.YFY_LIVE_MCP_TESTS !== "enabled" }, async () => {
   const envPath = process.env.YFY_LIVE_ENV_PATH ?? path.resolve(process.cwd(), ".env");
   assert.ok(fs.existsSync(envPath), `Live env file not found: ${envPath}`);
   loadDotEnv(envPath);
@@ -52,7 +52,7 @@ test("live MCP protocol exposes and executes the beta.8 capture workflow", { ski
     }
     const status = await client.callTool({ name: "yfy_status", arguments: {} });
     assert.equal(((status.structuredContent as Record<string, unknown>).server as Record<string, unknown>).version, SERVER_VERSION);
-    const root = await client.callTool({ name: "yfy_browse", arguments: { request: { mode: "first_request", at: "workspace:live_scope", limit: 5 } } });
+    const root = await client.callTool({ name: "yfy_browse", arguments: { at: "workspace:live_scope", limit: 5 } });
     assert.notEqual(root.isError, true, JSON.stringify(root.content));
     const access = runtime.access.resolveContext("default");
     const locked = await client.callTool({ name: "yfy_capture", arguments: { file: formatItemRef("file", fileId, access.context.id, access.identityRef), workspace: "workspace:live_scope" } });

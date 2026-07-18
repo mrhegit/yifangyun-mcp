@@ -11,13 +11,15 @@ import type { ResolvedScope } from "../runtime/access.js";
 import { projectInventoryReceipt } from "../scan/projectors.js";
 import type { ScopeItemCursor, ScopeScanState } from "../scan/types.js";
 import type { JsonObject } from "../types.js";
-import { continuationAction, pageOutput, paginatedRequestSchema, parsePaginatedRequest } from "./pagination.js";
+import { continuationAction, pageOutput, paginatedInputSchemaWithFixed, resolvePaginationArgs } from "./pagination.js";
 import { FolderRefSchema, NextActionSchema, SimplePageSchema, WorkspaceRefSchema } from "./schemas.js";
 import { registerTool } from "./tooling.js";
 import { workspaceMembershipProof } from "./workspaceContentTools.js";
 
 const InventoryStatusSchema = z.enum(["running", "retry_wait", "complete", "partial", "cancelled", "failed"]);
-const InventoryRefSchema = z.string().regex(/^inventory:[A-Za-z0-9_-]+$/);
+/** Encrypted, authenticated inventory reference. */
+const InventoryRefSchema = z.string().regex(/^inventory:[A-Za-z0-9_-]+$/).describe("Copy the opaque inventory ref returned by this server. inventory_id is display-only and is not accepted.");
+const InventoryHandleSchema = InventoryRefSchema;
 const DEFAULT_INVENTORY_PAGE_SIZE = 25;
 const CompletenessSchema = z.object({
   pagination_complete: z.boolean(),
@@ -30,7 +32,20 @@ const WorkspaceIdentitySchema = z.object({ ref: WorkspaceRefSchema, root: Folder
 const AgentGuidanceSchema = z.object({
   may_claim_absence: z.boolean(),
   absence_forbidden_reason: z.string().optional(),
-  recommended_actions: z.array(z.string())
+  recommended_actions: z.array(z.string()),
+  empty_result_meaning: z.string().optional(),
+  empty_result_code: z.enum([
+    "absence_forbidden_partial_or_incomplete",
+    "absence_supported",
+    "list_empty",
+    "page_exhausted_no_match"
+  ]).optional(),
+  observation_scope_note: z.string().optional()
+}).strict();
+const PlanningSchema = z.object({
+  strategy: z.literal("prefer_subtree_split"),
+  risk_level: z.enum(["high", "medium", "low"]),
+  hints: z.array(z.string())
 }).strict();
 const ScanRootSchema = z.object({ id: z.string(), ref: FolderRefSchema.optional() }).strict();
 const InventorySummaryShape = {
@@ -43,6 +58,8 @@ const InventorySummaryShape = {
   completeness: CompletenessSchema,
   scan_root: ScanRootSchema,
   agent_guidance: AgentGuidanceSchema,
+  planning: PlanningSchema.optional(),
+  empty_result_meaning: z.string().optional(),
   suggested_wait_ms: z.number().int().nonnegative().optional(),
   freshness: z.object({ age_seconds: z.number().int().nonnegative(), observed_at: z.string() }).strict(),
   limits: z.object({ max_item_depth: z.number().int().min(1), max_items: z.number().int().positive() }).strict(),
@@ -57,13 +74,16 @@ const RefreshSchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("reuse_if_fresh"), max_age_seconds: z.number().int().min(0).max(604800).default(300) }).strict(),
   z.object({ mode: z.literal("force_refresh") }).strict()
 ]);
-const InventorySearchRequestSchema = paginatedRequestSchema({
-  query: z.string().trim().min(1).max(200).optional(),
-  kind: z.enum(["file", "folder", "all"]).default("all"),
-  match_fields: z.array(z.enum(["name", "path"])).min(1).max(2).default(["name", "path"]),
-  case_sensitive: z.boolean().default(false),
-  limit: z.number().int().min(1).max(100).default(DEFAULT_INVENTORY_PAGE_SIZE)
-});
+const InventorySearchInputSchema = paginatedInputSchemaWithFixed(
+  { inventory: InventoryHandleSchema },
+  {
+    query: z.string().trim().min(1).max(200).optional(),
+    kind: z.enum(["file", "folder", "all"]).default("all"),
+    match_fields: z.array(z.enum(["name", "path"])).min(1).max(2).default(["name", "path"]),
+    case_sensitive: z.boolean().default(false),
+    limit: z.number().int().min(1).max(100).default(DEFAULT_INVENTORY_PAGE_SIZE)
+  }
+);
 
 const CursorSchema = z.object({
   item_id: z.string().min(1), item_type: z.enum(["file", "folder", "all"]), mode: z.enum(["search", "list"]), page_limit: z.number().int().min(1).max(100), query: z.string().optional(), match_fields: z.array(z.enum(["name", "path"])).min(1).max(2), case_sensitive: z.boolean(), query_spec_hash: z.string().regex(/^[a-f0-9]{64}$/), signature: z.string().regex(/^[a-f0-9]{64}$/), inventory_id: z.string().uuid(), workspace_fingerprint: z.string().regex(/^[a-f0-9]{64}$/), sort_path: z.string(), total: z.number().int().nonnegative(), watermark: z.number().int().nonnegative(), version: z.literal(3)
@@ -78,24 +98,49 @@ function workspaceFingerprint(state: { contextId: string; identityRef: string; s
   return signature(secret, { access_context: state.contextId, identity_ref: state.identityRef, scan_root_folder_id: state.scanRootFolderId, workspace_id: state.workspaceId, workspace_root_folder_id: state.workspaceRootFolderId, version: 3 });
 }
 
-function inventoryRef(secret: string, state: ScopeScanState): string {
-  const payload = { access_context: state.accessContextId, inventory_id: state.scanId, version: 3, workspace_fingerprint: state.workspaceFingerprint };
-  return `inventory:${Buffer.from(JSON.stringify({ ...payload, signature: signature(secret, payload) }), "utf8").toString("base64url")}`;
+interface InventoryRefPayload {
+  accessContext: string;
+  handle: string;
+  inventoryId: string;
+  workspaceFingerprint: string;
 }
 
-function parseInventoryRef(secret: string, value: unknown): { accessContext: string; inventoryId: string; workspaceFingerprint: string } {
+const INVENTORY_REF_AAD = Buffer.from("yifangyun-inventory-ref-v4", "utf8");
+const InventoryRefPayloadSchema = z.object({ access_context: z.string(), inventory_id: z.string().uuid(), version: z.literal(4), workspace_fingerprint: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
+
+function inventoryRefKey(secret: string): Buffer {
+  return crypto.createHash("sha256").update(`inventory-ref:${secret}`).digest();
+}
+
+function inventoryRef(runtime: AppRuntime, state: ScopeScanState): string {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", inventoryRefKey(runtime.config.clientSecret), iv);
+  cipher.setAAD(INVENTORY_REF_AAD);
+  const plaintext = Buffer.from(JSON.stringify({ access_context: state.accessContextId, inventory_id: state.scanId, version: 4, workspace_fingerprint: state.workspaceFingerprint }), "utf8");
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return `inventory:${Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString("base64url")}`;
+}
+
+function parseInventoryRef(runtime: AppRuntime, raw: string): InventoryRefPayload {
+  const token = decodeCanonicalBase64Url(raw.slice("inventory:".length));
+  if (token.length <= 28) throw new Error("inventory token is too short");
+  const decipher = crypto.createDecipheriv("aes-256-gcm", inventoryRefKey(runtime.config.clientSecret), token.subarray(0, 12));
+  decipher.setAAD(INVENTORY_REF_AAD);
+  decipher.setAuthTag(token.subarray(12, 28));
+  const parsed = InventoryRefPayloadSchema.parse(JSON.parse(Buffer.concat([decipher.update(token.subarray(28)), decipher.final()]).toString("utf8")));
+  return { accessContext: parsed.access_context, handle: raw, inventoryId: parsed.inventory_id, workspaceFingerprint: parsed.workspace_fingerprint };
+}
+
+function resolveInventoryHandle(runtime: AppRuntime, value: unknown): InventoryRefPayload {
+  const raw = String(value).trim();
   try {
-    const encoded = String(value).slice("inventory:".length);
-    const schema = z.object({ access_context: z.string(), inventory_id: z.string().uuid(), signature: z.string().regex(/^[a-f0-9]{64}$/), version: z.literal(3), workspace_fingerprint: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
-    const parsed = schema.parse(JSON.parse(decodeCanonicalBase64Url(encoded).toString("utf8")));
-    const payload = { access_context: parsed.access_context, inventory_id: parsed.inventory_id, version: parsed.version, workspace_fingerprint: parsed.workspace_fingerprint };
-    const expected = Buffer.from(signature(secret, payload), "utf8");
-    const actual = Buffer.from(parsed.signature, "utf8");
-    if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) throw new Error("signature mismatch");
-    return { accessContext: parsed.access_context, inventoryId: parsed.inventory_id, workspaceFingerprint: parsed.workspace_fingerprint };
-  } catch {
-    throw new YifangyunError("Inventory reference is invalid.", { code: "YFY_INPUT_INVALID", phase: "inventory_reference", suggestedAction: "Copy the inventory ref returned by yfy_inventory_create exactly." });
-  }
+    if (raw.startsWith("inventory:")) return parseInventoryRef(runtime, raw);
+  } catch {}
+  throw new YifangyunError("Inventory reference is invalid.", {
+    code: "YFY_INPUT_INVALID",
+    phase: "inventory_reference",
+    suggestedAction: "Copy the opaque inventory ref returned by yfy_inventory_create/get/search. inventory_id is display-only."
+  });
 }
 
 function querySpec(value: { caseSensitive: boolean; itemType: string; limit: number; matchFields: string[]; mode: string; query?: string }) {
@@ -145,7 +190,7 @@ function decodeCursor(value: unknown, ref: { inventoryId: string; workspaceFinge
     }
     return { cursor: { itemId: parsed.item_id, sortPath: parsed.sort_path, total: parsed.total, watermark: parsed.watermark } satisfies ScopeItemCursor, itemType: parsed.item_type, limit: parsed.page_limit, mode: parsed.mode, query: parsed.query, matchFields: parsed.match_fields, caseSensitive: parsed.case_sensitive };
   } catch {
-    throw new YifangyunError("Inventory cursor is invalid or expired.", { code: "YFY_INVENTORY_CURSOR_INVALID", phase: "inventory_search", suggestedAction: "Restart yfy_inventory_search with request.mode=first_request.", agentDetails: { reason } });
+    throw new YifangyunError("Inventory cursor is invalid or expired.", { code: "YFY_INVENTORY_CURSOR_INVALID", phase: "inventory_search", suggestedAction: "Restart yfy_inventory_search with inventory and first-page search fields.", agentDetails: { reason } });
   }
 }
 
@@ -155,7 +200,7 @@ function encodeInventoryCursor(input: { caseSensitive: boolean; cursor: ScopeIte
   return Buffer.from(JSON.stringify({ ...payload, signature: signature(secret, payload) }), "utf8").toString("base64url");
 }
 
-async function stateForRef(runtime: AppRuntime, ref: ReturnType<typeof parseInventoryRef>) {
+async function stateForRef(runtime: AppRuntime, ref: { accessContext: string; inventoryId: string; workspaceFingerprint: string }) {
   const state = await runtime.snapshots.get(ref.inventoryId, ref.accessContext);
   if (state.workspaceFingerprint !== ref.workspaceFingerprint) throw new YifangyunError("Inventory reference belongs to a different workspace identity.", { code: "YFY_INVENTORY_ACCESS_DENIED", phase: "inventory_access", scanId: state.scanId });
   assertCurrentWorkspaceState(runtime, state);
@@ -191,13 +236,41 @@ function assertCurrentWorkspaceState(runtime: AppRuntime, state: ScopeScanState)
   }
 }
 
-function agentGuidance(state: ScopeScanState, safeToClaimAbsence: boolean): {
+function agentGuidance(
+  state: ScopeScanState,
+  safeToClaimAbsence: boolean,
+  opts?: { emptyItems?: boolean; mode?: "search" | "list"; hasMore?: boolean }
+): {
   may_claim_absence: boolean;
   absence_forbidden_reason?: string;
   recommended_actions: string[];
+  empty_result_meaning?: string;
+  empty_result_code?: "absence_forbidden_partial_or_incomplete" | "absence_supported" | "list_empty" | "page_exhausted_no_match";
+  observation_scope_note?: string;
 } {
+  const observation_scope_note = `scan_root=${state.rootFolderId}; status=${state.status}; incomplete_reasons=${state.incompleteReasons.join(",") || "none"}`;
+
   if (safeToClaimAbsence) {
-    return { may_claim_absence: true, recommended_actions: ["Search this inventory with yfy_inventory_search; absence claims are limited to the observed scan root and observation window."] };
+    const base = {
+      may_claim_absence: true as const,
+      recommended_actions: ["Search this inventory with yfy_inventory_search; absence claims are limited to the observed scan root and observation window."],
+      observation_scope_note
+    };
+    if (opts?.emptyItems) {
+      if (opts.mode === "list") {
+        return { ...base, empty_result_meaning: "list_empty_page", empty_result_code: "list_empty" };
+      }
+      return {
+        ...base,
+        empty_result_meaning: "not_found_within_complete_observation; absence_supported",
+        empty_result_code: "absence_supported",
+        recommended_actions: [
+          ...base.recommended_actions,
+          "Empty result under may_claim_absence=true supports absence only within this scan root and observation window."
+        ]
+      };
+    }
+    return base;
   }
 
   const reasons = state.incompleteReasons;
@@ -233,7 +306,58 @@ function agentGuidance(state: ScopeScanState, safeToClaimAbsence: boolean): {
   const absence_forbidden_reason = reasons[0]
     ?? (state.status === "running" || state.status === "retry_wait" ? `inventory_${state.status}` : `inventory_status_${state.status}`);
 
-  return { may_claim_absence: false, absence_forbidden_reason, recommended_actions: [...new Set(recommended_actions)] };
+  const result: ReturnType<typeof agentGuidance> = {
+    may_claim_absence: false,
+    absence_forbidden_reason,
+    recommended_actions: [...new Set(recommended_actions)],
+    observation_scope_note
+  };
+
+  if (opts?.emptyItems) {
+    if (opts.hasMore) {
+      result.empty_result_meaning = "matches_exist_on_later_pages";
+      result.empty_result_code = "page_exhausted_no_match";
+    } else {
+      result.empty_result_meaning = "not_found_in_observed_prefix_only; absence_forbidden";
+      result.empty_result_code = "absence_forbidden_partial_or_incomplete";
+      result.recommended_actions = [
+        "Do not claim materials are missing from this inventory.",
+        "Split root_folder / raise limits.max_items and create a new inventory if completeness is partial.",
+        "Absence claims require agent_guidance.may_claim_absence=true only.",
+        ...result.recommended_actions
+      ];
+      result.recommended_actions = [...new Set(result.recommended_actions)];
+    }
+  }
+  return result;
+}
+
+function inventoryPlanning(hasRootFolder: boolean, maxItems: number, maxDepth: number): {
+  strategy: "prefer_subtree_split";
+  risk_level: "high" | "medium" | "low";
+  hints: string[];
+} {
+  const hints: string[] = [];
+  let risk: "high" | "medium" | "low" = "low";
+  if (!hasRootFolder) {
+    hints.push("Large workspaces: prefer root_folder on a first-level category instead of scanning the entire workspace root.");
+    risk = "high";
+  }
+  if (maxItems < 5000 && !hasRootFolder) {
+    hints.push("max_items is low for a whole-workspace scan; expect partial and absence_forbidden.");
+    risk = "high";
+  } else if (maxItems < 1000) {
+    hints.push("max_items is modest; deep trees may hit MAX_ITEMS_REACHED.");
+    if (risk === "low") risk = "medium";
+  }
+  if (maxDepth < 4) {
+    hints.push("max_item_depth is shallow; deep material paths may be incomplete.");
+    if (risk === "low") risk = "medium";
+  }
+  if (hints.length === 0) {
+    hints.push("Subtree + explicit limits look reasonable; still wait for terminal completeness before absence claims.");
+  }
+  return { strategy: "prefer_subtree_split", risk_level: risk, hints };
 }
 
 function suggestedWaitMs(state: ScopeScanState): number | undefined {
@@ -247,10 +371,10 @@ function suggestedWaitMs(state: ScopeScanState): number | undefined {
   return undefined;
 }
 
-function summary(runtime: AppRuntime, state: ScopeScanState): JsonObject {
+function summary(runtime: AppRuntime, state: ScopeScanState, extra?: { planning?: JsonObject }): JsonObject {
   const internal = runtime.snapshots.summary(state);
   const observedAt = state.observationUpdatedAt;
-  const ref = inventoryRef(runtime.config.clientSecret, state);
+  const ref = inventoryRef(runtime, state);
   const completeness = { ...((internal.completeness as JsonObject) ?? {}) };
   const safeToClaimAbsence = completeness.safe_to_claim_absence === true;
   const next = ["running", "retry_wait"].includes(state.status) ? { tool: "yfy_inventory_get", arguments: { inventory: ref } } : undefined;
@@ -266,6 +390,7 @@ function summary(runtime: AppRuntime, state: ScopeScanState): JsonObject {
     completeness,
     scan_root: scope.scan_root,
     agent_guidance: agentGuidance(state, safeToClaimAbsence),
+    ...(extra?.planning ? { planning: extra.planning } : {}),
     ...(wait !== undefined ? { suggested_wait_ms: wait } : {}),
     freshness: { age_seconds: Math.max(0, Math.floor((Date.now() - Date.parse(observedAt)) / 1000)), observed_at: observedAt },
     limits: { max_item_depth: state.policy.maxItemDepth, max_items: state.policy.maxItems },
@@ -340,7 +465,7 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
 
   registerTool(server, "yfy_inventory_create", {
     title: "Create Yifangyun Workspace Inventory",
-    description: "Create, join, or reuse a recursive workspace inventory. Explicit limits are required because they determine whether absence can be proven. Optional root_folder scopes the scan to a verified subtree inside the workspace.",
+    description: "WHEN: completeness/absence audit. DO NOT: claim absence unless may_claim_absence=true; prefer root_folder for large libraries. EXAMPLE: {\"workspace\":\"workspace:tender_public\",\"refresh\":{\"mode\":\"reuse_if_fresh\"},\"limits\":{\"max_item_depth\":8,\"max_items\":10000},\"root_folder\":\"folder:...\"}",
     inputSchema: {
       workspace: WorkspaceRefSchema,
       refresh: RefreshSchema,
@@ -376,55 +501,88 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
       workspaceRef: String(args.workspace),
       workspaceRootFolderId: workspace.scope.rootFolderId
     });
-    return { ...summary(runtime, started.state), reuse: { reused: started.reused, reason: started.reuseReason, mode: refresh.mode, ...(refresh.mode === "reuse_if_fresh" ? { max_age_seconds: refresh.max_age_seconds } : {}) } };
+    const planning = inventoryPlanning(args.root_folder !== undefined && args.root_folder !== null, limits.max_items, limits.max_item_depth);
+    return {
+      ...summary(runtime, started.state, { planning }),
+      reuse: { reused: started.reused, reason: started.reuseReason, mode: refresh.mode, ...(refresh.mode === "reuse_if_fresh" ? { max_age_seconds: refresh.max_age_seconds } : {}) }
+    };
   });
 
   registerTool(server, "yfy_inventory_get", {
-    title: "Get Yifangyun Workspace Inventory", description: "Read inventory identity, progress, diagnostics, retention and completeness.", inputSchema: { inventory: InventoryRefSchema }, outputSchema: InventorySummaryShape
+    title: "Get Yifangyun Workspace Inventory",
+    description: "Read inventory identity, progress, diagnostics, retention and completeness. Copy the opaque inventory ref returned by this server.",
+    inputSchema: { inventory: InventoryHandleSchema },
+    outputSchema: InventorySummaryShape
   }, { readOnly: true, openWorld: false }, async ({ inventory }) => {
-    const ref = parseInventoryRef(runtime.config.clientSecret, inventory);
+    const ref = resolveInventoryHandle(runtime, inventory);
     return summary(runtime, await stateForRef(runtime, ref));
   });
 
   registerTool(server, "yfy_inventory_search", {
-    title: "Search Yifangyun Workspace Inventory", description: "Search or list a fixed observation watermark. Existing cursors remain stable while the inventory continues scanning.",
-    inputSchema: z.object({ inventory: InventoryRefSchema, request: InventorySearchRequestSchema }).strict(),
-    outputSchema: { inventory: InventoryRefSchema, workspace: WorkspaceIdentitySchema, scan_root: ScanRootSchema, agent_guidance: AgentGuidanceSchema, status: InventoryStatusSchema, view: z.object({ commit_watermark: z.number().int().nonnegative(), current_commit_watermark: z.number().int().nonnegative(), stable: z.literal(true) }).strict(), items: z.array(z.record(z.unknown())), page: SimplePageSchema, next_action: NextActionSchema.optional(), completeness: CompletenessSchema }
+    title: "Search Yifangyun Workspace Inventory",
+    description: "WHEN: search fixed inventory watermark. DO NOT: treat empty items as absence unless empty_result_meaning supports it and may_claim_absence=true. EXAMPLE: {\"inventory\":\"inventory:<uuid>\",\"query\":\"投标函\",\"kind\":\"file\"}",
+    inputSchema: InventorySearchInputSchema.inputSchema,
+    inputValidator: InventorySearchInputSchema.validator,
+    outputSchema: {
+      inventory: InventoryRefSchema,
+      empty_result_meaning: z.string().optional(),
+      workspace: WorkspaceIdentitySchema,
+      scan_root: ScanRootSchema,
+      agent_guidance: AgentGuidanceSchema,
+      status: InventoryStatusSchema,
+      view: z.object({ commit_watermark: z.number().int().nonnegative(), current_commit_watermark: z.number().int().nonnegative(), stable: z.literal(true) }).strict(),
+      items: z.array(z.record(z.unknown())),
+      page: SimplePageSchema,
+      next_action: NextActionSchema.optional(),
+      completeness: CompletenessSchema
+    }
   }, { readOnly: true, openWorld: false }, async (args) => {
-    const ref = parseInventoryRef(runtime.config.clientSecret, args.inventory);
+    const pageArgs = resolvePaginationArgs(args, "inventory_search", { fixedKeys: ["inventory"] });
+    const inventoryValue = String(pageArgs.kind === "continuation" ? pageArgs.fixed.inventory : (pageArgs.data as { inventory: string }).inventory);
+    const ref = resolveInventoryHandle(runtime, inventoryValue);
     await stateForRef(runtime, ref);
-    const request = parsePaginatedRequest(InventorySearchRequestSchema, args.request, "inventory_search");
-    const continued = request.mode === "continuation" ? decodeCursor(request.cursor, ref, runtime.config.clientSecret) : undefined;
-    const query = continued?.query ?? (request.mode === "first_request" ? request.query : undefined);
+    const first = pageArgs.kind === "first" ? pageArgs.data as {
+      inventory: string; query?: string; kind: "file" | "folder" | "all"; match_fields: Array<"name" | "path">; case_sensitive: boolean; limit: number;
+    } : undefined;
+    const continued = pageArgs.kind === "continuation" ? decodeCursor(pageArgs.cursor, ref, runtime.config.clientSecret) : undefined;
+    const query = continued?.query ?? first?.query;
     const mode = continued?.mode ?? (query ? "search" as const : "list" as const);
-    const itemType = continued?.itemType ?? (request.mode === "first_request" ? request.kind : "all");
-    const limit = continued?.limit ?? (request.mode === "first_request" ? request.limit : DEFAULT_INVENTORY_PAGE_SIZE);
-    const matchFields = continued?.matchFields ?? (request.mode === "first_request" ? request.match_fields : ["name", "path"]);
-    const caseSensitive = continued?.caseSensitive ?? (request.mode === "first_request" && request.case_sensitive);
+    const itemType = continued?.itemType ?? first?.kind ?? "all";
+    const limit = continued?.limit ?? first?.limit ?? DEFAULT_INVENTORY_PAGE_SIZE;
+    const matchFields = continued?.matchFields ?? first?.match_fields ?? ["name", "path"];
+    const caseSensitive = continued?.caseSensitive ?? first?.case_sensitive === true;
     const result = await runtime.snapshots.query({ accessContextId: ref.accessContext, cursor: continued?.cursor, limit, mode, queries: query ? [query] : undefined, matchFields, caseSensitive, scanId: ref.inventoryId, type: itemType });
     const nextCursor = result.nextCursor ? encodeInventoryCursor({ caseSensitive, cursor: result.nextCursor, inventoryId: ref.inventoryId, itemType, limit, matchFields, mode, query, workspaceFingerprint: ref.workspaceFingerprint }, runtime.config.clientSecret) : undefined;
     const items = result.items.map((item) => typeof item.id === "string" && (item.type === "file" || item.type === "folder") ? { ...item, ref: formatItemRef(item.type, item.id, result.state.accessContextId, result.state.accessIdentityRef) } : item);
-    const next = continuationAction("yfy_inventory_search", nextCursor, { inventory: String(args.inventory) });
+    const refValue = inventoryRef(runtime, result.state);
+    const next = continuationAction("yfy_inventory_search", nextCursor, { inventory: refValue });
     const completeness = { ...(runtime.snapshots.summary(result.state).completeness as JsonObject) };
     const scope = inventoryScopeProjection(result.state);
+    const page = pageOutput(items.length, nextCursor);
+    const guidance = agentGuidance(result.state, completeness.safe_to_claim_absence === true, {
+      emptyItems: items.length === 0,
+      mode,
+      hasMore: page.has_more === true
+    });
     return {
-      inventory: String(args.inventory),
-      workspace: scope.workspace,
-      scan_root: scope.scan_root,
-      agent_guidance: agentGuidance(result.state, completeness.safe_to_claim_absence === true),
+      agent_guidance: guidance,
+      ...(guidance.empty_result_meaning ? { empty_result_meaning: guidance.empty_result_meaning } : {}),
       status: result.state.status,
+      completeness,
+      scan_root: scope.scan_root,
+      workspace: scope.workspace,
+      inventory: refValue,
       view: { commit_watermark: continued?.cursor.watermark ?? result.state.commitWatermark, current_commit_watermark: result.state.commitWatermark, stable: true },
       items,
-      page: pageOutput(items.length, nextCursor),
-      ...(next ? { next_action: next } : {}),
-      completeness
+      page,
+      ...(next ? { next_action: next } : {})
     };
   });
 
   registerTool(server, "yfy_inventory_cancel", {
-    title: "Cancel Yifangyun Workspace Inventory", description: "Cancel an active inventory. Cancelling a terminal inventory is a no-op.", inputSchema: { inventory: InventoryRefSchema }, outputSchema: { ...InventorySummaryShape, cancellation: z.object({ outcome: z.enum(["cancelled", "already_terminal"]) }).strict() }
+    title: "Cancel Yifangyun Workspace Inventory", description: "Cancel an active inventory. Cancelling a terminal inventory is a no-op.", inputSchema: { inventory: InventoryHandleSchema }, outputSchema: { ...InventorySummaryShape, cancellation: z.object({ outcome: z.enum(["cancelled", "already_terminal"]) }).strict() }
   }, { readOnly: false, idempotent: true, openWorld: false }, async ({ inventory }) => {
-    const ref = parseInventoryRef(runtime.config.clientSecret, inventory);
+    const ref = resolveInventoryHandle(runtime, inventory);
     const before = await stateForRef(runtime, ref);
     const terminal = ["complete", "partial", "cancelled", "failed"].includes(before.status);
     const state = terminal ? before : await runtime.snapshots.cancel(ref.inventoryId, ref.accessContext);
@@ -432,11 +590,19 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
   });
 
   registerTool(server, "yfy_inventory_release", {
-    title: "Release Yifangyun Workspace Inventory", description: "Delete one local inventory and invalidate its ref, cursors, manifest and receipt resources.", inputSchema: { inventory: InventoryRefSchema }, outputSchema: { inventory: InventoryRefSchema, status: z.enum(["released", "already_unavailable"]) }
+    title: "Release Yifangyun Workspace Inventory", description: "Delete one local inventory and invalidate its ref, cursors, manifest and receipt resources.", inputSchema: { inventory: InventoryHandleSchema }, outputSchema: { inventory: InventoryRefSchema, status: z.enum(["released", "already_unavailable"]) }
   }, { readOnly: false, destructive: true, idempotent: true, openWorld: false }, async ({ inventory }) => {
-    const ref = parseInventoryRef(runtime.config.clientSecret, inventory);
+    const ref = resolveInventoryHandle(runtime, inventory);
+    try {
+      await stateForRef(runtime, ref);
+    } catch (error) {
+      if (error instanceof YifangyunError && error.code === "YFY_INVENTORY_NOT_FOUND") {
+        return { inventory: ref.handle, status: "already_unavailable" };
+      }
+      throw error;
+    }
     const released = await runtime.snapshots.release(ref.inventoryId, ref.accessContext);
-    return { inventory: String(inventory), status: released ? "released" : "already_unavailable" };
+    return { inventory: ref.handle, status: released ? "released" : "already_unavailable" };
   });
 
   server.registerResource("yfy_inventory_manifest", new ResourceTemplate("yfy://inventory/{inventory_id}/{artifact_token}/{access_context}/manifest", { list: undefined }), { title: "Yifangyun Inventory Manifest", description: "Inventory observation digest without inline page receipts.", mimeType: "application/json" }, async (uri, variables) => {

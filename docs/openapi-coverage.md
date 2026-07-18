@@ -1,6 +1,6 @@
 ﻿# OpenAPI 覆盖矩阵
 
-beta.8 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Drive、Workspace、Inventory、Content 和 Organization Module 内。所有项目工具使用 context-bound Ref，分页工具统一使用严格的 first request/continuation 契约。
+beta.9 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Drive、Workspace、Inventory、Content 和 Organization Module 内。所有项目工具使用 context-bound Ref，分页工具统一使用扁平 first 字段 / `cursor` 续页契约（见 `docs/migration-v1.md`）。
 
 ## Drive
 
@@ -35,7 +35,7 @@ beta.8 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Driv
 | group list/users | `yfy_group_list/users` |
 | collaboration | `yfy_collaboration_read/mutate` |
 | folder/file mutation and upload | mutation toolset |
-| enterprise administration | admin toolset |
+| enterprise administration | admin toolset；Provider 未声明 page capacity 的列表使用本地 offset/limit cursor |
 
 ## 暂未覆盖
 

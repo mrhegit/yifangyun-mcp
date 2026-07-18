@@ -24,7 +24,7 @@ MCP 客户端配置示例：
   "mcpServers": {
     "yifangyun": {
       "command": "npx",
-      "args": ["-y", "yifangyun-mcp-server@1.0.0-beta.8"],
+      "args": ["-y", "yifangyun-mcp-server@1.0.0-beta.9"],
       "env": {
         "YFY_CLIENT_ID": "...",
         "YFY_CLIENT_SECRET": "...",
@@ -75,7 +75,7 @@ YFY_INVENTORY_CONCURRENCY=2
 同一个 `YFY_STATE_DB` 只允许一个 MCP 进程打开；需要水平扩展时必须使用独立数据库 adapter，不能让多个实例共享该 SQLite 文件。
 不要把 `YFY_STATE_DB` 放在 `YFY_TEMP_DIR/artifacts` 下，该目录属于 Evidence TTL 和配额清理范围。
 
-beta.8 使用 SQLite schema 5，持久化配置 Workspace root 与实际 scan root 的独立身份，不会原地迁移 0.4.0 或任何更早 beta 状态库。升级时先停止旧进程，然后把 `YFY_STATE_DB` 指向新的空文件路径。旧数据库及 `-wal`、`-shm`、进程锁文件应保留到功能验证完成；确认不回滚后再清理。
+beta.9 仍使用 SQLite schema 5（与 beta.8 状态库兼容），并引入 contract_version=4 的工具输入/输出破坏性变更（见 `docs/migration-v1.md`）。从 0.4.0、beta.7 或更早 beta 升级状态库时：先停止旧进程，把 `YFY_STATE_DB` 指向新的空文件路径。旧数据库及 `-wal`、`-shm`、进程锁文件应保留到功能验证完成；确认不回滚后再清理。
 
 大型目录可逐步提高 `YFY_INVENTORY_CONCURRENCY`。默认 2 路适合多数租户；提高到 4-8 前应观察 429、Provider 延迟和前台 Drive/Capture 请求等待时间。
 
@@ -111,9 +111,9 @@ npm pack --dry-run
 仓库的 `.github/workflows/publish.yml` 只在推送 `v*` tag 时运行。发布前要求工作区干净，并确保 tag 去掉前缀 `v` 后与 `package.json.version` 完全一致：
 
 ```bash
-git tag v1.0.0-beta.8
+git tag -a v1.0.0-beta.9 -m "发布 1.0.0-beta.9"
 git push origin HEAD
-git push origin v1.0.0-beta.8
+git push origin v1.0.0-beta.9
 ```
 
 Action 会依次执行 `npm ci`、build、单元/集成测试、Inventory 性能测试和 `npm pack --dry-run`。预发布版本以 npm dist-tag `next` 发布，并创建 GitHub prerelease；正式版本使用 `latest`。npm publish 使用 Trusted Publishing provenance 和仓库配置的 `NPM_TOKEN`，本地不直接运行 `npm publish`。

@@ -1,14 +1,16 @@
-# 从 0.4.0 迁移到 1.0.0-beta.8
+# 迁移到 1.0.0-beta.9
 
-本文是唯一迁移路径，适用于从正式版本 `0.4.0` 直接升级到当前版本 `1.0.0-beta.8`（`contract_version=3`）。无需先安装任何中间 beta。
+本文提供两条完整路径：从正式版 `0.4.0` 直接升级到 `1.0.0-beta.9`，以及从 `1.0.0-beta.8` 升级到 beta.9。当前服务版本为 `1.0.0-beta.9`，`contract_version=4`，Node.js 要求 `>=24`。
 
-beta 系列将 Agent-facing Interface 重构为轻量 Drive 平面和可选的 Workspace、Inventory、Evidence、Organization 平面，并统一 context-bound Ref、互斥分页、三态证明、内容 Resource、结果预算和固定观察水位 Inventory。**0.4.0 路径的最终契约版本为 `contract_version=3`（beta.8）**。
+这是 Agent-facing Interface 的破坏性升级。工具目录、调用参数、Cursor、Inventory 引用、Prompt、评测和客户端响应解析应作为一个版本单元切换。
 
-这是破坏性迁移：不提供 0.4.0 工具别名、旧参数解析、旧配置键映射、旧 cursor/Ref 转换或旧 SQLite schema 原地迁移。MCP 客户端定义、Prompt、评测、配置和状态库必须作为一个版本单元同步切换。
+## 从 0.4.0 直接升级
 
-## 工具迁移
+无需安装任何中间 beta。0.4.0 的旧工具名、数字 ID 参数、分页参数和 SQLite 状态不能在 beta.9 中继续使用。
 
-| 0.4.0 | 1.0.0-beta.8 |
+### 工具映射
+
+| 0.4.0 | beta.9 |
 |---|---|
 | `yfy_connection_check`、`yfy_context_get` | `yfy_status` |
 | `yfy_root_list`、`yfy_folder_list` | `yfy_browse` |
@@ -21,16 +23,14 @@ beta 系列将 Agent-facing Interface 重构为轻量 Drive 平面和可选的 W
 | `yfy_share_list` | `yfy_shares` |
 | `yfy_authority_validate` | `yfy_workspace_validate` |
 | `yfy_scope_check` | `yfy_membership_check` |
-| 四个 `yfy_snapshot_*` | `yfy_inventory_create/get/search/cancel`，并新增 `release` |
+| `yfy_snapshot_*` | `yfy_inventory_create/get/search/cancel/release` |
 | `yfy_evidence_capture` | `yfy_capture` |
 | `yfy_evidence_release` | `yfy_resource_release` |
 | `yfy_department_read`、`yfy_group_read` | 明确的 department/user/group 工具 |
 
-`yfy_open` 是新的普通内容读取入口，不要求 Workspace。`yfy_capture` 仅用于需要 Workspace membership 和下载前后稳定性证明的原件固化。
+`yfy_open` 是普通内容读取入口，不要求 Workspace。`yfy_capture` 只用于需要 Workspace membership 和下载前后稳定性证明的原件固化。
 
-## Toolset 与配置迁移
-
-Toolset 重命名：
+### Toolset 和环境变量
 
 ```text
 core       -> drive
@@ -38,24 +38,20 @@ authority  -> workspace
 snapshot   -> inventory
 ```
 
-环境变量重命名：
-
 ```text
-YFY_SCOPES_JSON              -> YFY_WORKSPACES_JSON
-YFY_SNAPSHOT_CONCURRENCY     -> YFY_INVENTORY_CONCURRENCY
-YFY_SNAPSHOT_TTL_SECONDS     -> YFY_INVENTORY_TTL_SECONDS
+YFY_SCOPES_JSON          -> YFY_WORKSPACES_JSON
+YFY_SNAPSHOT_CONCURRENCY -> YFY_INVENTORY_CONCURRENCY
+YFY_SNAPSHOT_TTL_SECONDS -> YFY_INVENTORY_TTL_SECONDS
 ```
 
-0.4.0：
+0.4.0 示例：
 
 ```env
 YFY_TOOLSETS=core,authority,snapshot,evidence,organization
 YFY_SCOPES_JSON=[{"id":"tender_public","root_folder_id":"501","access_context":"default","tags":["tender"]}]
-YFY_SNAPSHOT_CONCURRENCY=2
-YFY_SNAPSHOT_TTL_SECONDS=604800
 ```
 
-beta.8（Tender Profile 默认矩阵）：
+beta.9 Tender Profile：
 
 ```env
 YFY_TOOLSETS=drive,workspace,inventory,evidence
@@ -65,220 +61,151 @@ YFY_INVENTORY_CONCURRENCY=2
 YFY_INVENTORY_TTL_SECONDS=604800
 ```
 
-默认 `YFY_TOOLSETS=drive`。Tender Profile 要求 **`drive,workspace,inventory,evidence`** 和至少一个 Workspace。**`transfer` 永不进入投标默认矩阵**；仅在明确需要短时 Provider URL 时单独启用。不要同时保留新旧键；旧键不会作为 fallback 使用。
+默认只启用 `drive`。Tender Profile 要求 `drive,workspace,inventory,evidence` 和至少一个 Workspace。Transfer 仅在明确需要短时 Provider URL 时启用，不能替代 open/capture。
 
-服务只读取进程环境，不自动加载 `.env`。本地运行应显式使用 `node --env-file=.env dist/index.js`，MCP Host、容器或进程管理器应自行注入环境变量。
+服务只读取进程环境，不自动加载 `.env`。本地启动可使用：
 
-## Ref 迁移
+```bash
+node --env-file=.env dist/index.js
+```
 
-0.4.0 的数字 ID 参数和任何中间 beta 的数字 Ref 都不能直接复用。beta.8 Ref 示例：
+### Ref 迁移
+
+数字文件 ID、目录 ID 和旧 beta 数字 Ref 不能复用。beta.9 使用 context-bound Ref：
 
 ```text
 workspace:tender_public
 file:501@default.aaaaaaaaaaaaaaaaaaaaaaaa
 folder:502@default.aaaaaaaaaaaaaaaaaaaaaaaa
 version:7001@ZmlsZTo1MDFAZGVmYXVsdC5hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh
+inventory:<instance-handle-uuid>
 inventory:<signed-payload>
 ```
 
-迁移规则：
+- 从 `yfy_status`、Browse、Search、Resolve、Get、Versions 或 Inventory 结果复制 Ref，不要自行拼接。
+- 当前文件版本调用 open/capture 时省略 `version`；历史版本必须复制 `yfy_versions` 返回的 VersionRef。
+- Workspace 参数必须传 `workspace:<id>`，不能传裸 ID。
+- ItemRef 绑定 Access Context 和身份指纹。身份或 Workspace 配置变化后，应重新发现 Ref。
 
-- root/scope 对象改为 PlaceRef：`personal`、`collaboration`、`department:<id>`、context-bound FolderRef 或 `workspace:<id>`。
-- `item_type + item_id` 改为服务返回的 context-bound FileRef/FolderRef。
-- 历史版本必须先调用 `yfy_versions`，复制绑定完整 FileRef 的 VersionRef；当前版本省略 `version`（`ref=null`）。
-- Workspace 工具参数必须传 `workspace:<id>`，不能传裸 ID。
-- 不要根据格式自行拼接 Ref。应从 `yfy_status`、Browse、Search、Resolve、Get、Versions 或 Inventory 结果复制。
-- 修改 `YFY_CLIENT_SECRET`、Access Context 身份或 Workspace 绑定后，重新发现所有 Ref。
+### 分页迁移
 
-ItemRef 绑定 `access_context` 和 identity fingerprint。来源和目标 Ref 属于不同身份时，move/copy/capture 等操作会被拒绝，而不是只按数字 ID 请求 Provider。
-
-## 分页迁移
-
-0.4.0 的 `page_id`、`page_capacity` 和 `result_offset` 不再暴露。所有分页工具使用严格的 request 判别联合。
-
-首次浏览：
+Provider 的 `page_id`、`page_capacity` 和结果 offset 不再公开。首次调用直接传业务字段：
 
 ```json
 {
-  "tool": "yfy_browse",
-  "arguments": {
-    "request": {
-      "mode": "first_request",
-      "at": "workspace:tender_public",
-      "kind": "all",
-      "detail": "basic",
-      "limit": 50
-    }
-  }
+  "at": "workspace:tender_public",
+  "kind": "all",
+  "detail": "basic",
+  "limit": 50
 }
 ```
 
-续页：
+续页只执行工具返回的 `next_action`：
 
 ```json
 {
-  "tool": "yfy_browse",
-  "arguments": {
-    "request": {
-      "mode": "continuation",
-      "cursor": "..."
-    }
-  }
+  "cursor": "..."
 }
 ```
 
-实际调用应原样执行结果中的 `next_action`。continuation 只允许 cursor，混入首次请求字段会返回 `YFY_INPUT_INVALID`。不要解析 cursor，也不要将其与 Provider 页码混用。
+带固定字段的工具会返回例如：
 
-普通 invalid/stale cursor 应使用 `request.mode=first_request` 重启对应工具。cursor 绑定 contract/config fingerprint 与 envelope 版本；Access Context、Workspace 绑定或契约版本变化后，旧 cursor 不能续用。普通和 Inventory cursor 的公开错误路径均为 `error.diagnostics.reason`，值只可能是 `not_base64url/envelope_invalid/signature_invalid/payload_invalid`，不回传原始解码碎片。
+```json
+{
+  "inventory": "inventory:<uuid>",
+  "cursor": "..."
+}
+```
 
-## Search 与 Resolve 迁移
+不要解析 Cursor，也不要把 Cursor 与首次查询条件混用。Cursor 绑定 contract/config fingerprint；契约或有效配置变化后必须省略 Cursor，用首次业务字段重新开始。
 
-- `yfy_search` 固定是非穷尽 Provider index，空结果不能证明不存在；返回命中也不能替代 `yfy_get` 对当前存在性的确认。
-- 每个 hit 的 `match` 含 `fields/basis/verifiable`、`trust`、`claim_allowed`、scope evidence 和 Provider signals。
-- **只有 `match.claim_allowed=true` 的 hit 才可声称匹配**；默认 `hits` 仅含可本地验证的命中，`provider_index_only` / snippet 命中计入 `coverage.counts.unverified_index_hits`，不进入 `hits`。
-- 需要检查未验证索引噪声时，设置 `include_unverified_index_hits=true`；verified/unverified 按 Provider 顺序使用同一 `limit` 和 cursor，切片后分别投影到 `hits` / `unverified_hits`，`page.returned_count` 是两者之和。
-- 结果顶层含 `agent_warnings`；Provider 当前页同名多候选时 `match.disambiguation_required=true`。Search 永不声称全局唯一。
-- `exact_name` 只允许与 `field=name` 组合，并按大小写敏感名称相等验证。
-- `yfy_resolve` 遇到同名候选返回 `status=ambiguous`，调用方必须选择候选或从更窄 FolderRef 重试。
-- Item 的 `path_chain` 改为 `provider_path_chain` 和 `path_basis=provider_supplied`；Workspace 结果另返回 `relative_ancestor_chain`。
+服务在 `tools/list.inputSchema` 中使用 object + `anyOf` 发布与运行时相同的首次/续页约束。升级后应刷新 Host 的工具目录缓存。
 
-## Workspace 证明迁移
+### Search 和 Resolve
 
-Workspace validation 不再用布尔值压平不确定性：
+- Search 是非穷尽 Provider index，空结果不能证明不存在。
+- `match.claim_allowed=true` 只证明返回元数据支持查询匹配；依赖当前存在性前仍调用 `yfy_get`。
+- Content 命中永远不可 claim。`field=content` 默认返回 unverified 候选；显式传 `include_unverified_index_hits=false` 可隐藏。
+- 过滤统计区分默认隐藏和调用方显式隐藏 unverified 候选。
+- `selection_policy` 为：
+  - `must_disambiguate`：当前或后续页可能有竞争候选，不能直接选择 hits[0]。
+  - `single_candidate_ok`：已观察分页中只有一个可见候选，仍须 `yfy_get` 确认当前存在。
+  - `continue_search`：当前页没有可见候选，但必须继续 `next_action`。
+  - `no_candidates`：Provider 分页已结束且未观察到候选；仍不能证明缺席。
+- `yfy_resolve` 返回 ambiguous 时必须从候选中消歧或缩小起始 FolderRef。
 
-- 单项 checks 为 `pass`、`fail` 或 `unavailable`。
-- 顶层 verdict 为 `valid`、`invalid` 或 `unavailable`。
-- Provider 元数据缺失或末页无法证明时返回 unavailable，不会伪造 pass/fail。
+### Workspace 证明
 
-Membership 结果为 `inside`、`outside` 或 `unavailable`，并附带 `agent_interpretation`：
+Workspace validation 使用 `valid/invalid/unavailable`；Membership 使用 `inside/outside/unavailable`。`unavailable` 既不是 outside，也不允许 capture。
 
-| membership | may_claim_inside | may_claim_outside | may_capture |
-|---|---|---|---|
-| `inside` | true | false | true |
-| `outside` | false | true | false |
-| `unavailable` | false | false | false |
+只有在路径证据与 storage space 证据一致时才声称 inside/outside；冲突时返回 `unavailable/conflicting_membership_evidence`。
 
-路径命中 Workspace root 且不与 storage space 元数据冲突时是 inside；规范化后的 space 证据明确不同时是 outside；路径与 space 冲突时返回 `unavailable/conflicting_membership_evidence`。`mode=assert` 会把 outside 和 unavailable 映射为不同错误。**不得把 unavailable 说成 outside。**
+### Inventory
 
-Organization 用户列表和搜索增加必需的 `contact_policy`：`omitted_by_default` 表示未请求，`included` 表示本页至少一个用户含联系字段，`none_available` 表示已请求但本页没有可投影字段。Admin 的 department users、group list/users 和 log list/list_paginated 也已迁移到统一 request cursor，不再接受公开 `page_id/page_capacity`。Collaboration 的 folder action 只由 context-bound FolderRef 选择身份；collaboration ID action 禁止附带无关 folder。
-
-## Inventory 迁移
-
-创建参数从隐式 snapshot policy 改为显式 Workspace、refresh 和 limits；可选 `root_folder` 将扫描限制在已验证的子树：
+创建 Inventory 必须显式提供 Workspace、refresh 和 limits：
 
 ```json
 {
   "workspace": "workspace:tender_public",
   "root_folder": "folder:502@default.aaaaaaaaaaaaaaaaaaaaaaaa",
-  "refresh": {
-    "mode": "reuse_if_fresh",
-    "max_age_seconds": 300
-  },
-  "limits": {
-    "max_item_depth": 8,
-    "max_items": 10000
-  }
+  "refresh": { "mode": "reuse_if_fresh", "max_age_seconds": 300 },
+  "limits": { "max_item_depth": 8, "max_items": 10000 }
 }
 ```
 
-关键变化：
-
-- `limits.max_item_depth` 和 `limits.max_items` 必填，不再隐藏默认扫描边界。
-- `refresh.mode` 为 `reuse_if_fresh` 或 `force_refresh`。
-- 状态为 `running/retry_wait/complete/partial/cancelled/failed`，不再使用旧 snapshot 状态。
-- 输出含用于显示/日志的 `inventory_id` UUID、签名 `inventory` Ref、`scan_root`、`agent_guidance`（`may_claim_absence`、推荐动作）和运行中的 `suggested_wait_ms`；后续工具参数仍必须使用完整 `inventory` Ref。
-- 配置 Workspace root 与实际 scan root 分开持久化并共同进入 fingerprint；配置根变化后旧 InventoryRef、manifest 和 receipt 返回 `YFY_INVENTORY_STALE`。
-- create/get/search/manifest 使用同一 Workspace root、scan root 和完整性投影；search/manifest 同样返回 `agent_guidance`，子树扫描时 `completeness.scope` 为 `observed_subtree`。
-- retry count、next retry、last error、remaining frontier 和物理存储统计进入 `yfy_inventory_get`。
-- manifest 不再内联 receipt；使用分页 receipt Resource。
-- 新增 `yfy_inventory_release`，用于立即删除一个本地 Inventory。
-- 搜索/list 使用统一 request 分页，并固定 first request 时的 `commit_watermark`。
+- `inventory` 是加密认证的 opaque 持久引用，可在服务重启后继续访问相同 SQLite 中的 Inventory。
+- `inventory_id` 仅用于显示和日志，不能作为工具输入。
+- Ref 不暴露 Access Context、scan UUID 或 Workspace fingerprint；修改 `YFY_CLIENT_SECRET` 后旧 Ref 失效。
 - `safe_to_claim_absence` / `agent_guidance.may_claim_absence` 只有在终态、分页完整、limits 未截断且观察范围可信时才为 true。
+- Partial 空搜返回 `not_found_in_observed_prefix_only; absence_forbidden`，不能报告材料缺失。
+- `yfy_inventory_release` 幂等；重复释放返回 `already_unavailable`。
 
-Inventory search 示例：
+### 内容和 Resource
 
-```json
-{
-  "inventory": "inventory:<signed-payload>",
-  "request": {
-    "mode": "first_request",
-    "query": "招标文件",
-    "kind": "file",
-    "match_fields": ["name", "path"],
-    "case_sensitive": false,
-    "limit": 25
-  }
-}
-```
+- Open/Capture 完整对象位于 `structuredContent`。
+- text content 为兼容通道；大结果只保留有界 preview 和完整操作 control，不复制 `resource.preview_text`。
+- 小型 UTF-8 内容可作为标准 embedded resource 返回；Resource Link 不保证被 Host 自动读取。
+- `content_delivery.agent_readable/model_has_body_text` 表示当前工具结果是否已经给模型正文。
+- PDF、DOCX、XLSX、PPTX 等 binary 模式为 `agent_readable=false`，工具成功不代表模型已读正文。
+- 每次成功 open/capture 都返回 `next_action=yfy_resource_release`；使用后执行，释放操作幂等。
+- Transfer URL 仅存在于 `structuredContent`，text 通道脱敏；不得记录或回显。
 
-后台扫描继续提交时，已有 cursor 仍读取固定 watermark。需要观察新增项目时，重新发起 first request。
+### SQLite 状态
 
-## 内容与 Resource 迁移
-
-0.4.0 固化调用：
-
-```json
-{"tool":"yfy_evidence_capture","arguments":{"scope_id":"tender_public","file_id":"501","version":{"kind":"current"}}}
-```
-
-beta.8：
-
-```json
-{
-  "tool": "yfy_capture",
-  "arguments": {
-    "workspace": "workspace:tender_public",
-    "file": "file:501@default.aaaaaaaaaaaaaaaaaaaaaaaa"
-  }
-}
-```
-
-- 当前版省略 version；历史版复制 `yfy_versions` 返回的 VersionRef。
-- `yfy_versions` 当前版 `ref=null`，`usage.for_open_or_capture=omit_version_parameter`；历史版返回可复制 ref。
-- `expected` 不匹配返回 `YFY_EXPECTATION_MISMATCH`，不会成功返回 false。
-- Capture 在下载前后验证 membership、版本历史和文件元数据；drift 时删除候选内容。
-- `yfy_open` 提供非 Workspace-bound 的普通内容读取。
-- 成功结果顶层 `must_release=true`，并含严格的 `content_delivery`（交付模式、是否已嵌入标准 MCP resource、是否仍需读取 Resource）。
-- 不超过 32 KiB 的可预览 UTF-8 内容经大小和 SHA-256 复核后，同时作为 MCP embedded resource 与 `resource.preview_text` 返回；`include_text_preview=false` 可禁用内嵌。
-- 服务不再声明 `body_in_model_context`；是否进入模型由 Host 决定，resource link 也不保证自动读取。
-- 小文件通过 MCP Resource 返回 text/blob；大文件通过 multipart manifest 和 part URI 读取。
-- 结果不返回服务器本地路径。
-- 使用结束后调用 `yfy_resource_release`；释放幂等。
-- 工具输出校验或序列化失败时，已注册 Resource 会回滚。
-
-## SQLite 状态迁移
-
-Inventory SQLite schema 为 5。0.4.0 和所有更早 beta 状态库均不兼容，服务会返回 `YFY_STATE_SCHEMA_MISMATCH`，不会自动修改旧数据。
-
-升级时：
+beta.9 使用 SQLite schema 5。0.4.0 和更早 beta 状态库不兼容，不会自动迁移或覆盖。
 
 1. 停止旧服务，确认没有进程持有旧 SQLite。
-2. 为 beta.8 配置新的空 `YFY_STATE_DB` 路径。
-3. 保留旧数据库、`-wal`、`-shm` 和进程锁文件作为只读回滚参考。
-4. 完成 beta.8 功能验证并确认不再回滚后，再删除旧状态文件。
+2. 把 `YFY_STATE_DB` 指向新的空文件。
+3. 保留旧数据库及 `-wal`、`-shm`、进程锁作为回滚参考。
+4. 完成验证并确认不回滚后再清理旧状态。
 
-schema 不再保存 `snapshot_seen_items` 和重复 page artifact JSON。item digest、commit sequence、搜索文本和排序键直接位于 `snapshot_items`；receipt 仍保留用于审计。schema 5 还持久化独立的配置 Workspace root 和 scan root，禁止在配置变化后重解释旧观察。
+## 从 beta.8 升级
 
-0.4.0 snapshot ID、cursor、manifest URI、Resource URI 不能转换为 beta.8 InventoryRef 或 Resource。
+beta.8 到 beta.9 的 SQLite schema 仍为 5，可复用状态数据库，但工具契约从 3 升为 4：
 
----
+| beta.8 | beta.9 |
+|---|---|
+| `{request:{mode:"first_request",...}}` | 首次业务字段直接位于工具参数顶层；tools/list 以 `anyOf` 精确发布 |
+| `{request:{mode:"continuation",cursor}}` | `{cursor}`，以及工具要求的固定字段 |
+| 签名可读 payload `inventory` | 单一加密 opaque `inventory` Ref；不再返回 `inventory_secure_ref` |
+| compact preview 可能截断/复制 Resource 正文 | control 操作锚点完整，正文不进入 compact text |
+| Search 三态选择提示 | 改为四态并增加 `continue_search`，跨页候选保守消歧 |
+| content include flag 默认 false | content 默认 true，但显式 false 被尊重 |
 
-## 升级步骤
+beta.8 Cursor 不能在 contract 4 中续用。升级后重新发起首次调用，并更新所有保存的 Prompt、工具参数模板和评测。
 
-1. 停止 0.4.0（或中间 beta）服务，备份旧环境配置和状态目录。
-2. 安装 `yifangyun-mcp-server@1.0.0-beta.8`，要求 Node.js `>=24`。
-3. 从当前 `.env.example` 重建配置，改用新 Toolset、Access Context 和 Workspace 环境变量。
-4. 指定新的空 `YFY_STATE_DB`；不要让新旧服务共享数据库。
-5. 原子更新 MCP 工具目录、request 包装、Ref 保存、响应解析、Prompt 和评测。
-6. 调用 `yfy_status`，记录 `server.contract_version=3`、build/config fingerprint、capabilities 和 PlaceRef。
-7. 调用 `yfy_workspace_validate`，分别处理 valid、invalid 和 unavailable；用 `agent_interpretation` 约束 membership 话术。
-8. 使用小 limits（或 `root_folder` 子树）创建 Inventory，跟随 next_action 到 terminal，检查 diagnostics、manifest/receipts 和 completeness。
-9. 创建可完成的 Inventory，仅在 `safe_to_claim_absence=true` 时验证缺失结论；完成后测试 `yfy_inventory_release`。
-10. 使用受控当前/历史文件验证 `yfy_open`、`yfy_capture`、`content_delivery`/`must_release`、expectation mismatch、multipart 和 Resource release。
-11. 验证 `yfy_search`：默认可验证 hits、`claim_allowed`、可选 `unverified_hits`。
-12. 完成只读验证后，再按最小权限启用 mutation、collaboration、admin 或 transfer。
-13. 确认不回滚后清理旧数据库和临时 Resource 残留。
+## 验证清单
+
+1. 调用 `yfy_status`，确认 `server.version=1.0.0-beta.9`、`contract_version=4` 和 capabilities。
+2. 检查 Host 的 tools/list：分页工具必须显示首次字段和 `cursor`，不能是空 properties。
+3. 验证 Browse/Search 首次调用和原样执行 `next_action`。
+4. 验证 content 搜索、同名消歧、`continue_search` 和过滤计数。
+5. 创建非默认 Access Context 的 Inventory，验证 opaque Ref 的 get/search/cancel/release。
+6. 使用相同 `YFY_CLIENT_SECRET` 重启服务，确认同一 `inventory` Ref 可继续访问；更换 secret 后确认旧 Ref 被拒绝。
+7. 验证 complete 和 partial 空搜语义；只在 `may_claim_absence=true` 时报告缺席。
+8. 验证文本、PDF/Office、multipart 的 open/capture、agent_readable 和重复 release。
+9. 确认 Transfer URL 不出现在 text content 和日志中。
 
 ## 回滚
 
-回滚必须整体切回 0.4.0（或目标旧版）服务、配置、客户端工具定义和旧状态目录。0.4.0 与 beta.8 不能共享 SQLite、cursor、Ref、Resource URI 或 Agent 调用契约。不要尝试让同一 Prompt 同时兼容两套接口。
+回滚必须整体切换服务版本、工具目录、Prompt、Cursor/Ref 保存和对应状态目录。不要让 0.4.0 与 beta.9 共享 SQLite，也不要让同一 Prompt 同时兼容 contract 3 和 contract 4。
