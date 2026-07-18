@@ -79,6 +79,43 @@ test("background snapshot completes and queries indexed SQLite items", async () 
   }
 });
 
+test("subtree inventory keeps the configured workspace root distinct in summaries and manifests", async () => {
+  const store = new SqliteScopeScanStore(":memory:", 3600, 10_000_000);
+  const subtreeProvider: ScopeScanProvider = {
+    getRoot: async () => ({ folder: { id: "2", name: "证书", type: "folder", modified_at_unix: 1 }, meta: meta("/root/2") }),
+    listChildren: async () => ({ files: [{ id: "12", name: "验收证书.pdf", type: "file", parent_folder_id: "2" }], folders: [], hasMore: false, pageId: 0, paginationReliable: true, meta: meta("/2/0") })
+  };
+  const service = new SnapshotService(new ScopeScanEngine(store, subtreeProvider), store, new AccessRegistry(config(":memory:")));
+  await service.initialize();
+  try {
+    const started = await service.create({
+      accessContextId: "default",
+      includeFiles: true,
+      includeFolders: true,
+      maxItemDepth: 5,
+      maxItems: 1000,
+      pageCapacity: 2,
+      rootFolderId: "2",
+      workspaceFingerprint: "subtree-fingerprint",
+      workspaceId: "tender",
+      workspaceRef: "workspace:tender",
+      workspaceRootFolderId: "1"
+    });
+    await service.waitForIdle(started.state.scanId);
+    const completed = await service.get(started.state.scanId);
+    const summary = service.summary(completed);
+    const manifest = await service.manifest(completed.scanId, "default");
+    assert.equal((summary.workspace as Record<string, unknown>).root_folder_id, "1");
+    assert.deepEqual(summary.scan_root, { folder_id: "2", scope: "observed_subtree" });
+    assert.equal((summary.completeness as Record<string, unknown>).scope, "observed_subtree");
+    assert.equal((manifest.workspace as Record<string, unknown>).root_folder_id, "1");
+    assert.deepEqual(manifest.scan_root, { folder_id: "2", scope: "observed_subtree" });
+    assert.equal((manifest.completeness as Record<string, unknown>).scope, "observed_subtree");
+  } finally {
+    await service.close();
+  }
+});
+
 test("running inventory cursors keep a fixed committed watermark", async () => {
   const pagedProvider: ScopeScanProvider = {
     getRoot: async () => ({ folder: { id: "1", name: "Root", type: "folder" }, meta: meta("/root") }),

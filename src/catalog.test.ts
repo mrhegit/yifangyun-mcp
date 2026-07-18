@@ -65,7 +65,7 @@ test("default catalog exposes the current tools and schemas", async () => {
     assert.ok(server.tools.get("yfy_inventory_search")!.definition.outputSchema);
     const inventoryInput = server.tools.get("yfy_inventory_search")!.definition.inputSchema as { shape: Record<string, unknown> };
     assert.ok(inventoryInput.shape.request);
-    assert.deepEqual(Object.keys(server.tools.get("yfy_inventory_create")!.definition.inputSchema as Record<string, unknown>).sort(), ["limits", "refresh", "workspace"]);
+    assert.deepEqual(Object.keys(server.tools.get("yfy_inventory_create")!.definition.inputSchema as Record<string, unknown>).sort(), ["limits", "refresh", "root_folder", "workspace"]);
     assert.equal((server.tools.get("yfy_inventory_create")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
     assert.equal((server.tools.get("yfy_inventory_cancel")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
     assert.equal((server.tools.get("yfy_inventory_release")!.definition.annotations as { destructiveHint: boolean }).destructiveHint, true);

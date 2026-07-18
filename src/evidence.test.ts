@@ -24,6 +24,37 @@ test("evidence registry exposes short-lived bytes through an opaque resource tok
   }
 });
 
+test("evidence registry decodes svg markdown csv and html as text media", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-evidence-text-media-"));
+  const cases: Array<{ name: string; mimeType: string; body: string }> = [
+    { name: "icon.svg", mimeType: "image/svg+xml", body: "<svg xmlns=\"http://www.w3.org/2000/svg\"/>" },
+    { name: "notes.md", mimeType: "text/markdown", body: "# title" },
+    { name: "rows.csv", mimeType: "text/csv", body: "a,b\n1,2" },
+    { name: "page.html", mimeType: "text/html", body: "<html></html>" }
+  ];
+  const registry = new EvidenceArtifactRegistry(60, 1024);
+  try {
+    for (const entry of cases) {
+      const filePath = path.join(dir, entry.name);
+      await fs.writeFile(filePath, entry.body, { mode: 0o600 });
+      const uri = await registry.register({
+        path: filePath,
+        name: entry.name,
+        mimeType: entry.mimeType,
+        expectedSize: Buffer.byteLength(entry.body),
+        expectedSha256: crypto.createHash("sha256").update(entry.body).digest("hex")
+      });
+      const artifact = await registry.read(uri.split("/").at(-1)!);
+      assert.equal(artifact.kind, "text", entry.mimeType);
+      assert.equal(artifact.kind === "text" ? artifact.text : undefined, entry.body);
+      assert.equal(artifact.mimeType, entry.mimeType);
+    }
+  } finally {
+    await registry.close();
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
 test("evidence registry rejects oversized resources before allocating content", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-evidence-resource-limit-"));
   const filePath = path.join(dir, "large.bin");

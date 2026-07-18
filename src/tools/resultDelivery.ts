@@ -13,7 +13,14 @@ const PREVIEW_OPTIONS: PreviewOptions[] = [
   { arrayItems: 1, depth: 3, objectFields: 15, stringCharacters: 128 }
 ];
 
-const ANCHOR_FIELDS = new Set(["id", "ref", "name", "type", "file", "item", "inventory", "workspace", "path", "path_display", "provider_path_chain", "relative_ancestor_chain", "page", "next_action", "completeness", "view", "outcome", "status", "verdict"]);
+const ANCHOR_FIELDS = new Set([
+  "id", "ref", "name", "type", "file", "item", "inventory", "workspace", "path", "path_display", "provider_path_chain", "relative_ancestor_chain",
+  "page", "next_action", "completeness", "view", "outcome", "status", "verdict",
+  "agent_warnings", "coverage", "must_release", "content_delivery", "resource", "assurance", "match", "trust",
+  "disambiguation_required", "claim_allowed", "unverified_hits", "agent_guidance", "suggested_wait_ms",
+  "agent_interpretation", "diagnostics", "contact_policy", "version_selection_rules",
+  "safe_to_claim_absence", "preview_complete", "usage", "inventory_id", "scan_root"
+]);
 
 function terminalPreview(value: unknown, options: PreviewOptions, depth = 0): unknown {
   if (typeof value === "string") return value.length <= options.stringCharacters ? value : `${value.slice(0, options.stringCharacters)}...[${value.length - options.stringCharacters} characters omitted]`;
@@ -66,6 +73,7 @@ export function serializeToolText(tool: string, output: Record<string, unknown>,
     const compact = JSON.stringify(compactEnvelope(tool, output, serialized.length, options));
     if (compact.length <= maxCharacters) return compact;
   }
+  const controlAnchors = controlAnchorsFromOutput(output);
   const metadataOnly = JSON.stringify({
     status: "success",
     tool,
@@ -75,7 +83,8 @@ export function serializeToolText(tool: string, output: Record<string, unknown>,
       full_result_available_in: "structuredContent"
     },
     top_level_fields: Object.keys(output),
-    identity: Object.fromEntries(Object.entries(output).filter(([key]) => ["file", "item", "inventory", "workspace", "outcome", "status", "verdict"].includes(key))),
+    identity: Object.fromEntries(Object.entries(output).filter(([key]) => ["file", "item", "inventory", "inventory_id", "workspace", "outcome", "status", "verdict"].includes(key))),
+    ...controlAnchors,
     page: output.page,
     next_action: output.next_action,
     completeness: output.completeness
@@ -86,9 +95,38 @@ export function serializeToolText(tool: string, output: Record<string, unknown>,
     tool,
     text_delivery: { mode: "metadata_only", original_characters: serialized.length, full_result_available_in: "structuredContent" },
     top_level_fields: Object.keys(output),
-    identity: Object.fromEntries(Object.entries(output).filter(([key]) => ["file", "item", "inventory", "workspace", "outcome", "status", "verdict"].includes(key))),
+    identity: Object.fromEntries(Object.entries(output).filter(([key]) => ["file", "item", "inventory", "inventory_id", "workspace", "outcome", "status", "verdict"].includes(key))),
+    ...controlAnchors,
     page: output.page,
     next_action: output.next_action,
     completeness: output.completeness
   });
+}
+
+/** Keep release/fetch/guidance anchors even when the text channel collapses to metadata_only. */
+function controlAnchorsFromOutput(output: Record<string, unknown>): Record<string, unknown> {
+  const anchors: Record<string, unknown> = {};
+  if (output.must_release === true) anchors.must_release = true;
+  if (output.content_delivery && typeof output.content_delivery === "object" && !Array.isArray(output.content_delivery)) {
+    const delivery = output.content_delivery as Record<string, unknown>;
+    anchors.content_delivery = {
+      mode: delivery.mode,
+      resource_fetch_required: delivery.resource_fetch_required,
+      embedded_resource_in_tool_result: delivery.embedded_resource_in_tool_result,
+      still_must_release: delivery.still_must_release === true ? true : undefined,
+      next_step: typeof delivery.next_step === "string" ? delivery.next_step : undefined
+    };
+  }
+  if (output.resource && typeof output.resource === "object" && !Array.isArray(output.resource)) {
+    const resource = output.resource as Record<string, unknown>;
+    anchors.resource = {
+      ...(typeof resource.resource_uri === "string" ? { resource_uri: resource.resource_uri } : {}),
+      ...(typeof resource.delivery === "string" ? { delivery: resource.delivery } : {}),
+      ...(resource.must_release === true ? { must_release: true } : {})
+    };
+  }
+  if (Array.isArray(output.agent_warnings)) anchors.agent_warnings = output.agent_warnings.slice(0, 8);
+  if (output.agent_guidance && typeof output.agent_guidance === "object") anchors.agent_guidance = output.agent_guidance;
+  if (typeof output.suggested_wait_ms === "number") anchors.suggested_wait_ms = output.suggested_wait_ms;
+  return anchors;
 }

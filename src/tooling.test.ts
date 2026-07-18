@@ -6,6 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { YifangyunError } from "./client.js";
 import { decodeCanonicalBase64Url } from "./domain/base64url.js";
+import { decodeCursor, encodeCursor } from "./domain/cursors.js";
 import { formatItemRef } from "./domain/refs.js";
 import type { AppRuntime } from "./runtime/runtime.js";
 import { registerWorkspaceContentTools } from "./tools/workspaceContentTools.js";
@@ -19,6 +20,22 @@ const FILE_10 = formatItemRef("file", "10", "default", IDENTITY_REF);
 const WORKSPACE_SCOPE = "workspace:scope";
 const WORKSPACE_TENDER = "workspace:tender";
 const WORKSPACE_FINGERPRINT = "b".repeat(64);
+
+test("ordinary cursor errors expose only the stable reason enum", () => {
+  const schema = z.object({ offset: z.number().int() }).strict();
+  const expectReason = (value: string, reason: string) => {
+    assert.throws(() => decodeCursor("secret", WORKSPACE_FINGERPRINT, "test", value, schema), (error: unknown) => {
+      return error instanceof YifangyunError && error.message === "Cursor is invalid or expired." && error.agentDetails?.reason === reason;
+    });
+  };
+  expectReason("%%%", "not_base64url");
+  expectReason(Buffer.from("{}", "utf8").toString("base64url"), "envelope_invalid");
+  const valid = encodeCursor("secret", WORKSPACE_FINGERPRINT, "test", { offset: 1 });
+  const signatureInvalid = JSON.parse(decodeCanonicalBase64Url(valid).toString("utf8")) as Record<string, unknown>;
+  signatureInvalid.signature = "0".repeat(64);
+  expectReason(Buffer.from(JSON.stringify(signatureInvalid), "utf8").toString("base64url"), "signature_invalid");
+  expectReason(encodeCursor("secret", WORKSPACE_FINGERPRINT, "test", { offset: "bad" }), "payload_invalid");
+});
 
 test("tool errors bypass successful output schema validation", async () => {
   const server = new McpServer({ name: "test-server", version: "1.0.0" });
@@ -164,7 +181,7 @@ test("the MCP client accepts a running inventory success result", async () => {
         fileCount: 0, folderCount: 0, frontierCount: 1, incompleteReasons: [], observationStartedAt: "2026-07-16T00:00:00.000Z", observationUpdatedAt: "2026-07-16T00:00:00.000Z",
         pageReceiptCount: 0, policy: { caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"], maxItemDepth: 20, maxItems: 50000, pageCapacity: 500 },
         policyHash: "hash", receiptDigest: "digest", revision: 0, retryCount: 0, rootFolder: {}, rootFolderId: "501", rootObservationDigest: "root", scanId: "123e4567-e89b-12d3-a456-426614174000",
-        status: "running", updatedAt: "2026-07-16T00:00:00.000Z", workspaceFingerprint: WORKSPACE_FINGERPRINT, workspaceId: "tender", workspaceRef: WORKSPACE_TENDER
+        status: "running", updatedAt: "2026-07-16T00:00:00.000Z", workspaceFingerprint: String(input.workspaceFingerprint), workspaceId: "tender", workspaceRef: WORKSPACE_TENDER, workspaceRootFolderId: "501"
       } }); },
       summary: () => ({ terminal: false, completeness: { pagination_complete: false, safe_to_claim_absence: false, scope: "observed_subset_only", consistency_level: "partial_observation", incomplete_reasons: [] } }),
       storageStats: () => ({ database_bytes: 0, logical_bytes: 0, wal_bytes: 0 })
@@ -179,7 +196,11 @@ test("the MCP client accepts a running inventory success result", async () => {
     await client.listTools();
     const result = await client.callTool({ name: "yfy_inventory_create", arguments: { workspace: WORKSPACE_TENDER, refresh: { mode: "reuse_if_fresh", max_age_seconds: 300 }, limits: { max_item_depth: 100, max_items: 100000 } } });
     assert.equal(result.isError, undefined);
-    assert.equal((result.structuredContent as Record<string, unknown>).status, "running");
+    const structured = result.structuredContent as Record<string, unknown>;
+    assert.equal(structured.status, "running");
+    assert.equal(structured.suggested_wait_ms, 750);
+    assert.equal((structured.agent_guidance as Record<string, unknown>).may_claim_absence, false);
+    assert.equal((structured.scan_root as Record<string, unknown>).id, "501");
     assert.equal(createInput?.maxItemDepth, 100);
     assert.equal(createInput?.maxItems, 100_000);
   } finally {
@@ -256,6 +277,44 @@ test("the real MCP client validates current evidence capture and release", async
     assert.equal(resource.local_path, undefined);
     const released = await client.callTool({ name: "yfy_resource_release", arguments: { resource_uri: resourceUri } });
     assert.equal(((released.structuredContent as Record<string, unknown>).status), "released");
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("the real MCP client accepts embedded text and resource-link content together", async () => {
+  const server = new McpServer({ name: "test-server", version: "1.0.0" });
+  const resourceUri = `yfy://evidence/${"c".repeat(48)}`;
+  const body = "verified text";
+  const runtime = {
+    config: { maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, toolsets: ["drive"], transport: "stdio" },
+    gateway: {
+      context: () => ({ context: { id: "default", userId: "530" }, identityRef: IDENTITY_REF }),
+      getUser: async (endpoint: string) => ({
+        data: endpoint.endsWith("/versions")
+          ? { file_versions: [{ current: true, sha1: "a".repeat(40), size: body.length, modified_at: 1 }] }
+          : endpoint.endsWith("/download_v2") ? { download_url: "https://download.example/file" }
+            : { id: 10, name: "notes.txt", type: "file", size: body.length, modified_at: 1, file_version_key: "v1" },
+        meta: { endpoint, fetchedAtIso: "2026-07-16T00:00:00.000Z", fetchedAtUnix: 1, sourceApiVersion: "v2", statusCode: 200 }
+      })
+    },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "notes.txt", tempPath: "C:/temp/notes.txt", sha1: "a".repeat(40), sha256: "b".repeat(64), sizeBytes: body.length, contentType: "text/plain", meta: { endpoint: "/download", fetchedAtIso: "2026-07-16T00:00:00.000Z", fetchedAtUnix: 1, sourceApiVersion: "v2", statusCode: 200 } }) },
+    evidence: { register: async () => resourceUri, release: async () => true, readTextPreview: async () => ({ bytes: Buffer.byteLength(body), text: body }) }
+  } as unknown as AppRuntime;
+  registerWorkspaceContentTools(server, runtime);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-client", version: "1.0.0" });
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const opened = await client.callTool({ name: "yfy_open", arguments: { file: FILE_10 } });
+    assert.equal(opened.isError, undefined, JSON.stringify(opened.content));
+    const content = opened.content as Array<{ resource?: { text?: string }; type: string; uri?: string }>;
+    const embedded = content.find((entry) => entry.type === "resource");
+    const link = content.find((entry) => entry.type === "resource_link");
+    assert.equal(embedded?.resource?.text, body);
+    assert.equal(link?.uri, resourceUri);
   } finally {
     await client.close();
     await server.close();

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,20 +9,24 @@ import { YifangyunError } from "./client.js";
 import { provenance } from "./domain/projectors.js";
 import { formatItemRef, formatVersionRef, parseItemRef } from "./domain/refs.js";
 import type { AppRuntime } from "./runtime/runtime.js";
+import { EvidenceArtifactRegistry } from "./runtime/evidence.js";
 import { registerAdminTools } from "./tools/adminTools.js";
 import { normalizedMediaType, registerWorkspaceContentTools } from "./tools/workspaceContentTools.js";
 import { registerDriveTools } from "./tools/driveTools.js";
 import { registerMutationTools } from "./tools/mutationTools.js";
 import { registerInventoryTools } from "./tools/inventoryTools.js";
+import { registerOrganizationTools } from "./tools/organizationTools.js";
 import { registerTransferTools } from "./tools/transferTools.js";
 import type { ApiJsonResponse, JsonValue } from "./types.js";
 
-type ToolResult = { content?: Array<{ text?: string; type: string }>; structuredContent?: Record<string, unknown>; isError?: boolean };
+type ToolResult = { content?: Array<{ resource?: { mimeType?: string; text?: string; uri?: string }; text?: string; type: string; uri?: string; mimeType?: string }>; structuredContent?: Record<string, unknown>; isError?: boolean };
 type Handler = (args: Record<string, unknown>, extra: { signal: AbortSignal; sendNotification: () => Promise<void> }) => Promise<ToolResult>;
+type ResourceHandler = (uri: URL, variables: Record<string, string>) => Promise<{ contents: Array<{ text?: string }> }>;
 class FakeServer {
   readonly tools = new Map<string, Handler>();
+  readonly resources = new Map<string, ResourceHandler>();
   registerTool(name: string, _definition: unknown, handler: Handler): void { this.tools.set(name, handler); }
-  registerResource(): void {}
+  registerResource(name: string, _template: unknown, _definition: unknown, handler: ResourceHandler): void { this.resources.set(name, handler); }
   registerPrompt(): void {}
 }
 
@@ -75,6 +80,19 @@ test("legacy Office media types are normalized for MCP clients", () => {
   assert.equal(normalizedMediaType("application/excel", undefined), "application/vnd.ms-excel");
   assert.equal(normalizedMediaType("application/powerpoint; charset=binary", undefined), "application/vnd.ms-powerpoint");
   assert.equal(normalizedMediaType("application/octet-stream", "application/pdf"), "application/pdf");
+  assert.equal(normalizedMediaType("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/zip", "report.docx"), "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+  assert.equal(normalizedMediaType("application/octet-stream", "application/zip", "workbook.xlsx"), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  assert.equal(normalizedMediaType("application/vnd.openxmlformats-officedocument.presentationml.presentation", "application/zip", "slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation");
+});
+
+test("media type falls back from magic sniff then file extension including svg", () => {
+  assert.equal(normalizedMediaType("application/octet-stream", undefined, "diagram.svg"), "image/svg+xml");
+  assert.equal(normalizedMediaType(undefined, undefined, "notes.md"), "text/markdown");
+  assert.equal(normalizedMediaType(undefined, undefined, "rows.csv"), "text/csv");
+  assert.equal(normalizedMediaType(undefined, "image/svg+xml", "ignored.bin"), "image/svg+xml");
+  assert.equal(normalizedMediaType("text/plain", "application/pdf", "mislabelled.txt"), "application/pdf");
+  assert.equal(normalizedMediaType("text/plain", "application/json", "data.json"), "text/plain");
+  assert.equal(normalizedMediaType("application/octet-stream", undefined, "blob.bin"), "application/octet-stream");
 });
 
 test("context-bound refs reject beta.6 numeric refs and preserve identity", () => {
@@ -106,8 +124,28 @@ test("drive search hides Provider pagination behind one cursor", async () => {
   } as unknown as AppRuntime;
   registerDriveTools(server as unknown as McpServer, runtime);
   const first = await call(server, "yfy_search", { request: { mode: "first_request", query: "candidate", in: "personal", limit: 2 } });
-  assert.deepEqual(first.structuredContent?.coverage, { mode: "provider_index", exhaustive: false });
+  const coverage = first.structuredContent?.coverage as Record<string, unknown>;
+  assert.equal(coverage.mode, "provider_index");
+  assert.equal(coverage.exhaustive, false);
+  assert.equal(coverage.agent_must_read, true);
+  assert.equal(coverage.does_not_prove_current_existence, true);
+  assert.equal(coverage.does_not_prove_absence, true);
+  assert.deepEqual(coverage.counts, {
+    provider_raw: 3,
+    returned: 2,
+    returned_verified: 2,
+    returned_unverified: 0,
+    verified_hits: 3,
+    unverified_index_hits: 0,
+    scope_rejected: 0,
+    disambiguation_groups: 0
+  });
+  assert.equal(typeof coverage.note, "string");
+  assert.ok(((first.structuredContent?.agent_warnings as string[]) ?? []).some((warning) => /non-exhaustive|candidates only/i.test(warning)));
   assert.equal((first.structuredContent?.hits as unknown[]).length, 2);
+  assert.deepEqual(first.structuredContent?.unverified_hits, []);
+  assert.equal((((first.structuredContent?.hits as Array<Record<string, unknown>>)[0]?.match as Record<string, unknown>).claim_allowed), true);
+  assert.equal((((first.structuredContent?.hits as Array<Record<string, unknown>>)[0]?.match as Record<string, unknown>).trust), "locally_verified");
   const page = first.structuredContent?.page as Record<string, unknown>;
   assert.equal(page.returned_count, 2);
   assert.equal(page.has_more, true);
@@ -119,6 +157,116 @@ test("drive search hides Provider pagination behind one cursor", async () => {
   assert.doesNotMatch(JSON.stringify(first.structuredContent), /login|secret/);
   const standard = await call(server, "yfy_search", { request: { mode: "first_request", query: "candidate", in: "personal", detail: "standard" } });
   assert.equal((((standard.structuredContent?.hits as Array<Record<string, unknown>>)[0]?.item as Record<string, unknown>).owned_by as Record<string, unknown>).name, "Owner");
+});
+
+test("drive search excludes provider_index_only hits by default", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["drive"] },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => response(endpoint, {
+        files: [
+          { id: 1, name: "unrelated-a.pdf", type: "file" },
+          { id: 2, name: "candidate-match.pdf", type: "file" },
+          { id: 3, name: "unrelated-b.pdf", type: "file", snippet: "no useful text" }
+        ],
+        folders: [], page_id: 0, page_capacity: 100, page_count: 1, total_count: 3
+      })
+    }
+  } as unknown as AppRuntime;
+  registerDriveTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_search", { request: { mode: "first_request", query: "candidate", in: "personal", limit: 10 } });
+  const hits = result.structuredContent?.hits as Array<Record<string, unknown>>;
+  assert.equal(hits.length, 1);
+  assert.equal((hits[0]?.item as Record<string, unknown>).ref, FILE_2);
+  assert.equal((hits[0]?.match as Record<string, unknown>).claim_allowed, true);
+  assert.deepEqual(result.structuredContent?.unverified_hits, []);
+  const counts = (result.structuredContent?.coverage as Record<string, unknown>).counts as Record<string, unknown>;
+  assert.equal(counts.provider_raw, 3);
+  assert.equal(counts.verified_hits, 1);
+  assert.equal(counts.unverified_index_hits, 2);
+  assert.equal(counts.returned, 1);
+
+  const included = await call(server, "yfy_search", { request: { mode: "first_request", query: "candidate", in: "personal", include_unverified_index_hits: true, limit: 10 } });
+  assert.equal((included.structuredContent?.hits as unknown[]).length, 1);
+  const unverified = included.structuredContent?.unverified_hits as Array<Record<string, unknown>>;
+  assert.equal(unverified.length, 2);
+  assert.equal((unverified[0]?.match as Record<string, unknown>).claim_allowed, false);
+  assert.equal((unverified[0]?.match as Record<string, unknown>).trust, "unverified_index_hit");
+
+  const orderedFirst = await call(server, "yfy_search", { request: { mode: "first_request", query: "candidate", in: "personal", include_unverified_index_hits: true, limit: 1 } });
+  assert.equal((orderedFirst.structuredContent?.hits as unknown[]).length, 0);
+  assert.equal((((orderedFirst.structuredContent?.unverified_hits as Array<Record<string, unknown>>)[0]?.item as Record<string, unknown>).ref), FILE_1);
+  const orderedSecond = await call(server, "yfy_search", { request: { mode: "continuation", cursor: String((orderedFirst.structuredContent?.page as Record<string, unknown>).next_cursor) } });
+  assert.equal((((orderedSecond.structuredContent?.hits as Array<Record<string, unknown>>)[0]?.item as Record<string, unknown>).ref), FILE_2);
+  const orderedThird = await call(server, "yfy_search", { request: { mode: "continuation", cursor: String((orderedSecond.structuredContent?.page as Record<string, unknown>).next_cursor) } });
+  assert.equal((((orderedThird.structuredContent?.unverified_hits as Array<Record<string, unknown>>)[0]?.item as Record<string, unknown>).ref), formatItemRef("file", "3", "default", IDENTITY_REF));
+});
+
+test("drive search marks same-name hits for disambiguation", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["drive"] },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => response(endpoint, {
+        files: [
+          { id: 1, name: "招标公告.pdf", type: "file", parent_folder_id: 10 },
+          { id: 2, name: "招标公告.pdf", type: "file", parent_folder_id: 20 },
+          { id: 3, name: "other.pdf", type: "file" }
+        ],
+        folders: [], page_id: 0, page_capacity: 100, page_count: 1, total_count: 3
+      })
+    }
+  } as unknown as AppRuntime;
+  registerDriveTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_search", { request: { mode: "first_request", query: "招标公告.pdf", in: "personal", field: "name", exact_name: true, limit: 10 } });
+  const hits = result.structuredContent?.hits as Array<Record<string, unknown>>;
+  assert.equal(hits.length, 2);
+  for (const hit of hits) {
+    const match = hit.match as Record<string, unknown>;
+    assert.equal(match.disambiguation_required, true);
+    assert.equal(match.same_name_hit_count_in_provider_page, 2);
+    assert.deepEqual(match.uniqueness, { status: "multiple_in_provider_page", basis: "non_exhaustive_provider_search" });
+    assert.equal(match.claim_allowed, true);
+  }
+  assert.equal(((result.structuredContent?.coverage as Record<string, unknown>).counts as Record<string, unknown>).disambiguation_groups, 1);
+});
+
+test("drive search preserves disambiguation and total limits across verified and unverified continuation", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["drive"] },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => response(endpoint, {
+        files: [
+          { id: 1, name: "same.pdf", type: "file" },
+          { id: 2, name: "same.pdf", type: "file" },
+          { id: 3, name: "unrelated.pdf", type: "file" }
+        ],
+        folders: [], page_id: 0, page_capacity: 100, page_count: 1, total_count: 3
+      })
+    }
+  } as unknown as AppRuntime;
+  registerDriveTools(server as unknown as McpServer, runtime);
+
+  const first = await call(server, "yfy_search", { request: { mode: "first_request", query: "same", in: "personal", field: "all", include_unverified_index_hits: true, limit: 1 } });
+  const firstHit = ((first.structuredContent?.hits as Array<Record<string, unknown>>)[0]?.match as Record<string, unknown>);
+  assert.equal(firstHit.disambiguation_required, true);
+  assert.equal(firstHit.same_name_hit_count_in_provider_page, 2);
+  assert.equal((first.structuredContent?.page as Record<string, unknown>).returned_count, 1);
+
+  const second = await call(server, "yfy_search", { request: { mode: "continuation", cursor: String((first.structuredContent?.page as Record<string, unknown>).next_cursor) } });
+  assert.equal((second.structuredContent?.page as Record<string, unknown>).returned_count, 1);
+  assert.equal((((second.structuredContent?.hits as Array<Record<string, unknown>>)[0]?.match as Record<string, unknown>).disambiguation_required), true);
+
+  const third = await call(server, "yfy_search", { request: { mode: "continuation", cursor: String((second.structuredContent?.page as Record<string, unknown>).next_cursor) } });
+  assert.equal((third.structuredContent?.hits as unknown[]).length, 0);
+  assert.equal((third.structuredContent?.unverified_hits as unknown[]).length, 1);
+  assert.equal((third.structuredContent?.page as Record<string, unknown>).returned_count, 1);
+  assert.equal((third.structuredContent?.page as Record<string, unknown>).has_more, false);
 });
 
 test("ordinary cursors are invalid after the effective configuration changes", async () => {
@@ -141,6 +289,10 @@ test("ordinary cursors are invalid after the effective configuration changes", a
   registerDriveTools(secondServer as unknown as McpServer, secondRuntime);
   const continued = await call(secondServer, "yfy_browse", { request: { mode: "continuation", cursor } });
   assert.equal(errorCode(continued), "YFY_CURSOR_INVALID");
+  const errorText = JSON.stringify(continued.content);
+  assert.match(errorText, /Cursor is invalid or expired\./);
+  assert.doesNotMatch(errorText, /Invalid cursor:/);
+  assert.doesNotMatch(errorText, /envelope is invalid|signature is invalid|not unpadded|not canonical/);
 });
 
 test("admin log pagination counts user activity rows", async () => {
@@ -239,8 +391,21 @@ test("current file versions omit historical VersionRef values", async () => {
   assert.notEqual(result.isError, true, JSON.stringify(result.content));
   const versions = result.structuredContent?.versions as Array<Record<string, unknown>>;
   assert.equal(versions[0]?.current, true);
-  assert.equal(versions[0]?.ref, undefined);
+  assert.equal(versions[0]?.ref, null);
+  assert.ok(Object.prototype.hasOwnProperty.call(versions[0], "ref"));
+  assert.deepEqual(versions[0]?.usage, {
+    for_open_or_capture: "omit_version_parameter",
+    note: "Current version: omit the version parameter on yfy_open/yfy_capture."
+  });
   assert.equal(versions[1]?.ref, VERSION_10_7);
+  assert.deepEqual(versions[1]?.usage, {
+    for_open_or_capture: "pass_version_ref",
+    note: "Historical version: pass this ref as the version parameter on yfy_open/yfy_capture."
+  });
+  assert.deepEqual(result.structuredContent?.version_selection_rules, {
+    current: "Omit the version parameter on yfy_open/yfy_capture for the current version. Do not invent a version ref.",
+    historical: "Copy the historical version ref from this result and pass it as the version parameter on yfy_open/yfy_capture."
+  });
 });
 
 test("workspace membership distinguishes query and assert semantics", async () => {
@@ -258,11 +423,40 @@ test("workspace membership distinguishes query and assert semantics", async () =
   assert.equal(query.structuredContent?.path_basis, "configured_workspace_root");
   assert.deepEqual(query.structuredContent?.relative_ancestor_chain, []);
   assert.equal((query.structuredContent?.file as Record<string, unknown>).path_basis, "provider_supplied");
+  assert.equal((query.structuredContent?.diagnostics as Record<string, unknown>).reason, "different_space_id");
+  const interpretation = query.structuredContent?.agent_interpretation as Record<string, unknown>;
+  assert.equal(interpretation.may_claim_inside, false);
+  assert.equal(interpretation.may_claim_outside, true);
+  assert.equal(interpretation.may_capture, false);
+  assert.deepEqual((query.structuredContent?.diagnostics as Record<string, unknown>).observed_file_space, { id: "2", type: "department" });
+  assert.deepEqual((query.structuredContent?.diagnostics as Record<string, unknown>).observed_root_space, { id: "1", type: "department" });
   assert.equal(query.isError, undefined);
   const assertion = await call(server, "yfy_membership_check", { file: FILE_10, workspace: WORKSPACE_TENDER, mode: "assert" });
   assert.equal(assertion.isError, true);
   assert.equal(errorCode(assertion), "YFY_WORKSPACE_MEMBERSHIP_FAILED");
   assert.equal(errorCategory(assertion), "authorization");
+  const diagnostics = JSON.parse(assertion.content?.find((entry) => entry.type === "text")?.text ?? "{}") as { error?: { diagnostics?: Record<string, unknown> } };
+  assert.equal(diagnostics.error?.diagnostics?.reason, "different_space_id");
+  assert.equal((diagnostics.error?.diagnostics?.agent_interpretation as Record<string, unknown> | undefined)?.may_capture, false);
+});
+
+test("workspace membership marks different space types as outside", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["workspace"] },
+    access: { resolveWorkspaceRef: () => ({ ...access(), scope: { id: "tender", rootFolderId: "501", accessContext: "default", tags: [] } }) },
+    gateway: { getUser: async (endpoint: string) => endpoint.includes("/folder/501/info")
+      ? response(endpoint, { id: 501, name: "Root", type: "folder", space: { type: "department" } })
+      : response(endpoint, { id: 10, name: "personal.svg", type: "file", parent_folder_id: 0, space: { type: "personal" } }) }
+  } as unknown as AppRuntime;
+  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  const query = await call(server, "yfy_membership_check", { file: FILE_10, workspace: WORKSPACE_TENDER, mode: "query" });
+  assert.equal(query.structuredContent?.membership, "outside");
+  assert.equal((query.structuredContent?.diagnostics as Record<string, unknown>).reason, "different_space_type");
+  const interpretation = query.structuredContent?.agent_interpretation as Record<string, unknown>;
+  assert.equal(interpretation.may_claim_outside, true);
+  assert.equal(interpretation.may_claim_inside, false);
+  assert.equal(interpretation.may_capture, false);
 });
 
 test("workspace membership reports unavailable when ancestry is incomplete", async () => {
@@ -275,9 +469,36 @@ test("workspace membership reports unavailable when ancestry is incomplete", asy
   registerWorkspaceContentTools(server as unknown as McpServer, runtime);
   const query = await call(server, "yfy_membership_check", { file: FILE_10, workspace: WORKSPACE_TENDER, mode: "query" });
   assert.equal(query.structuredContent?.membership, "unavailable");
+  assert.equal((query.structuredContent?.diagnostics as Record<string, unknown>).reason, "missing_ancestor_chain");
+  const interpretation = query.structuredContent?.agent_interpretation as Record<string, unknown>;
+  assert.equal(interpretation.may_claim_inside, false);
+  assert.equal(interpretation.may_claim_outside, false);
+  assert.equal(interpretation.may_capture, false);
   const assertion = await call(server, "yfy_membership_check", { file: FILE_10, workspace: WORKSPACE_TENDER, mode: "assert" });
   assert.equal(errorCode(assertion), "YFY_WORKSPACE_MEMBERSHIP_UNAVAILABLE");
   assert.equal(errorCategory(assertion), "provider_contract");
+  const diagnostics = JSON.parse(assertion.content?.find((entry) => entry.type === "text")?.text ?? "{}") as { error?: { diagnostics?: Record<string, unknown> } };
+  assert.equal(diagnostics.error?.diagnostics?.reason, "missing_ancestor_chain");
+  assert.equal((diagnostics.error?.diagnostics?.agent_interpretation as Record<string, unknown> | undefined)?.may_claim_outside, false);
+});
+
+test("workspace membership rejects conflicting path and storage-space evidence", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["workspace"] },
+    access: { resolveWorkspaceRef: () => ({ ...access(), scope: { id: "tender", rootFolderId: "501", accessContext: "default", tags: [] } }) },
+    gateway: { getUser: async (endpoint: string) => endpoint.includes("/folder/501/info")
+      ? response(endpoint, { id: 501, name: "Root", type: "folder", space: { id: 1, type: "Department" } })
+      : response(endpoint, { id: 10, name: "conflict.pdf", type: "file", parent_folder_id: 501, path: [{ id: 501, name: "Root", type: "folder" }], space: { id: 2, type: "department" } }) }
+  } as unknown as AppRuntime;
+  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_membership_check", { file: FILE_10, workspace: WORKSPACE_TENDER, mode: "query" });
+  assert.equal(result.structuredContent?.membership, "unavailable");
+  assert.equal((result.structuredContent?.diagnostics as Record<string, unknown>).reason, "conflicting_membership_evidence");
+  const interpretation = result.structuredContent?.agent_interpretation as Record<string, unknown>;
+  assert.equal(interpretation.may_claim_inside, false);
+  assert.equal(interpretation.may_claim_outside, false);
+  assert.equal(interpretation.may_capture, false);
 });
 
 test("workspace validation keeps missing evidence unavailable instead of invalid", async () => {
@@ -300,57 +521,138 @@ test("workspace validation keeps missing evidence unavailable instead of invalid
 test("inventory search returns a signed context-bound cursor", async () => {
   const server = new FakeServer();
   let receivedCursor: unknown;
+  let state!: Record<string, unknown>;
   const runtime = {
     config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["inventory"] },
     access: { resolveWorkspaceRef: () => ({ ...access(), scope: { id: "tender", rootFolderId: "501", tags: [] } }) },
+    gateway: {
+      getUser: async (endpoint: string) => endpoint.includes("/folder/10/")
+        ? response(endpoint, { id: 10, name: "Subtree", type: "folder", parent_folder_id: 501, path: [{ id: 501, name: "Root", type: "folder" }], space: { id: 7, type: "department" } })
+        : response(endpoint, { id: 501, name: "Root", type: "folder", space: { id: 7, type: "department" } })
+    },
     snapshots: {
-      create: async () => ({ reused: false, reuseReason: "new", state: {
+      create: async (input: Record<string, unknown>) => {
+        state = {
         accessContextId: "default", accessIdentityRef: IDENTITY_REF, artifactToken: "token", commitWatermark: 1, createdAt: "2026-07-16T00:00:00.000Z", expiresAt: "2026-07-17T00:00:00.000Z",
         fileCount: 1, folderCount: 0, frontierCount: 0, incompleteReasons: [], observationStartedAt: "2026-07-16T00:00:00.000Z", observationUpdatedAt: "2026-07-16T00:00:00.000Z",
         pageReceiptCount: 1, policy: { caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"], maxItemDepth: 20, maxItems: 50000, pageCapacity: 500 },
-        policyHash: "hash", receiptDigest: "digest", revision: 4, retryCount: 0, rootFolder: {}, rootFolderId: "501", rootObservationDigest: "root", scanId: "123e4567-e89b-12d3-a456-426614174000",
-        status: "complete", updatedAt: "2026-07-16T00:00:00.000Z", workspaceFingerprint: WORKSPACE_FINGERPRINT, workspaceId: "tender", workspaceRef: WORKSPACE_TENDER
-      } }),
-      get: async () => ({ workspaceFingerprint: WORKSPACE_FINGERPRINT }),
+        policyHash: "hash", receiptDigest: "digest", revision: 4, retryCount: 0, rootFolder: {}, rootFolderId: String(input.rootFolderId), rootObservationDigest: "root", scanId: "123e4567-e89b-12d3-a456-426614174000",
+        status: "complete", updatedAt: "2026-07-16T00:00:00.000Z", workspaceFingerprint: input.workspaceFingerprint, workspaceId: "tender", workspaceRef: WORKSPACE_TENDER, workspaceRootFolderId: "501"
+        };
+        return { reused: false, reuseReason: "new", state };
+      },
+      get: async () => state,
       query: async (input: Record<string, unknown>) => {
         receivedCursor = input.cursor;
         return {
           items: [{ id: "10", name: "A", type: "file" }],
           nextCursor: { itemId: "file:10", sortPath: "Root/A", total: 2, watermark: 1 },
-          state: { accessContextId: "default", accessIdentityRef: IDENTITY_REF, commitWatermark: 1, revision: 4, scanId: input.scanId, status: "complete", workspaceFingerprint: WORKSPACE_FINGERPRINT, workspaceRef: WORKSPACE_TENDER, rootFolderId: "501" },
+          state,
           total: 2
         };
       },
+      summary: () => ({ terminal: true, completeness: { pagination_complete: true, safe_to_claim_absence: true, scope: "observed_subtree", consistency_level: "best_effort_complete_observation", incomplete_reasons: [] } }),
+      manifest: async () => ({ completeness: { pagination_complete: true, safe_to_claim_absence: true, scope: "observed_subtree", consistency_level: "best_effort_complete_observation", incomplete_reasons: [] }, observation_digest: "digest" }),
+      storageStats: () => ({ database_bytes: 0, logical_bytes: 0, wal_bytes: 0 })
+    }
+  } as unknown as AppRuntime;
+  registerInventoryTools(server as unknown as McpServer, runtime);
+  const created = await call(server, "yfy_inventory_create", { workspace: WORKSPACE_TENDER, root_folder: FOLDER_10, refresh: { mode: "reuse_if_fresh", max_age_seconds: 300 }, limits: { max_item_depth: 20, max_items: 50000 } });
+  assert.notEqual(created.isError, true, JSON.stringify(created.content));
+  assert.equal((created.structuredContent?.agent_guidance as Record<string, unknown>)?.may_claim_absence, true);
+  assert.equal((created.structuredContent?.scan_root as Record<string, unknown>)?.id, "10");
+  const inventory = String(created.structuredContent?.inventory);
+  const first = await call(server, "yfy_inventory_search", { inventory, request: { mode: "first_request", query: "证书", kind: "all", limit: 1 } });
+  assert.equal((first.structuredContent?.scan_root as Record<string, unknown>)?.id, "10");
+  assert.equal((first.structuredContent?.agent_guidance as Record<string, unknown>)?.may_claim_absence, true);
+  assert.equal(((first.structuredContent?.completeness as Record<string, unknown>)?.scope), "observed_subtree");
+  const manifestUri = String(created.structuredContent?.manifest_uri);
+  const manifestResult = await server.resources.get("yfy_inventory_manifest")!(new URL(manifestUri), { inventory_id: String(state.scanId), artifact_token: String(state.artifactToken), access_context: "default" });
+  const manifest = JSON.parse(manifestResult.contents[0]?.text ?? "{}") as Record<string, unknown>;
+  assert.equal((manifest.scan_root as Record<string, unknown>).id, "10");
+  assert.equal((manifest.agent_guidance as Record<string, unknown>).may_claim_absence, true);
+  const cursor = String((first.structuredContent?.page as Record<string, unknown>).next_cursor);
+  assert.ok(cursor.length > 20);
+  const second = await call(server, "yfy_inventory_search", { inventory, request: { mode: "continuation", cursor } });
+  assert.notEqual(second.isError, true, JSON.stringify(second.content));
+  assert.deepEqual(receivedCursor, { itemId: "file:10", sortPath: "Root/A", total: 2, watermark: 1 });
+  const invalid = await call(server, "yfy_inventory_search", { inventory, request: { mode: "continuation", cursor: "%%%" } });
+  const error = JSON.parse(invalid.content?.find((entry) => entry.type === "text")?.text ?? "{}") as { error?: { diagnostics?: Record<string, unknown> } };
+  assert.equal(error.error?.diagnostics?.reason, "not_base64url");
+});
+
+test("inventory refs become stale when the configured workspace root changes", async () => {
+  const server = new FakeServer();
+  let configuredRoot = "501";
+  let state!: Record<string, unknown>;
+  const runtime = {
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["inventory"] },
+    access: { resolveWorkspaceRef: () => ({ ...access(), scope: { id: "scope", rootFolderId: configuredRoot, tags: [] } }) },
+    snapshots: {
+      create: async (input: Record<string, unknown>) => {
+        state = {
+          accessContextId: "default", accessIdentityRef: IDENTITY_REF, artifactToken: "token", commitWatermark: 1, createdAt: "2026-07-16T00:00:00.000Z", expiresAt: "2026-07-17T00:00:00.000Z",
+          fileCount: 1, folderCount: 0, frontierCount: 0, incompleteReasons: [], observationStartedAt: "2026-07-16T00:00:00.000Z", observationUpdatedAt: "2026-07-16T00:00:00.000Z",
+          pageReceiptCount: 1, policy: { includeFiles: true, includeFolders: true, maxItemDepth: 20, maxItems: 50000, pageCapacity: 500 }, policyHash: "hash", receiptDigest: "digest",
+          revision: 1, retryCount: 0, rootFolder: {}, rootFolderId: "501", rootObservationDigest: "root", scanId: "123e4567-e89b-12d3-a456-426614174001", status: "complete",
+          updatedAt: "2026-07-16T00:00:00.000Z", workspaceFingerprint: input.workspaceFingerprint, workspaceId: "scope", workspaceRef: WORKSPACE_SCOPE, workspaceRootFolderId: "501"
+        };
+        return { reused: false, reuseReason: "new", state };
+      },
+      get: async () => state,
       summary: () => ({ terminal: true, completeness: { pagination_complete: true, safe_to_claim_absence: true, scope: "entire_observed_accessible_scope", consistency_level: "best_effort_complete_observation", incomplete_reasons: [] } }),
       storageStats: () => ({ database_bytes: 0, logical_bytes: 0, wal_bytes: 0 })
     }
   } as unknown as AppRuntime;
   registerInventoryTools(server as unknown as McpServer, runtime);
-  const created = await call(server, "yfy_inventory_create", { workspace: WORKSPACE_TENDER, refresh: { mode: "reuse_if_fresh", max_age_seconds: 300 }, limits: { max_item_depth: 20, max_items: 50000 } });
+  const created = await call(server, "yfy_inventory_create", { workspace: WORKSPACE_SCOPE, refresh: { mode: "force_refresh" }, limits: { max_item_depth: 20, max_items: 50000 } });
   const inventory = String(created.structuredContent?.inventory);
-  const first = await call(server, "yfy_inventory_search", { inventory, request: { mode: "first_request", query: "证书", kind: "all", limit: 1 } });
-  const cursor = String((first.structuredContent?.page as Record<string, unknown>).next_cursor);
-  assert.ok(cursor.length > 20);
-  const second = await call(server, "yfy_inventory_search", { inventory, request: { mode: "continuation", cursor } });
-  assert.notEqual(second.isError, true);
-  assert.deepEqual(receivedCursor, { itemId: "file:10", sortPath: "Root/A", total: 2, watermark: 1 });
+  const before = await call(server, "yfy_inventory_get", { inventory });
+  assert.notEqual(before.isError, true, JSON.stringify(before.content));
+  configuredRoot = "999";
+  const after = await call(server, "yfy_inventory_get", { inventory });
+  assert.equal(errorCode(after), "YFY_INVENTORY_STALE");
+  assert.equal(errorCategory(after), "stale_state");
+});
+
+test("inventory root_folder rejects conflicting path and storage-space evidence", async () => {
+  const server = new FakeServer();
+  const runtime = {
+    config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["inventory"] },
+    access: { resolveWorkspaceRef: () => ({ ...access(), scope: { id: "scope", rootFolderId: "501", tags: [] } }) },
+    gateway: {
+      getUser: async (endpoint: string) => endpoint.includes("/folder/10/")
+        ? response(endpoint, { id: 10, name: "Conflict", type: "folder", path: [{ id: 501, name: "Root", type: "folder" }], space: { id: 7, type: "personal" } })
+        : response(endpoint, { id: 501, name: "Root", type: "folder", space: { id: 7, type: "department" } })
+    },
+    snapshots: { create: async () => { throw new Error("conflicting membership must fail before inventory creation"); } }
+  } as unknown as AppRuntime;
+  registerInventoryTools(server as unknown as McpServer, runtime);
+  const result = await call(server, "yfy_inventory_create", { workspace: WORKSPACE_SCOPE, root_folder: FOLDER_10, refresh: { mode: "force_refresh" }, limits: { max_item_depth: 20, max_items: 50000 } });
+  assert.equal(errorCode(result), "YFY_WORKSPACE_MEMBERSHIP_UNAVAILABLE");
+  assert.match(JSON.stringify(result.content), /conflicting_membership_evidence/);
 });
 
 test("inventory cancel reports the terminal state won by a concurrent completion", async () => {
   const server = new FakeServer();
-  const running = {
+  let running!: Record<string, unknown>;
+  let complete!: Record<string, unknown>;
+  const base = {
     accessContextId: "default", accessIdentityRef: IDENTITY_REF, artifactToken: "token", commitWatermark: 0, createdAt: "2026-07-16T00:00:00.000Z", expiresAt: "2026-07-17T00:00:00.000Z",
     fileCount: 0, folderCount: 0, frontierCount: 1, incompleteReasons: [], observationStartedAt: "2026-07-16T00:00:00.000Z", observationUpdatedAt: "2026-07-16T00:00:00.000Z",
     pageReceiptCount: 0, policy: { caseSensitive: false, includeFiles: true, includeFolders: true, matchFields: ["name", "path"], maxItemDepth: 20, maxItems: 50000, pageCapacity: 500 },
     policyHash: "hash", receiptDigest: "digest", revision: 1, retryCount: 0, rootFolder: {}, rootFolderId: "501", rootObservationDigest: "root", scanId: "123e4567-e89b-12d3-a456-426614174000",
-    status: "running", updatedAt: "2026-07-16T00:00:00.000Z", workspaceFingerprint: WORKSPACE_FINGERPRINT, workspaceId: "scope", workspaceRef: WORKSPACE_SCOPE
+    status: "running", updatedAt: "2026-07-16T00:00:00.000Z", workspaceId: "scope", workspaceRef: WORKSPACE_SCOPE, workspaceRootFolderId: "501"
   };
-  const complete = { ...running, status: "complete", revision: 2 };
   const runtime = {
     config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["inventory"] },
     access: { resolveWorkspaceRef: () => ({ ...access(), scope: { id: "scope", rootFolderId: "501", tags: [] } }) },
     snapshots: {
-      create: async () => ({ reused: false, reuseReason: "new", state: running }),
+      create: async (input: Record<string, unknown>) => {
+        running = { ...base, workspaceFingerprint: input.workspaceFingerprint };
+        complete = { ...running, status: "complete", revision: 2 };
+        return { reused: false, reuseReason: "new", state: running };
+      },
       get: async () => running,
       cancel: async () => complete,
       summary: (state: Record<string, unknown>) => ({ terminal: state.status === "complete", completeness: { pagination_complete: true, safe_to_claim_absence: true, scope: "entire_observed_accessible_scope", consistency_level: "best_effort_complete_observation", incomplete_reasons: [] } }),
@@ -384,6 +686,110 @@ test("ordinary open does not require workspace ancestry metadata", async () => {
   const result = await call(server, "yfy_open", { file: FILE_10 });
   assert.notEqual(result.isError, true, JSON.stringify(result.content));
   assert.equal(((result.structuredContent?.assurance as Record<string, unknown>).checks as Record<string, unknown>).workspace_membership, "not_applicable");
+  assert.equal(result.structuredContent?.must_release, true);
+  const delivery = result.structuredContent?.content_delivery as Record<string, unknown>;
+  assert.equal(delivery.host_auto_fetch_not_guaranteed, true);
+  assert.equal(delivery.mode, "binary_no_preview");
+  assert.equal(delivery.resource_fetch_required, true);
+  assert.equal(delivery.embedded_resource_in_tool_result, false);
+  assert.equal((result.structuredContent?.resource as Record<string, unknown>).must_release, true);
+  assert.equal((result.structuredContent?.resource as Record<string, unknown>).media_type, "application/pdf");
+  assert.equal((result.structuredContent?.resource as Record<string, unknown>).media_type_source, "file_extension");
+});
+
+test("open returns inline preview for small text and svg media types", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-open-preview-"));
+  const svgPath = path.join(dir, "icon.svg");
+  const svgBody = `<svg xmlns="http://www.w3.org/2000/svg"><text>${"x".repeat(16_000)}</text></svg>`;
+  await fs.writeFile(svgPath, svgBody);
+  const registry = new EvidenceArtifactRegistry(60, 1024 * 1024);
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["drive"], maxEvidenceResourceBytes: 1024 * 1024, tempFileTtlSeconds: 60, transport: "stdio" },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => endpoint.endsWith("/versions")
+        ? response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: svgBody.length, modified_at: 1 }] })
+        : endpoint.endsWith("/download_v2")
+          ? response(endpoint, { download_url: "https://download.example/file" })
+          : response(endpoint, { id: 10, name: "icon.svg", type: "file", size: svgBody.length, modified_at: 1, file_version_key: "v1" })
+    },
+    client: {
+      downloadFromUrlToTemp: async () => ({
+        fileName: "icon.svg",
+        tempPath: svgPath,
+        sha1: "a".repeat(40),
+        sha256: crypto.createHash("sha256").update(svgBody).digest("hex"),
+        sizeBytes: svgBody.length,
+        contentType: "application/octet-stream",
+        meta: response("/download", {}).meta
+      })
+    },
+    evidence: registry
+  } as unknown as AppRuntime;
+  try {
+    registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_open", { file: FILE_10 });
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    assert.equal(result.structuredContent?.must_release, true);
+    const resource = result.structuredContent?.resource as Record<string, unknown>;
+    assert.equal(resource.media_type, "image/svg+xml");
+    assert.equal(resource.media_type_source, "file_extension");
+    assert.equal(resource.preview_text, svgBody);
+    assert.equal(resource.preview_complete, true);
+    assert.equal(resource.preview_bytes, Buffer.byteLength(svgBody));
+    const delivery = result.structuredContent?.content_delivery as Record<string, unknown>;
+    assert.equal(delivery.mode, "inline_preview");
+    assert.equal(delivery.resource_fetch_required, false);
+    assert.equal(delivery.embedded_resource_in_tool_result, true);
+    assert.equal(delivery.preview_charset, "utf-8");
+    const embedded = result.content?.find((entry) => entry.type === "resource");
+    assert.equal(embedded?.resource?.text, svgBody);
+    assert.match(String(embedded?.resource?.uri), /^yfy:\/\/evidence\//);
+    const textEnvelope = JSON.parse(result.content?.find((entry) => entry.type === "text")?.text ?? "{}") as { text_delivery?: { mode?: string } };
+    assert.equal(textEnvelope.text_delivery?.mode, "compact_preview");
+    const disabled = await call(server, "yfy_open", { file: FILE_10, include_text_preview: false });
+    const disabledDelivery = disabled.structuredContent?.content_delivery as Record<string, unknown>;
+    assert.equal(disabledDelivery.mode, "resource_link_only");
+    assert.equal(disabledDelivery.reason, "preview_disabled_by_request");
+    assert.equal((disabled.structuredContent?.resource as Record<string, unknown>).preview_text, undefined);
+    assert.equal(disabled.content?.some((entry) => entry.type === "resource"), false);
+  } finally {
+    await registry.close().catch(() => undefined);
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("open refuses an inline preview whose bytes no longer match the registered digest", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-open-preview-drift-"));
+  const tempPath = path.join(dir, "changed.svg");
+  const changed = "<svg>changed</svg>";
+  await fs.writeFile(tempPath, changed);
+  const registry = new EvidenceArtifactRegistry(60, 1024 * 1024);
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["drive"], maxEvidenceResourceBytes: 1024 * 1024, tempFileTtlSeconds: 60, transport: "stdio" },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => endpoint.endsWith("/versions")
+        ? response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: changed.length, modified_at: 1 }] })
+        : endpoint.endsWith("/download_v2")
+          ? response(endpoint, { download_url: "https://download.example/file" })
+          : response(endpoint, { id: 10, name: "changed.svg", type: "file", size: changed.length, modified_at: 1, file_version_key: "v1" })
+    },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "changed.svg", tempPath, sha1: "a".repeat(40), sha256: "b".repeat(64), sizeBytes: changed.length, contentType: "image/svg+xml", meta: response("/download", {}).meta }) },
+    evidence: registry
+  } as unknown as AppRuntime;
+  try {
+    registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_open", { file: FILE_10 });
+    assert.equal(result.isError, true);
+    assert.equal(errorCode(result), "YFY_EVIDENCE_ARTIFACT_INTEGRITY_FAILED");
+    await assert.rejects(() => fs.stat(tempPath), { code: "ENOENT" });
+  } finally {
+    await registry.close().catch(() => undefined);
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
 });
 
 test("evidence capture rejects a current file version key for historical content", async () => {
@@ -554,7 +960,16 @@ test("large captured content returns a multipart resource without a local path",
     const resource = result.structuredContent?.resource as Record<string, unknown>;
     assert.equal(resource.delivery, "multipart_resource");
     assert.equal(resource.media_type, "application/vnd.ms-excel");
+    assert.equal(resource.media_type_source, "content_type");
+    assert.equal(resource.must_release, true);
+    assert.equal(resource.preview_text, undefined);
     assert.match(String(resource.resource_uri), /\/manifest$/);
+    assert.equal(result.structuredContent?.must_release, true);
+    const delivery = result.structuredContent?.content_delivery as Record<string, unknown>;
+    assert.equal(delivery.mode, "multipart_manifest_only");
+    assert.equal(delivery.resource_fetch_required, true);
+    assert.equal(delivery.embedded_resource_in_tool_result, false);
+    assert.equal(delivery.host_auto_fetch_not_guaranteed, true);
     const link = result.content?.find((entry) => entry.type === "resource_link") as ({ mimeType?: string } | undefined);
     assert.equal(link?.mimeType, "application/json");
     assert.equal(resource.local_path, undefined);
@@ -562,6 +977,24 @@ test("large captured content returns a multipart resource without a local path",
   } finally {
     await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }
+});
+
+test("organization contact policy distinguishes omitted included and unavailable fields", async () => {
+  const server = new FakeServer();
+  let providerHasContact = true;
+  const runtime = {
+    config: { clientSecret: "secret", configFingerprint: "a".repeat(64), maxPageCapacity: 500, toolsets: ["organization"] },
+    configFingerprint: "a".repeat(64),
+    gateway: { getEnterprise: async (endpoint: string) => response(endpoint, { users: [{ id: 1, name: "User", ...(providerHasContact ? { email: "user@example.com" } : {}) }], page_id: 0, page_count: 1 }) }
+  } as unknown as AppRuntime;
+  registerOrganizationTools(server as unknown as McpServer, runtime);
+  const omitted = await call(server, "yfy_department_users", { request: { mode: "first_request", department_id: "1", include_contact: false } });
+  assert.deepEqual(omitted.structuredContent?.contact_policy, { requested: false, fields: "omitted_by_default" });
+  const included = await call(server, "yfy_department_users", { request: { mode: "first_request", department_id: "1", include_contact: true } });
+  assert.deepEqual(included.structuredContent?.contact_policy, { requested: true, fields: "included" });
+  providerHasContact = false;
+  const unavailable = await call(server, "yfy_department_users", { request: { mode: "first_request", department_id: "1", include_contact: true } });
+  assert.deepEqual(unavailable.structuredContent?.contact_policy, { requested: true, fields: "none_available" });
 });
 
 test("transfer tickets are current-only and claim metadata-only validation", async () => {

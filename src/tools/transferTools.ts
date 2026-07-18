@@ -14,7 +14,7 @@ export function registerTransferTools(server: McpServer, runtime: AppRuntime): v
   }
   registerTool(server, "yfy_transfer_ticket_get", {
     title: "Get Current Transfer Ticket",
-    description: "Return a short-lived Provider URL for the current version only. This result has no content-integrity guarantee; use yfy_capture for workspace-bound evidence. Historical transfer tickets are intentionally unsupported.",
+    description: "Return a short-lived Provider transfer URL for the current version only. Do not use this for ordinary read-only access or as the tender evidence path—prefer yfy_open for bytes and yfy_capture for workspace-bound evidence. The URL is sensitive: do not log, store, or echo it. This result has no content-integrity guarantee. Historical transfer tickets are intentionally unsupported.",
     inputSchema: { file: FileRefSchema },
     outputSchema: { download_url: z.string().url(), selection: z.object({ kind: z.literal("current"), provider_selector: z.literal(0), validation_level: z.literal("metadata_only") }), sensitive: z.literal(true), expires_quickly: z.literal(true), provenance: z.array(ProvenanceSchema) }
   }, { readOnly: true }, async ({ file }, extra) => {

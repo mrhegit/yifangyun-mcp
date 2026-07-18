@@ -138,11 +138,13 @@ export function registerTool(
       const resourceUri = typeof resource?.resource_uri === "string" ? resource.resource_uri : typeof artifact?.resource_uri === "string" ? artifact.resource_uri : typeof legacyEvidence?.resource_uri === "string" ? legacyEvidence.resource_uri : undefined;
       const delivery = resource?.delivery ?? artifact?.delivery;
       const resourceReadable = delivery === undefined || delivery === "mcp_resource" || delivery === "multipart_resource";
+      const embeddedText = delivery === "mcp_resource" && typeof resource?.preview_text === "string" ? resource.preview_text : undefined;
       const text = serializeToolText(name, output);
       cleanupRequired = false;
       return {
         content: [
           { type: "text" as const, text },
+          ...(resourceUri && embeddedText !== undefined ? [{ type: "resource" as const, resource: { uri: resourceUri, mimeType: typeof resource?.media_type === "string" ? resource.media_type : "text/plain", text: embeddedText } }] : []),
           ...(resourceUri && resourceReadable ? [{ type: "resource_link" as const, uri: resourceUri, name: typeof resource?.file_name === "string" ? resource.file_name : typeof artifact?.file_name === "string" ? artifact.file_name : typeof legacyEvidence?.file_name === "string" ? legacyEvidence.file_name : "Yifangyun content", mimeType: delivery === "multipart_resource" ? "application/json" : typeof resource?.media_type === "string" ? resource.media_type : typeof artifact?.media_type === "string" ? artifact.media_type : "application/octet-stream" }] : [])
         ],
         structuredContent: output

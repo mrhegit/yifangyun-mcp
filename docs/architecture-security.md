@@ -43,7 +43,7 @@ Tool Catalog 只暴露稳定领域模型。Provider 路径、参数、分页和�
 
 identity ref 用于 ItemRef、Inventory 访问隔离和本地 content 目录命名，不包含原始凭据。ItemRef 将 Provider ID 与 access context/identity ref 绑定；VersionRef 再绑定完整 FileRef，防止调用方把同一个数字 ID 或版本 ID 跨身份、跨文件复用。
 
-WorkspaceRef 只表达命名业务边界；Inventory 另外保存由 Workspace ID、root folder、access context 和 identity ref 计算的 fingerprint。配置绑定变化后，旧 InventoryRef 会因 fingerprint 不匹配而被拒绝。
+WorkspaceRef 只表达命名业务边界；Inventory 分别持久化配置 Workspace root 和实际 scan root，fingerprint 同时绑定 Workspace ID、两级 root、access context 和 identity ref。读取 Inventory、manifest 或 receipt 时都会与当前 Workspace 配置复核；配置绑定变化后返回 `YFY_INVENTORY_STALE`，旧观察不会被重解释到新边界。
 
 当前 HTTP 部署仍是单配置主体模型：一个 MCP Server 进程使用一套企业凭据和静态 context 注册表。它不是面向不可信多租户的 OAuth delegation server。
 
@@ -61,9 +61,9 @@ SQLite 表：
 - `snapshot_items_fts_map`
 - `snapshot_storage`
 
-schema version 为 4。启用 WAL、外键、事务、incremental auto-vacuum 和 busy timeout。`snapshot_items` 直接保存 item digest、commit sequence、原始/规范化 name/path 和稳定排序键，同时承担全局判重；不再维护重复的 `snapshot_seen_items` 或整页 artifact JSON。`snapshot_frontier` 将 FIFO cursor 独立持久化，避免宽树每页重写完整 state JSON；`snapshot_items_fts` 与映射表为 trigram 子串搜索提供索引；`snapshot_storage` 记录逻辑占用，运行时另统计数据库和 WAL 物理字节。
+schema version 为 5。启用 WAL、外键、事务、incremental auto-vacuum 和 busy timeout。`snapshot_items` 直接保存 item digest、commit sequence、原始/规范化 name/path 和稳定排序键，同时承担全局判重；不再维护重复的 `snapshot_seen_items` 或整页 artifact JSON。`snapshot_frontier` 将 FIFO cursor 独立持久化，避免宽树每页重写完整 state JSON；`snapshot_items_fts` 与映射表为 trigram 子串搜索提供索引；`snapshot_storage` 记录逻辑占用，运行时另统计数据库和 WAL 物理字节。schema 5 state 明确区分 `workspaceRootFolderId` 与 `rootFolderId`（scan root）。
 
-每个 Provider page receipt、item 索引、frontier 变化和 state checkpoint 在同一事务中提交。提交时递增 `commit_watermark`，查询只读取 `commit_seq <= watermark` 的 item。cursor 保存首次查询水位、查询规格哈希、Workspace fingerprint 和签名，所以后台扫描继续提交时，已开始的分页仍保持稳定；新的 first request 才观察更新后的水位。
+每个 Provider page receipt、item 索引、frontier 变化和 state checkpoint 在同一事务中提交。提交时递增 `commit_watermark`，查询只读取 `commit_seq <= watermark` 的 item。cursor 保存首次查询水位、查询规格哈希、Workspace fingerprint 和签名，所以后台扫描继续提交时，已开始的分页仍保持稳定；新的 first request 才观察更新后的水位。可选 `root_folder` 将扫描根限制为 Workspace 内已验证子树；create/get/search/manifest 使用同一范围投影，摘要暴露 `scan_root`、`agent_guidance` 与运行中 `suggested_wait_ms`。普通和 Inventory cursor 错误只在 `error.diagnostics.reason` 返回稳定枚举，不回传解码碎片。
 
 Provider I/O 使用有界并发抓取。正式结果由单一提交器按 FIFO canonical order 串行提交；请求完成顺序不会改变截断点、重复项胜者或 receipt 顺序。状态和局部索引查询不等待慢 Provider 请求，取消会先传播 AbortSignal，再写入 durable 终态。
 
@@ -99,13 +99,15 @@ Capture 工具默认不返回下载 URL。Provider URL 只在服务内部使用�
 - identity 隔离目录
 - `0600/0700` 权限尝试
 - SHA-1 和 SHA-256
-- MIME 嗅探
+- MIME 嗅探；PDF/PNG/JPEG 等明确 magic 可覆盖错误通用类型，ZIP 容器会保留 DOCX/XLSX/PPTX 等更具体的 Office MIME
 - TTL 清理
 - drift 时删除候选文件
 
-成功 Open/Capture 注册随机、短期 `yfy://evidence/{token}` Resource。小文件读取时复核大小与 SHA-256；大文件返回 manifest 和有界 part URI，每个 part 读取时流式复核整文件 SHA-256。stdio 和 HTTP 都不返回本地路径。工具输出在交给 MCP SDK 前执行严格 schema 校验；handler 成功后若输出校验或文本序列化失败，也会回滚已注册 Resource。expectation mismatch、drift 或内容选择失败同样删除候选文件。`transfer` toolset 是唯一直接返回 Provider 下载 URL 的接口。
+成功 Open/Capture 注册随机、短期 `yfy://evidence/{token}` Resource，并在 Agent 结果中置顶 `must_release` 与严格判别联合 `content_delivery`。不超过 32 KiB 的可预览 UTF-8 内容由 Evidence Registry 复核普通文件、大小和 SHA-256 后，同时作为 MCP embedded resource 与 `preview_text` 返回；`include_text_preview=false` 可禁止内嵌。其他内容使用 resource link 或 multipart manifest。服务只声明协议结果是否嵌入，不声称 Host 一定将内容注入模型；resource link 也不保证自动读取。每个 part 读取时流式复核整文件 SHA-256。stdio 和 HTTP 都不返回本地路径。工具输出在交给 MCP SDK 前执行严格 schema 校验；handler 成功后若输出校验或文本序列化失败，也会回滚已注册 Resource。expectation mismatch、drift 或内容选择失败同样删除候选文件。
 
-Workspace membership 使用 `inside/outside/unavailable`，避免把缺少或截断的祖先元数据误判为越界。路径命中配置 root 可证明 inside；明确跨存储空间可证明 outside；其余缺证场景保持 unavailable。成员关系校验同时观察文件与 Workspace root 元数据。Workspace validation 的单项检查为 `pass/fail/unavailable`，顶层 verdict 为 `valid/invalid/unavailable`；只有明确证据才能产生 fail，取消、认证、限流和系统性 Provider 错误不会被吞成成功结果。
+`transfer` toolset 是唯一直接返回 Provider 下载 URL 的接口；**不进入 Tender Profile 默认矩阵**（`drive,workspace,inventory,evidence`），仅在显式启用时注册。普通内容读取优先 `yfy_open` / `yfy_capture`。
+
+Workspace membership 使用 `inside/outside/unavailable`，并附带 `agent_interpretation`（是否可声称 inside/outside、是否可 capture、narrative 与 next_steps），避免把缺少或截断的祖先元数据误判为越界。路径命中配置 root 且不与 storage space 证据冲突时可证明 inside；规范化后的 `space.id/type` 明确不同且不冲突时可证明 outside；路径与 space 互相矛盾时返回 `unavailable/conflicting_membership_evidence`。成员关系校验同时观察文件与 Workspace root 元数据。Workspace validation 的单项检查为 `pass/fail/unavailable`，顶层 verdict 为 `valid/invalid/unavailable`；只有明确证据才能产生 fail，取消、认证、限流和系统性 Provider 错误不会被吞成成功结果。
 
 ## HTTP
 

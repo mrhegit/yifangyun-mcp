@@ -1,6 +1,6 @@
 # 配置指南
 
-beta.7 默认只启用轻量 Drive 平面。Workspace、Inventory、Capture、Organization 和写入能力都必须显式开启。
+beta.8 默认只启用轻量 Drive 平面。Workspace、Inventory、Capture、Organization 和写入能力都必须显式开启。
 
 服务只读取当前进程环境变量，不会自动加载项目目录中的 `.env`。本地运行可使用 `node --env-file=.env dist/index.js`；MCP Host、容器和进程管理器应通过各自的 env 配置注入。运行后以 `yfy_status.runtime` 和 `capabilities` 为实际生效值。
 
@@ -42,7 +42,7 @@ YFY_TOOLSETS=drive
 | `collaboration` | 读写 | 无 | 协作读取和变更 |
 | `mutation` | 写入 | 可读取上传目录 | 创建、移动、删除、恢复、上传 |
 | `admin` | 读写 | 无 | 企业管理和日志 |
-| `transfer` | 读取短时 URL | 无 | 敏感 Provider 下载 ticket |
+| `transfer` | 读取短时 URL | 无 | 敏感 Provider 下载 ticket（**永不进入投标默认**） |
 
 `YFY_TOOLSETS` 是逗号分隔列表，重复值会去重，未知值会导致启动失败。建议从最小集合开始：
 
@@ -51,16 +51,23 @@ YFY_TOOLSETS=drive
 - `inventory` 会产生 Provider 递归读取和本地 SQLite 写入，但不修改云端。
 - `evidence` 会下载并暂存原件，但不修改云端。
 - `collaboration`、`mutation`、`admin` 含云端写操作，应只在明确需要时启用。
-- `transfer` 直接返回短时 Provider URL，敏感度高于普通 `yfy_open`。
+- `transfer` 直接返回短时 Provider URL，敏感度高于普通 `yfy_open`；**投标与只读审计流不要启用**。
 
-Tender Profile 要求：
+### Tender Profile 工具矩阵
+
+| 场景 | `YFY_TOOLSETS` | 说明 |
+|---|---|---|
+| 仅浏览 | `drive` | 默认 |
+| **投标完整工作流** | **`drive,workspace,inventory,evidence`** | Profile `tender` 强制要求；`transfer` / `organization` / 写工具均不在默认矩阵 |
+| 投标 + 组织通讯录 | `drive,workspace,inventory,evidence,organization` | 可选扩展，非 Profile 强制 |
+| 显式下载 ticket | 在矩阵上**额外**追加 `,transfer` | 仅在明确需要短时 Provider URL 时；永不默认 |
 
 ```env
 YFY_TOOLSETS=drive,workspace,inventory,evidence
 YFY_WORKFLOW_PROFILES=tender
 ```
 
-`YFY_WORKFLOW_PROFILES` 是逗号分隔列表。当前仅支持 `tender`；它注册 Guidance 和 Prompt，不授予额外权限。启用 `tender` 时必须同时启用 `drive,workspace,inventory,evidence`，并至少配置一个 Workspace，否则服务拒绝启动。
+`YFY_WORKFLOW_PROFILES` 是逗号分隔列表。当前仅支持 `tender`；它注册 Guidance 和 Prompt，不授予额外权限。启用 `tender` 时必须同时启用 `drive,workspace,inventory,evidence`，并至少配置一个 Workspace，否则服务拒绝启动。**`transfer` 永不作为 tender 默认或强制依赖。**
 
 ## Access Context
 
@@ -98,7 +105,7 @@ Workspace 不会授予 Provider 权限。启动后使用 `yfy_workspace_validate
 
 普通位置引用为 `workspace:<id>`。Workspace、Inventory 和 Capture 工具也只接受该完整 Ref，不接受裸 `id`。Drive 工具可从该位置开始，但只有 Workspace/Inventory/Capture 工具提供范围保证。
 
-Workspace 的 `root_folder_id`、`access_context` 或身份配置变化后，旧 ItemRef、InventoryRef 和 Inventory cursor 不应继续使用。调用 `yfy_status` 获取新的 PlaceRef，并从 Browse、Resolve、Search 或 Inventory 结果重新发现项目。
+Workspace 的 `root_folder_id`、`access_context` 或身份配置变化后，旧 ItemRef、InventoryRef 和 Inventory cursor 不应继续使用。Inventory 会持久化创建时的配置 Workspace 根和实际 scan root；当前配置根不匹配时返回 `YFY_INVENTORY_STALE`，不会动态重解释旧扫描。调用 `yfy_status` 获取新的 PlaceRef，并从 Browse、Resolve、Search 或 Inventory 结果重新发现项目。
 
 ## Inventory
 
@@ -111,19 +118,20 @@ Workspace 的 `root_folder_id`、`access_context` 或身份配置变化后，旧
 
 保留期决定本地状态何时可清理；`yfy_inventory_create.refresh.max_age_seconds` 决定本次调用是否接受复用。两者是独立概念：TTL 长并不表示观察仍足够新，freshness 短也不会立即删除旧状态。
 
-beta.7 SQLite schema 为 4。`0.4.0` 和 beta.6 状态库会返回 `YFY_STATE_SCHEMA_MISMATCH`，不会自动迁移、覆盖或删除。升级时必须停止旧进程并配置新的空 `YFY_STATE_DB`；确认不再回滚后再人工清理旧数据库及其 `-wal`、`-shm` 和进程锁伴生文件。
+beta.8 SQLite schema 为 5，用于持久化配置 Workspace 根与 scan root 的独立身份。`0.4.0` 和所有更早 beta 状态库会返回 `YFY_STATE_SCHEMA_MISMATCH`，不会自动迁移、覆盖或删除。升级时必须停止旧进程并配置新的空 `YFY_STATE_DB`；确认不再回滚后再人工清理旧数据库及其 `-wal`、`-shm` 和进程锁伴生文件。
 
-`yfy_inventory_create` 不提供隐藏的 limits 默认值，每次调用必须显式传：
+`yfy_inventory_create` 不提供隐藏的 limits 默认值，每次调用必须显式传。可选 `root_folder` 将扫描限制在 Workspace 内已验证的子树（适合大资料库）：
 
 ```json
 {
   "workspace":"workspace:tender_public",
+  "root_folder":"folder:502@default.aaaaaaaaaaaaaaaaaaaaaaaa",
   "refresh":{"mode":"reuse_if_fresh","max_age_seconds":300},
   "limits":{"max_item_depth":8,"max_items":10000}
 }
 ```
 
-`max_item_depth` 允许 1-100，`max_items` 允许 1-1,000,000。达到任一边界会使 Inventory 不完整，因此 limits 是业务证明边界，不只是性能配置。`reuse_if_fresh.max_age_seconds` 允许 0-604800，省略时为 300；`force_refresh` 不接收 max age，并始终创建新任务。
+`max_item_depth` 允许 1-100，`max_items` 允许 1-1,000,000。达到任一边界会使 Inventory 不完整，因此 limits 是业务证明边界，不只是性能配置。`reuse_if_fresh.max_age_seconds` 允许 0-604800，省略时为 300；`force_refresh` 不接收 max age，并始终创建新任务。缺失结论仅在 `safe_to_claim_absence=true` / `agent_guidance.may_claim_absence=true` 时成立。
 
 `yfy_inventory_search` 的 first request 默认 `limit=25`，最大 100；默认搜索 name 和 path，大小写不敏感。cursor 固定首次查询的 commit watermark，后台扫描新增提交不会改变已有分页视图。
 
@@ -145,7 +153,7 @@ beta.7 SQLite schema 为 4。`0.4.0` 和 beta.6 状态库会返回 `YFY_STATE_SC
 
 单个 Resource 超过 `YFY_MAX_EVIDENCE_RESOURCE_BYTES` 时返回 multipart manifest，每个 part 不超过该上限。该上限不能大于 `YFY_MAX_DOWNLOAD_BYTES`。
 
-任何 Agent-facing 结果都不返回服务器本地路径。Resource 到期、释放或完整性失败后会删除临时内容。
+任何 Agent-facing 结果都不返回服务器本地路径。Open/Capture 的 `include_text_preview` 默认 true：不超过 32 KiB 的可预览 UTF-8 内容在 Registry 复核大小和 SHA-256 后，以 MCP embedded resource 和 `structuredContent.resource.preview_text` 返回；设为 false 时只返回 resource link。Resource 到期、释放或完整性失败后会删除临时内容。
 
 ## Provider 与重试
 
@@ -215,9 +223,18 @@ HTTP 端点为 `POST/GET/DELETE /mcp`、`GET /health` 和 `GET /metrics`。Beare
 ```env
 YFY_TOOLSETS=drive
 YFY_WORKSPACES_JSON=[]
+YFY_WORKFLOW_PROFILES=
 ```
 
-完整投标工作流：
+完整投标工作流（**默认矩阵，不含 transfer**）：
+
+```env
+YFY_TOOLSETS=drive,workspace,inventory,evidence
+YFY_WORKFLOW_PROFILES=tender
+YFY_WORKSPACES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_context":"default","tags":["tender"]}]
+```
+
+投标 + 组织查询（可选扩展，仍不含 transfer）：
 
 ```env
 YFY_TOOLSETS=drive,workspace,inventory,evidence,organization
@@ -225,4 +242,4 @@ YFY_WORKFLOW_PROFILES=tender
 YFY_WORKSPACES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_context":"default","tags":["tender"]}]
 ```
 
-启用 Toolset 只注册能力，不绕过 Provider ACL。`inventory` 和内容工具不修改云端，但会写本地 SQLite 或临时 Resource。
+启用 Toolset 只注册能力，不绕过 Provider ACL。`inventory` 和内容工具不修改云端，但会写本地 SQLite 或临时 Resource。`transfer` 仅在明确需要短时 Provider URL 时单独追加。

@@ -361,6 +361,11 @@ function detectContentType(buffer: Buffer): string | undefined {
   if (buffer.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) {
     return "image/jpeg";
   }
+  // 仅识别明确 SVG 根元素；通用 XML/JSON 依赖响应头或扩展名，避免前缀误判后自动内联。
+  if (buffer.length > 0 && !buffer.subarray(0, Math.min(buffer.length, 64)).includes(0)) {
+    const head = buffer.subarray(0, Math.min(buffer.length, 512)).toString("utf8").replace(/^\uFEFF/, "").trimStart();
+    if (/(?:^<svg[\s/>]|^<\?xml\b[\s\S]{0,256}<svg[\s/>]|^<!--[\s\S]{0,256}<svg[\s/>])/i.test(head)) return "image/svg+xml";
+  }
   return undefined;
 }
 

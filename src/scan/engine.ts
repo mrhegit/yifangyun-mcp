@@ -56,6 +56,7 @@ export class ScopeScanEngine {
     workspaceFingerprint?: string;
     workspaceId?: string;
     workspaceRef?: string;
+    workspaceRootFolderId?: IdLike;
   }): Promise<{ reuseReason: "fresh_complete" | "running_join" | "new"; reused: boolean; state: ScopeScanState }> {
     const policyHash = digest(input.policy);
     const rootFolderId = String(input.rootFolderId);
@@ -99,7 +100,8 @@ export class ScopeScanEngine {
         updatedAt: now,
         workspaceFingerprint: effectiveWorkspaceFingerprint,
         workspaceId: input.workspaceId ?? "internal",
-        workspaceRef: input.workspaceRef ?? "workspace:internal"
+        workspaceRef: input.workspaceRef ?? "workspace:internal",
+        workspaceRootFolderId: String(input.workspaceRootFolderId ?? input.rootFolderId)
       };
       await this.store.create(state, [{ attempt: 0, depth: 0, folderId: rootFolderId, pageId: 0, pathDisplay: rootName }]);
       return { reuseReason: "new", reused: false, state };
@@ -473,17 +475,19 @@ export class ScopeScanEngine {
   summary(state: ScopeScanState): JsonObject {
     const paginationComplete = state.status === "complete" && state.frontierCount === 0 && state.incompleteReasons.length === 0;
     const safeToClaimAbsence = paginationComplete && state.policy.includeFiles && state.policy.includeFolders;
+    const subtree = state.rootFolderId !== state.workspaceRootFolderId;
     return {
       inventory_id: state.scanId,
       status: state.status,
-      workspace: { ref: state.workspaceRef, root_folder_id: state.rootFolderId, access_context: state.accessContextId, fingerprint: state.workspaceFingerprint },
+      workspace: { ref: state.workspaceRef, root_folder_id: state.workspaceRootFolderId, access_context: state.accessContextId, fingerprint: state.workspaceFingerprint },
+      scan_root: { folder_id: state.rootFolderId, scope: subtree ? "observed_subtree" : "configured_workspace_root" },
       scanned_file_count: state.fileCount,
       scanned_folder_count: state.folderCount,
       page_receipt_count: state.pageReceiptCount,
       completeness: {
         pagination_complete: paginationComplete,
         safe_to_claim_absence: safeToClaimAbsence,
-        scope: safeToClaimAbsence ? "entire_observed_accessible_scope" : "observed_subset_only",
+        scope: subtree ? "observed_subtree" : safeToClaimAbsence ? "entire_observed_accessible_scope" : "observed_subset_only",
         consistency_level: paginationComplete ? "best_effort_complete_observation" : "partial_observation",
         incomplete_reasons: state.incompleteReasons
       },

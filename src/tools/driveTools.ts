@@ -40,6 +40,7 @@ const SearchRequestSchema = paginatedRequestSchema({
   exact_name: z.boolean().optional(),
   sort: z.enum(["name", "date", "size", "score"]).default("score"),
   direction: z.enum(["asc", "desc"]).default("desc"),
+  include_unverified_index_hits: z.boolean().default(false),
   limit: z.number().int().min(1).max(100).default(DEFAULT_DRIVE_PAGE_SIZE),
   access_context: AccessContextSchema
 }).superRefine((request, context) => {
@@ -52,10 +53,49 @@ const CommentsRequestSchema = paginatedRequestSchema({ file: FileRefSchema, limi
 const SharesRequestSchema = paginatedRequestSchema({ item: ItemRefSchema, limit: z.number().int().min(1).max(100).default(DEFAULT_DRIVE_PAGE_SIZE) });
 
 const BrowseCursorSchema = z.object({ at: PlaceRefSchema, kind: z.enum(["file", "folder", "all"]), detail: z.enum(["basic", "standard", "full"]), page_id: z.number().int().nonnegative(), offset: z.number().int().nonnegative(), limit: z.number().int().min(1).max(100), access_context: z.string().optional() }).strict();
-const SearchCursorSchema = z.object({ query: z.string().min(1), at: PlaceRefSchema, kind: z.enum(["file", "folder", "all"]), field: z.enum(["name", "content", "creator", "tag", "all"]), detail: z.enum(["basic", "standard", "full"]), exact_name: z.boolean(), sort: z.enum(["name", "date", "size", "score"]), direction: z.enum(["asc", "desc"]), page_id: z.number().int().nonnegative(), offset: z.number().int().nonnegative(), limit: z.number().int().min(1).max(100), access_context: z.string().optional() }).strict();
+const SearchCursorSchema = z.object({ query: z.string().min(1), at: PlaceRefSchema, kind: z.enum(["file", "folder", "all"]), field: z.enum(["name", "content", "creator", "tag", "all"]), detail: z.enum(["basic", "standard", "full"]), exact_name: z.boolean(), sort: z.enum(["name", "date", "size", "score"]), direction: z.enum(["asc", "desc"]), include_unverified_index_hits: z.boolean(), page_id: z.number().int().nonnegative(), offset: z.number().int().nonnegative(), limit: z.number().int().min(1).max(100), access_context: z.string().optional() }).strict();
 const VersionsCursorSchema = z.object({ file: FileRefSchema, offset: z.number().int().nonnegative(), limit: z.number().int().min(1).max(100), fingerprint: z.string().min(1) }).strict();
 const CommentsCursorSchema = z.object({ file: FileRefSchema, offset: z.number().int().nonnegative(), limit: z.number().int().min(1).max(100), fingerprint: z.string().min(1) }).strict();
 const SharesCursorSchema = z.object({ item: ItemRefSchema, page_id: z.number().int().nonnegative(), offset: z.number().int().nonnegative(), limit: z.number().int().min(1).max(100) }).strict();
+
+const SEARCH_NON_EXHAUSTIVE_WARNING = "Indexed search is non-exhaustive: it cannot prove current existence or absence.";
+const SEARCH_CLAIM_WARNING = "match.claim_allowed=true means returned metadata supports the query match; confirm current existence with yfy_get before relying on the item. Provider snippets and unverified index hits must not be asserted as confirmed matches.";
+const VERSION_SELECTION_RULES = {
+  current: "Omit the version parameter on yfy_open/yfy_capture for the current version. Do not invent a version ref.",
+  historical: "Copy the historical version ref from this result and pass it as the version parameter on yfy_open/yfy_capture."
+} as const;
+
+const SearchMatchFieldSchema = z.object({
+  field: z.enum(["name", "content", "creator", "tag", "all"]),
+  basis: z.enum(["local_value_match", "provider_value_match", "provider_snippet", "provider_index_only"]),
+  value: z.string().optional(),
+  verifiable: z.boolean()
+}).strict();
+const SearchScopeSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("provider_filtered"), basis: z.literal("department_filter") }).strict(),
+  z.object({ status: z.literal("verified"), basis: z.enum(["parent_folder_id", "ancestor_folder_ids"]) }).strict(),
+  z.object({ status: z.literal("rejected"), basis: z.literal("local_scope_filter") }).strict()
+]);
+const SearchMatchCommonShape = {
+  source: z.literal("provider_index"),
+  requested_field: z.enum(["name", "content", "creator", "tag", "all"]),
+  provider_filter: z.object({ query_filter: z.string(), precise_search: z.boolean() }).strict(),
+  fields: z.array(SearchMatchFieldSchema).min(1),
+  scope: SearchScopeSchema,
+  exact_name: z.discriminatedUnion("status", [
+    z.object({ status: z.literal("verified"), basis: z.literal("case_sensitive_name_equality") }).strict(),
+    z.object({ status: z.literal("not_requested") }).strict()
+  ]),
+  provider_signals: z.array(z.object({ source_field: z.string(), value: z.union([z.string(), z.number()]) }).strict()),
+  disambiguation_required: z.boolean(),
+  same_name_hit_count_in_provider_page: z.number().int().min(2).optional(),
+  uniqueness: z.object({ status: z.enum(["multiple_in_provider_page", "not_proven"]), basis: z.literal("non_exhaustive_provider_search") }).strict().optional()
+};
+const SearchMatchSchema = z.discriminatedUnion("trust", [
+  z.object({ ...SearchMatchCommonShape, trust: z.literal("locally_verified"), claim_allowed: z.literal(true) }).strict(),
+  z.object({ ...SearchMatchCommonShape, trust: z.literal("provider_snippet"), claim_allowed: z.literal(false) }).strict(),
+  z.object({ ...SearchMatchCommonShape, trust: z.literal("unverified_index_hit"), claim_allowed: z.literal(false) }).strict()
+]);
 
 function detailView(detail: Detail): "summary" | "evidence" | "full" {
   return detail === "basic" ? "summary" : detail === "standard" ? "evidence" : "full";
@@ -144,8 +184,20 @@ function searchMatch(source: JsonObject, item: JsonObject, field: SearchField, q
   const ownerName = objectValue(source.owned_by ?? source.creator)?.name;
   if ((field === "creator" || field === "all") && typeof ownerName === "string" && ownerName.toLocaleLowerCase("zh-CN").includes(lowerQuery)) fields.push({ field: "creator", basis: "provider_value_match", value: ownerName, verifiable: true });
   const snippet = [source.snippet, source.highlight, source.content_highlight].find((value) => typeof value === "string");
-  if ((field === "content" || field === "all") && typeof snippet === "string") fields.push({ field: "content", basis: "provider_snippet", value: snippet, verifiable: true });
+  if ((field === "content" || field === "all") && typeof snippet === "string") {
+    const snippetText = String(snippet);
+    // Snippet without the query string is not usable as match evidence.
+    if (snippetText.toLocaleLowerCase("zh-CN").includes(lowerQuery)) fields.push({ field: "content", basis: "provider_snippet", value: snippetText, verifiable: false });
+    else fields.push({ field: "content", basis: "provider_index_only", value: snippetText, verifiable: false });
+  }
   if (fields.length === 0) fields.push({ field, basis: "provider_index_only", verifiable: false });
+  const bases = fields.map((entry) => entry.basis);
+  const trust = bases.some((basis) => basis === "local_value_match" || basis === "provider_value_match")
+    ? "locally_verified"
+    : bases.some((basis) => basis === "provider_snippet")
+      ? "provider_snippet"
+      : "unverified_index_hit";
+  const claimAllowed = trust === "locally_verified";
   const ancestors = Array.isArray(item.ancestor_folder_ids) ? item.ancestor_folder_ids : [];
   const scope = !rootFolderId ? { status: "provider_filtered", basis: "department_filter" }
     : item.parent_folder_id === rootFolderId ? { status: "verified", basis: "parent_folder_id" }
@@ -157,9 +209,37 @@ function searchMatch(source: JsonObject, item: JsonObject, field: SearchField, q
     provider_filter: { query_filter: field === "name" ? "file_name" : field, precise_search: exactName },
     fields,
     scope,
+    trust,
+    claim_allowed: claimAllowed,
     exact_name: exactName ? { status: "verified", basis: "case_sensitive_name_equality" } : { status: "not_requested" },
-    provider_signals: providerSignals(source)
+    provider_signals: providerSignals(source),
+    disambiguation_required: false,
+    ...(exactName ? { uniqueness: { status: "not_proven", basis: "non_exhaustive_provider_search" } } : {})
   };
+}
+
+function applySearchDisambiguation(hits: Array<{ item: JsonObject; match: JsonObject }>, exactName: boolean): number {
+  const nameCounts = new Map<string, number>();
+  for (const hit of hits) {
+    const name = typeof hit.item.name === "string" ? hit.item.name : "";
+    nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
+  }
+  let disambiguationGroups = 0;
+  const counted = new Set<string>();
+  for (const hit of hits) {
+    const name = typeof hit.item.name === "string" ? hit.item.name : "";
+    const sameNameCount = nameCounts.get(name) ?? 1;
+    if (sameNameCount >= 2) {
+      hit.match.disambiguation_required = true;
+      hit.match.same_name_hit_count_in_provider_page = sameNameCount;
+      if (exactName) hit.match.uniqueness = { status: "multiple_in_provider_page", basis: "non_exhaustive_provider_search" };
+      if (!counted.has(name)) {
+        counted.add(name);
+        disambiguationGroups += 1;
+      }
+    }
+  }
+  return disambiguationGroups;
 }
 
 async function findAcrossPages(runtime: AppRuntime, at: string, pathText: string, accessContext: string | undefined, signal?: AbortSignal) {
@@ -265,9 +345,34 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
 
   registerTool(server, "yfy_search", {
     title: "Search Yifangyun Drive",
-    description: "Search the Provider index for candidates. Results are non-exhaustive and include explicit match evidence.",
+    description: "Search the non-exhaustive Provider index for candidates. This never proves absence. match.claim_allowed=true means returned metadata supports the query match, but yfy_get is required to confirm current existence. Provider snippets and unverified index hits must not be asserted. Disambiguate by path/ref before opening or capturing.",
     inputSchema: z.object({ request: SearchRequestSchema }).strict(),
-    outputSchema: { hits: z.array(z.object({ item: DriveItemSchema, match: z.record(z.unknown()) }).strict()), coverage: z.object({ mode: z.literal("provider_index"), exhaustive: z.literal(false) }).strict(), ...PageOutputShape, provenance: ProvenanceSchema }
+    outputSchema: {
+      agent_warnings: z.array(z.string()).min(1),
+      coverage: z.object({
+        mode: z.literal("provider_index"),
+        exhaustive: z.literal(false),
+        agent_must_read: z.literal(true),
+        does_not_prove_current_existence: z.literal(true),
+        does_not_prove_absence: z.literal(true),
+        current_existence_confirmation_tool: z.literal("yfy_get"),
+        counts: z.object({
+          provider_raw: z.number().int().nonnegative(),
+          returned: z.number().int().nonnegative(),
+          returned_verified: z.number().int().nonnegative(),
+          returned_unverified: z.number().int().nonnegative(),
+          verified_hits: z.number().int().nonnegative(),
+          unverified_index_hits: z.number().int().nonnegative(),
+          scope_rejected: z.number().int().nonnegative(),
+          disambiguation_groups: z.number().int().nonnegative()
+        }).strict(),
+        note: z.string()
+      }).strict(),
+      hits: z.array(z.object({ item: DriveItemSchema, match: SearchMatchSchema }).strict()),
+      unverified_hits: z.array(z.object({ item: DriveItemSchema, match: SearchMatchSchema }).strict()),
+      ...PageOutputShape,
+      provenance: ProvenanceSchema
+    }
   }, { readOnly: true }, async (args, extra) => {
     const request = parsePaginatedRequest(SearchRequestSchema, args.request, "drive_search");
     const cursor = request.mode === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "drive_search", request.cursor, SearchCursorSchema) : undefined;
@@ -279,6 +384,7 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
     const exactName = cursor?.exact_name ?? (request.mode === "first_request" && request.exact_name === true);
     const sort = cursor?.sort ?? (request.mode === "first_request" ? request.sort : "score");
     const direction = cursor?.direction ?? (request.mode === "first_request" ? request.direction : "desc");
+    const includeUnverified = cursor?.include_unverified_index_hits ?? (request.mode === "first_request" ? request.include_unverified_index_hits === true : false);
     const pageId = cursor?.page_id ?? 0;
     const offset = cursor?.offset ?? 0;
     const limit = cursor?.limit ?? (request.mode === "first_request" ? request.limit : DEFAULT_DRIVE_PAGE_SIZE);
@@ -288,23 +394,77 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
     const response = await runtime.gateway.getUser("/v2/item/search", root.access.context.id, { query_words: query, type: kind, query_filter: field === "name" ? "file_name" : field, department_id: root.departmentId, search_in_folder: root.folderId, precise_search: exactName, sort_by: sort, sort_direction: direction, page_id: pageId, page_capacity: capacity }, extra.signal);
     const source = objectValue(response.data) ?? {};
     const rawItems = [...arrayValue(source.files), ...arrayValue(source.folders)];
-    const eligible = rawItems.flatMap((entry) => {
+    let scopeRejected = 0;
+    const verifiedEligible: Array<{ item: JsonObject; match: JsonObject }> = [];
+    const unverifiedEligible: Array<{ item: JsonObject; match: JsonObject }> = [];
+    const orderedEligible: Array<{ item: JsonObject; match: JsonObject; bucket: "verified" | "unverified" }> = [];
+    for (const entry of rawItems) {
       const raw = objectValue(entry) ?? {};
       const item = driveItem(entry, root.access, detail);
-      if (typeof item.id !== "string" || typeof item.name !== "string" || (item.type !== "file" && item.type !== "folder")) return [];
+      if (typeof item.id !== "string" || typeof item.name !== "string" || (item.type !== "file" && item.type !== "folder")) continue;
       const match = searchMatch(raw, item, field, query, exactName, root.folderId);
-      if ((match.scope as JsonObject).status === "rejected") return [];
-      if (exactName && item.name !== query) return [];
-      return [{ item, match }];
-    });
-    const hits = eligible.slice(offset, offset + limit);
-    const nextOffset = offset + hits.length;
+      if ((match.scope as JsonObject).status === "rejected") {
+        scopeRejected += 1;
+        continue;
+      }
+      if (exactName && item.name !== query) continue;
+      const candidate = { item, match };
+      if (match.claim_allowed === true) {
+        verifiedEligible.push(candidate);
+        orderedEligible.push({ ...candidate, bucket: "verified" });
+      } else {
+        unverifiedEligible.push(candidate);
+        orderedEligible.push({ ...candidate, bucket: "unverified" });
+      }
+    }
+    const disambiguationGroups = applySearchDisambiguation(orderedEligible, exactName);
+    const visibleCandidates = includeUnverified ? orderedEligible : orderedEligible.filter((candidate) => candidate.bucket === "verified");
+    const selected = visibleCandidates.slice(offset, offset + limit);
+    const hits = selected.filter((candidate) => candidate.bucket === "verified").map(({ bucket: _bucket, ...candidate }) => candidate);
+    const unverifiedHits = selected.filter((candidate) => candidate.bucket === "unverified").map(({ bucket: _bucket, ...candidate }) => candidate);
+    const nextOffset = offset + selected.length;
     const providerPage = projectPage(response.data, { itemCount: rawItems.length, providerCount: rawItems.length, pageCapacity: capacity, pageId });
-    const payload = { query, at, kind, field, detail, exact_name: exactName, sort, direction, page_id: pageId, offset: nextOffset, limit, ...(accessContext ? { access_context: accessContext } : {}) };
-    const nextCursor = nextOffset < eligible.length ? encodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "drive_search", payload)
-      : pageHasMore(providerPage) ? encodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "drive_search", { ...payload, page_id: Number(providerPage.next_page_id ?? pageId + 1), offset: 0 }) : undefined;
+    const payload = { query, at, kind, field, detail, exact_name: exactName, sort, direction, include_unverified_index_hits: includeUnverified, page_id: pageId, offset: nextOffset, limit, ...(accessContext ? { access_context: accessContext } : {}) };
+    const nextCursor = nextOffset < visibleCandidates.length
+      ? encodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "drive_search", payload)
+      : pageHasMore(providerPage)
+        ? encodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "drive_search", { ...payload, page_id: Number(providerPage.next_page_id ?? pageId + 1), offset: 0 })
+        : undefined;
     const next = continuationAction("yfy_search", nextCursor);
-    return { hits, coverage: { mode: "provider_index", exhaustive: false }, page: pageOutput(hits.length, nextCursor), ...(next ? { next_action: next } : {}), provenance: provenance(response.meta, undefined, "drive_search") };
+    const agentWarnings = [SEARCH_NON_EXHAUSTIVE_WARNING, SEARCH_CLAIM_WARNING];
+    if (unverifiedEligible.length > 0 && !includeUnverified) {
+      agentWarnings.push(`${unverifiedEligible.length} unverified Provider index hit(s) were counted but omitted from hits (set include_unverified_index_hits=true to inspect them).`);
+    }
+    if (disambiguationGroups > 0) {
+      agentWarnings.push("Some Provider-page candidates share the same name; disambiguate by path/ref and confirm with yfy_get before opening or capturing.");
+    }
+    return {
+      agent_warnings: agentWarnings,
+      coverage: {
+          mode: "provider_index",
+          exhaustive: false,
+          agent_must_read: true,
+          does_not_prove_current_existence: true,
+          does_not_prove_absence: true,
+          current_existence_confirmation_tool: "yfy_get",
+          counts: {
+            provider_raw: rawItems.length,
+            returned: selected.length,
+            returned_verified: hits.length,
+            returned_unverified: unverifiedHits.length,
+          verified_hits: verifiedEligible.length,
+          unverified_index_hits: unverifiedEligible.length,
+          scope_rejected: scopeRejected,
+          disambiguation_groups: disambiguationGroups
+        },
+        note: "Provider index search is non-exhaustive. claim_allowed=true supports the query match from returned metadata, but yfy_get is required to confirm current existence; this result never proves absence."
+      },
+      hits,
+      unverified_hits: unverifiedHits,
+      page: pageOutput(selected.length, nextCursor),
+      ...(next ? { next_action: next } : {}),
+      provenance: provenance(response.meta, undefined, "drive_search")
+    };
   });
 
   const ResolveOutcomeSchema = z.discriminatedUnion("status", [
@@ -346,9 +506,24 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
   });
 
   registerTool(server, "yfy_versions", {
-    title: "List Yifangyun File Versions", description: "List stable historical version refs for one context-bound file ref.",
+    title: "List Yifangyun File Versions",
+    description: "List file versions for one context-bound file ref. Current versions use ref=null (omit version on open/capture); historical versions return a copyable version ref.",
     inputSchema: z.object({ request: VersionsRequestSchema }).strict(),
-    outputSchema: { file: FileRefSchema, versions: z.array(FileVersionSchema.extend({ ref: VersionRefSchema.optional(), file: FileRefSchema })), fingerprint: z.string(), ...PageOutputShape, provenance: ProvenanceSchema }
+    outputSchema: {
+      file: FileRefSchema,
+      versions: z.array(FileVersionSchema.extend({
+        ref: VersionRefSchema.nullable(),
+        file: FileRefSchema,
+        usage: z.object({
+          for_open_or_capture: z.enum(["omit_version_parameter", "pass_version_ref"]),
+          note: z.string()
+        }).strict()
+      })),
+      version_selection_rules: z.object({ current: z.string(), historical: z.string() }).strict(),
+      fingerprint: z.string(),
+      ...PageOutputShape,
+      provenance: ProvenanceSchema
+    }
   }, { readOnly: true }, async (args, extra) => {
     const request = parsePaginatedRequest(VersionsRequestSchema, args.request, "drive_versions");
     const cursor = request.mode === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "drive_versions", request.cursor, VersionsCursorSchema) : undefined;
@@ -359,11 +534,40 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
     const response = await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(resolved.item.id)}/versions`, resolved.access.context.id, {}, extra.signal);
     const normalized = normalizeFileVersions(response.data);
     if (cursor && cursor.fingerprint !== normalized.fingerprint) throw new YifangyunError("File version history changed after this cursor was issued.", { code: "YFY_CURSOR_STALE", phase: "drive_versions", suggestedAction: "Restart yfy_versions with request.mode=first_request." });
-    const versions = normalized.versions.slice(offset, offset + limit).map((version) => ({ ...version, file, ...(!version.current ? { ref: formatVersionRef(file, version.provider_version_id!) } : {}) }));
+    const versions = normalized.versions.slice(offset, offset + limit).map((version) => {
+      if (version.current) {
+        return {
+          ...version,
+          file,
+          ref: null,
+          usage: {
+            for_open_or_capture: "omit_version_parameter" as const,
+            note: "Current version: omit the version parameter on yfy_open/yfy_capture."
+          }
+        };
+      }
+      return {
+        ...version,
+        file,
+        ref: formatVersionRef(file, version.provider_version_id!),
+        usage: {
+          for_open_or_capture: "pass_version_ref" as const,
+          note: "Historical version: pass this ref as the version parameter on yfy_open/yfy_capture."
+        }
+      };
+    });
     const nextOffset = offset + versions.length;
     const nextCursor = nextOffset < normalized.versions.length ? encodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "drive_versions", { file, offset: nextOffset, limit, fingerprint: normalized.fingerprint }) : undefined;
     const next = continuationAction("yfy_versions", nextCursor);
-    return { file, versions, fingerprint: normalized.fingerprint, page: pageOutput(versions.length, nextCursor), ...(next ? { next_action: next } : {}), provenance: provenance(response.meta, undefined, "file_versions") };
+    return {
+      file,
+      versions,
+      version_selection_rules: { ...VERSION_SELECTION_RULES },
+      fingerprint: normalized.fingerprint,
+      page: pageOutput(versions.length, nextCursor),
+      ...(next ? { next_action: next } : {}),
+      provenance: provenance(response.meta, undefined, "file_versions")
+    };
   });
 
   registerTool(server, "yfy_comments", {

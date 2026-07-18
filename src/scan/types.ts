@@ -51,6 +51,7 @@ export interface ScopeScanState {
   workspaceFingerprint: string;
   workspaceId: string;
   workspaceRef: string;
+  workspaceRootFolderId: string;
 }
 
 export interface ScopeScanPage {

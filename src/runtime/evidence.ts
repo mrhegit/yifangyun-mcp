@@ -46,7 +46,8 @@ export class EvidenceArtifactRegistry {
     return `yfy://evidence/${token}`;
   }
 
-  async read(token: string): Promise<{ kind: "blob"; blob: string; mimeType?: string; name: string } | { kind: "text"; text: string; mimeType?: string; name: string }> {
+  async read(resourceUriOrToken: string): Promise<{ kind: "blob"; blob: string; mimeType?: string; name: string } | { kind: "text"; text: string; mimeType?: string; name: string }> {
+    const token = this.resourceToken(resourceUriOrToken);
     const artifact = this.artifacts.get(token);
     if (!artifact || artifact.expiresAtMs <= Date.now()) {
       if (artifact) await this.deleteArtifact(token, artifact);
@@ -80,6 +81,11 @@ export class EvidenceArtifactRegistry {
       const textMedia = artifact.mimeType?.startsWith("text/")
         || artifact.mimeType === "application/json"
         || artifact.mimeType === "application/xml"
+        || artifact.mimeType === "application/yaml"
+        || artifact.mimeType === "image/svg+xml"
+        || artifact.mimeType === "text/csv"
+        || artifact.mimeType === "text/markdown"
+        || artifact.mimeType === "text/html"
         || artifact.mimeType?.endsWith("+json")
         || artifact.mimeType?.endsWith("+xml");
       if (textMedia) {
@@ -99,6 +105,15 @@ export class EvidenceArtifactRegistry {
     } finally {
       await handle?.close().catch(() => undefined);
     }
+  }
+
+  async readTextPreview(resourceUriOrToken: string, maxBytes: number): Promise<{ bytes: number; text: string } | undefined> {
+    const token = this.resourceToken(resourceUriOrToken);
+    const artifact = await this.availableArtifact(token);
+    if (artifact.expectedSize > maxBytes) return undefined;
+    const resource = await this.read(token);
+    if (resource.kind !== "text" || resource.text.includes("\0")) return undefined;
+    return { bytes: Buffer.byteLength(resource.text, "utf8"), text: resource.text };
   }
 
   async manifest(token: string): Promise<{ mimeType?: string; name: string; partCount: number; partSizeBytes: number; sizeBytes: number }> {
@@ -155,7 +170,7 @@ export class EvidenceArtifactRegistry {
   }
 
   async release(resourceUriOrToken: string): Promise<boolean> {
-    const token = /^yfy:\/\/evidence\/([a-f0-9]{48})(?:\/.*)?$/.exec(resourceUriOrToken)?.[1] ?? resourceUriOrToken;
+    const token = this.resourceToken(resourceUriOrToken);
     const artifact = this.artifacts.get(token);
     if (!artifact) return false;
     if (artifact.expiresAtMs <= Date.now()) {
@@ -173,6 +188,10 @@ export class EvidenceArtifactRegistry {
       throw new YifangyunError("Evidence artifact is unavailable or expired.", { code: "YFY_EVIDENCE_ARTIFACT_NOT_FOUND", phase: "evidence_resource" });
     }
     return artifact;
+  }
+
+  private resourceToken(resourceUriOrToken: string): string {
+    return /^yfy:\/\/evidence\/([a-f0-9]{48})(?:\/.*)?$/.exec(resourceUriOrToken)?.[1] ?? resourceUriOrToken;
   }
 
   async close(): Promise<void> {

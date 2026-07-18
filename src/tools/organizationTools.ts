@@ -38,6 +38,17 @@ function users(value: JsonValue | undefined, includeContact: boolean): JsonObjec
   return firstArray(source, "users", "members", "items").map((entry) => projectUser(entry, includeContact)).filter((entry) => Object.keys(entry).length > 0);
 }
 
+const ContactPolicySchema = z.object({
+  requested: z.boolean(),
+  fields: z.enum(["included", "none_available", "omitted_by_default"])
+}).strict();
+
+function contactPolicy(includeContact: boolean, projectedUsers: JsonObject[]): { requested: boolean; fields: "included" | "none_available" | "omitted_by_default" } {
+  if (!includeContact) return { requested: false, fields: "omitted_by_default" };
+  const hasContact = projectedUsers.some((user) => typeof user.email === "string" || typeof user.phone === "string");
+  return { requested: true, fields: hasContact ? "included" : "none_available" };
+}
+
 function departments(value: JsonValue | undefined): JsonObject[] {
   const source = objectValue(value) ?? {};
   return firstArray(source, "departments", "children", "items").map(projectDepartment).filter((entry) => Object.keys(entry).length > 0);
@@ -81,7 +92,7 @@ export function registerOrganizationTools(server: McpServer, runtime: AppRuntime
 
   registerTool(server, "yfy_department_users", {
     title: "List Yifangyun Department Users", description: "List users in one department. Contact fields require include_contact=true.",
-    inputSchema: z.object({ request: DepartmentUsersRequest }).strict(), outputSchema: { users: z.array(UserSchema), ...PageOutputShape, provenance: ProvenanceSchema }
+    inputSchema: z.object({ request: DepartmentUsersRequest }).strict(), outputSchema: { users: z.array(UserSchema), contact_policy: ContactPolicySchema, ...PageOutputShape, provenance: ProvenanceSchema }
   }, { readOnly: true }, async (args, extra) => {
     const request = parsePaginatedRequest(DepartmentUsersRequest, args.request, "department_users");
     const cursor = request.mode === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "department_users", request.cursor, DepartmentUsersCursor) : undefined;
@@ -99,12 +110,12 @@ export function registerOrganizationTools(server: McpServer, runtime: AppRuntime
     const nextCursor = nextOffset < all.length ? encodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "department_users", payload)
       : hasMore(providerPage) ? encodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "department_users", { ...payload, page_id: Number(providerPage.next_page_id ?? pageId + 1), offset: 0 }) : undefined;
     const next = continuationAction("yfy_department_users", nextCursor);
-    return { users: selected, page: pageOutput(selected.length, nextCursor), ...(next ? { next_action: next } : {}), provenance: provenance(response.meta, undefined, "department_users") };
+    return { users: selected, contact_policy: contactPolicy(includeContact, selected), page: pageOutput(selected.length, nextCursor), ...(next ? { next_action: next } : {}), provenance: provenance(response.meta, undefined, "department_users") };
   });
 
   registerTool(server, "yfy_user_search", {
     title: "Search Yifangyun Users", description: "Search visible enterprise users with a stable cursor.",
-    inputSchema: z.object({ request: UserSearchRequest }).strict(), outputSchema: { users: z.array(UserSchema), ...PageOutputShape, provenance: ProvenanceSchema }
+    inputSchema: z.object({ request: UserSearchRequest }).strict(), outputSchema: { users: z.array(UserSchema), contact_policy: ContactPolicySchema, ...PageOutputShape, provenance: ProvenanceSchema }
   }, { readOnly: true }, async (args, extra) => {
     const request = parsePaginatedRequest(UserSearchRequest, args.request, "user_search");
     const cursor = request.mode === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "user_search", request.cursor, UserSearchCursor) : undefined;
@@ -125,7 +136,7 @@ export function registerOrganizationTools(server: McpServer, runtime: AppRuntime
     const nextCursor = nextOffset < all.length ? encodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "user_search", payload)
       : hasMore(providerPage) ? encodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "user_search", { ...payload, page_id: Number(providerPage.next_page_id ?? pageId + 1), offset: 0 }) : undefined;
     const next = continuationAction("yfy_user_search", nextCursor);
-    return { users: selected, page: pageOutput(selected.length, nextCursor), ...(next ? { next_action: next } : {}), provenance: provenance(response.meta, undefined, "user_search") };
+    return { users: selected, contact_policy: contactPolicy(includeContact, selected), page: pageOutput(selected.length, nextCursor), ...(next ? { next_action: next } : {}), provenance: provenance(response.meta, undefined, "user_search") };
   });
 
   registerTool(server, "yfy_group_list", {
@@ -150,7 +161,7 @@ export function registerOrganizationTools(server: McpServer, runtime: AppRuntime
 
   registerTool(server, "yfy_group_users", {
     title: "List Yifangyun Group Users", description: "List members of one group with a stable cursor.",
-    inputSchema: z.object({ request: GroupUsersRequest }).strict(), outputSchema: { users: z.array(UserSchema), ...PageOutputShape, provenance: ProvenanceSchema }
+    inputSchema: z.object({ request: GroupUsersRequest }).strict(), outputSchema: { users: z.array(UserSchema), contact_policy: ContactPolicySchema, ...PageOutputShape, provenance: ProvenanceSchema }
   }, { readOnly: true }, async (args, extra) => {
     const request = parsePaginatedRequest(GroupUsersRequest, args.request, "group_users");
     const cursor = request.mode === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "group_users", request.cursor, GroupUsersCursor) : undefined;
@@ -170,6 +181,6 @@ export function registerOrganizationTools(server: McpServer, runtime: AppRuntime
     const nextCursor = nextOffset < all.length ? encodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "group_users", payload)
       : hasMore(providerPage) ? encodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "group_users", { ...payload, page_id: Number(providerPage.next_page_id ?? pageId + 1), offset: 0 }) : undefined;
     const next = continuationAction("yfy_group_users", nextCursor);
-    return { users: selected, page: pageOutput(selected.length, nextCursor), ...(next ? { next_action: next } : {}), provenance: provenance(response.meta, undefined, "group_users") };
+    return { users: selected, contact_policy: contactPolicy(includeContact, selected), page: pageOutput(selected.length, nextCursor), ...(next ? { next_action: next } : {}), provenance: provenance(response.meta, undefined, "group_users") };
   });
 }

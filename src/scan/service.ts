@@ -21,6 +21,7 @@ export interface CreateSnapshotInput {
   workspaceFingerprint?: string;
   workspaceId?: string;
   workspaceRef?: string;
+  workspaceRootFolderId?: string;
 }
 
 export class SnapshotService {
@@ -63,7 +64,8 @@ export class SnapshotService {
       userId: resolved.context.userId,
       workspaceFingerprint: input.workspaceFingerprint ?? `internal:${resolved.identityRef}:${input.rootFolderId}`,
       workspaceId: input.workspaceId ?? "internal",
-      workspaceRef: input.workspaceRef ?? "workspace:internal"
+      workspaceRef: input.workspaceRef ?? "workspace:internal",
+      workspaceRootFolderId: input.workspaceRootFolderId ?? input.rootFolderId
     });
     this.launch(started.state.scanId);
     return started;

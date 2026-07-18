@@ -41,11 +41,16 @@ test("server instructions only recommend available and ready capabilities", () =
   const instructions = serverInstructions(evidenceOnly);
   assert.match(instructions, /yfy_status/);
   assert.doesNotMatch(instructions, /inventory|yfy_capture/);
-  const ready = { config: { toolsets: ["drive", "inventory", "evidence"], workflowProfiles: [], authorityScopes: [{ id: "workspace" }] } } as unknown as AppRuntime;
+  const ready = { config: { toolsets: ["drive", "inventory", "evidence", "transfer"], workflowProfiles: [], authorityScopes: [{ id: "workspace" }] } } as unknown as AppRuntime;
   const readyInstructions = serverInstructions(ready);
   assert.match(readyInstructions, /ItemRef.*yfy_get/);
   assert.match(readyInstructions, /yfy_open/);
   assert.match(readyInstructions, /safe_to_claim_absence=true/);
+  assert.match(readyInstructions, /agent_guidance/);
+  assert.match(readyInstructions, /claim_allowed=true/);
+  assert.match(readyInstructions, /content_delivery/);
+  assert.match(readyInstructions, /must_release/);
   assert.match(readyInstructions, /yfy_capture/);
   assert.match(readyInstructions, /release every returned resource/i);
+  assert.match(readyInstructions, /Do not use yfy_transfer_ticket_get/);
 });

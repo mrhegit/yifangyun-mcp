@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import type { AppConfig, Toolset, WorkflowProfile } from "./types.js";
+import { CONTRACT_VERSION } from "./version.js";
 
 const PROFILE_REQUIREMENTS: Record<WorkflowProfile, { requiresScope: boolean; toolsets: Toolset[] }> = {
   tender: { requiresScope: true, toolsets: ["drive", "workspace", "inventory", "evidence"] }
@@ -30,6 +31,7 @@ export function assertProfilesReady(config: Pick<AppConfig, "authorityScopes" | 
 
 export function configFingerprint(config: AppConfig): string {
   const stable = JSON.stringify({
+    contract_version: CONTRACT_VERSION,
     access_contexts: config.accessContexts.map((context) => ({ id: context.id, user_id: context.userId, external_enterprise_id: context.externalEnterpriseId ?? null })),
     workspaces: config.authorityScopes.map((scope) => ({ id: scope.id, root_folder_id: scope.rootFolderId, access_context: scope.accessContext, tags: scope.tags })),
     default_access_context: config.defaultAccessContext,

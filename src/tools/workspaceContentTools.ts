@@ -28,7 +28,83 @@ function progressReporter(extra: { _meta?: { progressToken?: string | number }; 
 
 type MembershipStatus = "inside" | "outside" | "unavailable";
 
-function membershipProof(file: JsonObject, rootFolder: JsonObject, rootFolderId: string): { ancestorIds: string[]; status: MembershipStatus } {
+type MembershipAgentInterpretation = {
+  may_claim_inside: boolean;
+  may_claim_outside: boolean;
+  may_capture: boolean;
+  narrative: string;
+  next_steps: string[];
+};
+
+type MembershipProof = {
+  ancestorIds: string[];
+  status: MembershipStatus;
+  reason: string;
+  agent_interpretation: MembershipAgentInterpretation;
+  observed_file_space?: JsonObject;
+  observed_root_space?: JsonObject;
+};
+
+function spaceIdPresent(space: JsonObject | undefined): string | undefined {
+  const id = space?.id;
+  if (typeof id === "string" || typeof id === "number") return String(id);
+  return undefined;
+}
+
+function spaceTypePresent(space: JsonObject | undefined): "collaboration" | "department" | "personal" | undefined {
+  if (typeof space?.type !== "string") return undefined;
+  const value = space.type.trim().toLowerCase().replace(/[\s_-]+/g, "");
+  if (value.includes("personal") || value === "private") return "personal";
+  if (value.includes("department") || value.includes("enterprise") || value === "dept") return "department";
+  if (value.includes("collab") || value.includes("share")) return "collaboration";
+  return undefined;
+}
+
+function buildMembershipInterpretation(status: MembershipStatus, reason: string): MembershipAgentInterpretation {
+  if (status === "inside") {
+    return {
+      may_claim_inside: true,
+      may_claim_outside: false,
+      may_capture: true,
+      narrative: "The file is inside the configured workspace root (path or parent folder hit the root).",
+      next_steps: ["You may call yfy_capture with this workspace and file ref.", "Release every content resource after use."]
+    };
+  }
+  if (status === "outside") {
+    return {
+      may_claim_inside: false,
+      may_claim_outside: true,
+      may_capture: false,
+      narrative: reason === "different_space_id"
+        ? "The file belongs to a different storage space id than the workspace root."
+        : "The file belongs to a different storage space type than the workspace root (for example personal vs department).",
+      next_steps: [
+        "Do not claim this file is inside the workspace.",
+        "Do not call yfy_capture for this workspace with this file.",
+        "Discover the file from the target workspace (browse/resolve) before capture."
+      ]
+    };
+  }
+  const narratives: Record<string, string> = {
+    conflicting_membership_evidence: "Provider path and storage-space metadata conflict, so membership is unsafe to claim in either direction.",
+    missing_ancestor_chain: "Provider metadata does not include a path that reaches the workspace root; membership is unproven. Do not treat this as outside or inside.",
+    incomplete_space_metadata: "Space metadata is incomplete on the file and/or workspace root, so outside/inside cannot be decided.",
+    same_space_path_inconclusive: "File and workspace appear to share a space, but the path does not prove the file is under the configured root."
+  };
+  return {
+    may_claim_inside: false,
+    may_claim_outside: false,
+    may_capture: false,
+    narrative: narratives[reason] ?? "Workspace membership could not be proven from Provider metadata. Do not claim inside or outside.",
+    next_steps: [
+      "Do not claim the file is inside or outside the workspace.",
+      "Resolve the file via a path under the workspace root, or browse from the workspace to obtain a path-backed ref.",
+      "Retry after the Provider exposes a complete ancestry chain or space metadata."
+    ]
+  };
+}
+
+export function workspaceMembershipProof(file: JsonObject, rootFolder: JsonObject, rootFolderId: string): MembershipProof {
   const chain = Array.isArray(file.provider_path_chain) ? file.provider_path_chain : [];
   const ancestorIds = chain.flatMap((entry) => {
     if (typeof entry === "object" && entry !== null && !Array.isArray(entry) && typeof entry.id === "string") {
@@ -36,11 +112,74 @@ function membershipProof(file: JsonObject, rootFolder: JsonObject, rootFolderId:
     }
     return [];
   });
-  if (ancestorIds.includes(rootFolderId) || file.parent_folder_id === rootFolderId) return { ancestorIds, status: "inside" };
-  const fileSpaceId = objectValue(file.space)?.id;
-  const rootSpaceId = objectValue(rootFolder.space)?.id;
-  if ((typeof fileSpaceId === "string" || typeof fileSpaceId === "number") && (typeof rootSpaceId === "string" || typeof rootSpaceId === "number") && String(fileSpaceId) !== String(rootSpaceId)) return { ancestorIds, status: "outside" };
-  return { ancestorIds, status: "unavailable" };
+  const fileSpace = objectValue(file.space);
+  const rootSpace = objectValue(rootFolder.space);
+  const observed = {
+    ...(fileSpace ? { observed_file_space: fileSpace } : {}),
+    ...(rootSpace ? { observed_root_space: rootSpace } : {})
+  };
+
+  const pathInside = ancestorIds.includes(rootFolderId) || file.parent_folder_id === rootFolderId;
+  const fileSpaceId = spaceIdPresent(fileSpace);
+  const rootSpaceId = spaceIdPresent(rootSpace);
+  const fileSpaceType = spaceTypePresent(fileSpace);
+  const rootSpaceType = spaceTypePresent(rootSpace);
+  const differentSpaceId = fileSpaceId !== undefined && rootSpaceId !== undefined && fileSpaceId !== rootSpaceId;
+  const sameSpaceId = fileSpaceId !== undefined && rootSpaceId !== undefined && fileSpaceId === rootSpaceId;
+  const differentKnownSpaceType = fileSpaceType !== undefined && rootSpaceType !== undefined && fileSpaceType !== rootSpaceType;
+
+  if ((pathInside && (differentSpaceId || differentKnownSpaceType)) || (sameSpaceId && differentKnownSpaceType)) {
+    const reason = "conflicting_membership_evidence";
+    return { ancestorIds, status: "unavailable", reason, agent_interpretation: buildMembershipInterpretation("unavailable", reason), ...observed };
+  }
+
+  if (pathInside) {
+    const reason = "path_or_parent_hit_root";
+    return { ancestorIds, status: "inside", reason, agent_interpretation: buildMembershipInterpretation("inside", reason), ...observed };
+  }
+
+  if (differentSpaceId) {
+    const reason = "different_space_id";
+    return { ancestorIds, status: "outside", reason, agent_interpretation: buildMembershipInterpretation("outside", reason), ...observed };
+  }
+
+  if ((fileSpaceId === undefined || rootSpaceId === undefined) && differentKnownSpaceType) {
+    const reason = "different_space_type";
+    return { ancestorIds, status: "outside", reason, agent_interpretation: buildMembershipInterpretation("outside", reason), ...observed };
+  }
+
+  // 4. unavailable + reason
+  let reason: string;
+  if (fileSpaceId !== undefined && rootSpaceId !== undefined && fileSpaceId === rootSpaceId) {
+    reason = "same_space_path_inconclusive";
+  } else if (fileSpaceType !== undefined && rootSpaceType !== undefined && fileSpaceType === rootSpaceType) {
+    reason = "same_space_path_inconclusive";
+  } else if (ancestorIds.length === 0) {
+    reason = "missing_ancestor_chain";
+  } else if (fileSpaceId === undefined || rootSpaceId === undefined || fileSpaceType === undefined || rootSpaceType === undefined) {
+    reason = "incomplete_space_metadata";
+  } else {
+    reason = "same_space_path_inconclusive";
+  }
+  return { ancestorIds, status: "unavailable", reason, agent_interpretation: buildMembershipInterpretation("unavailable", reason), ...observed };
+}
+
+function membershipDiagnostics(membership: MembershipProof, extra: JsonObject = {}): JsonObject {
+  const interpretation = membership.agent_interpretation;
+  return {
+    reason: membership.reason,
+    ...(membership.observed_file_space ? { observed_file_space: membership.observed_file_space } : {}),
+    ...(membership.observed_root_space ? { observed_root_space: membership.observed_root_space } : {}),
+    observed_ancestor_folder_ids: membership.ancestorIds,
+    agent_interpretation: {
+      may_claim_inside: interpretation.may_claim_inside,
+      may_claim_outside: interpretation.may_claim_outside,
+      may_capture: interpretation.may_capture,
+      narrative: interpretation.narrative,
+      next_steps: [...interpretation.next_steps]
+    },
+    ...extra
+  };
 }
 
 function canDowngradeCheckToUnavailable(error: unknown, signal: AbortSignal): boolean {
@@ -66,16 +205,187 @@ const MEDIA_TYPE_ALIASES: Record<string, string> = {
   "application/x-msword": "application/msword"
 };
 
+/** 扩展名 → media type（content-type / magic 均不可用时回退） */
+const EXTENSION_MEDIA_TYPES: Record<string, string> = {
+  svg: "image/svg+xml",
+  txt: "text/plain",
+  text: "text/plain",
+  md: "text/markdown",
+  markdown: "text/markdown",
+  csv: "text/csv",
+  json: "application/json",
+  html: "text/html",
+  htm: "text/html",
+  xml: "application/xml",
+  yaml: "application/yaml",
+  yml: "application/yaml",
+  css: "text/css",
+  js: "text/javascript",
+  mjs: "text/javascript",
+  tsv: "text/tab-separated-values",
+  log: "text/plain",
+  pdf: "application/pdf",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ppt: "application/vnd.ms-powerpoint",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp"
+};
+
+type MediaTypeSource = "content_type" | "magic_sniff" | "file_extension" | "octet_stream";
+
+/** Inline preview cap for structuredContent — keep small so Hosts that inject structuredContent do not blow the model context. */
+const PREVIEW_MAX_BYTES = 32 * 1024;
+const STRONG_MAGIC_MEDIA_TYPES = new Set(["application/pdf", "application/zip", "image/jpeg", "image/png"]);
+
+function isSpecificZipContainerMediaType(mediaType: string | undefined): boolean {
+  return mediaType !== undefined && (
+    mediaType.includes("openxmlformats-officedocument")
+    || mediaType.includes("macroenabled")
+    || mediaType.includes("oasis.opendocument")
+    || mediaType.endsWith("+zip")
+  );
+}
+
 function normalizeSingleMediaType(value: unknown): string | undefined {
   const mediaType = typeof value === "string" ? value.split(";", 1)[0]!.trim().toLowerCase() : "";
   if (!/^[\w.+-]+\/[\w.+-]+$/.test(mediaType)) return undefined;
   return MEDIA_TYPE_ALIASES[mediaType] ?? mediaType;
 }
 
-export function normalizedMediaType(contentType: unknown, detectedContentType: unknown): string {
+function mediaTypeFromFileName(fileName: unknown): string | undefined {
+  if (typeof fileName !== "string" || fileName.length === 0) return undefined;
+  const base = fileName.split(/[/\\]/).pop() ?? fileName;
+  const dot = base.lastIndexOf(".");
+  if (dot <= 0 || dot === base.length - 1) return undefined;
+  const ext = base.slice(dot + 1).toLowerCase();
+  return EXTENSION_MEDIA_TYPES[ext];
+}
+
+/**
+ * 强 magic 优先于响应头；弱文本嗅探只在响应头无类型时使用。
+ */
+export function resolveMediaType(contentType: unknown, detectedContentType: unknown, fileName?: unknown): { media_type: string; media_type_source: MediaTypeSource } {
   const providerType = normalizeSingleMediaType(contentType);
-  if (providerType && providerType !== "application/octet-stream") return providerType;
-  return normalizeSingleMediaType(detectedContentType) ?? "application/octet-stream";
+  const detected = normalizeSingleMediaType(detectedContentType);
+  const fromName = mediaTypeFromFileName(fileName);
+  if (detected === "application/zip") {
+    if (isSpecificZipContainerMediaType(providerType)) {
+      return { media_type: providerType!, media_type_source: "content_type" };
+    }
+    if (isSpecificZipContainerMediaType(fromName)) {
+      return { media_type: fromName!, media_type_source: "file_extension" };
+    }
+  }
+  if (detected && STRONG_MAGIC_MEDIA_TYPES.has(detected)) {
+    return { media_type: detected, media_type_source: "magic_sniff" };
+  }
+  if (providerType && providerType !== "application/octet-stream") {
+    return { media_type: providerType, media_type_source: "content_type" };
+  }
+  if (detected && detected !== "application/octet-stream") {
+    return { media_type: detected, media_type_source: "magic_sniff" };
+  }
+  if (fromName) {
+    return { media_type: fromName, media_type_source: "file_extension" };
+  }
+  return { media_type: "application/octet-stream", media_type_source: "octet_stream" };
+}
+
+export function normalizedMediaType(contentType: unknown, detectedContentType: unknown, fileName?: unknown): string {
+  return resolveMediaType(contentType, detectedContentType, fileName).media_type;
+}
+
+function isPreviewableMediaType(mediaType: string): boolean {
+  return mediaType.startsWith("text/")
+    || mediaType === "application/json"
+    || mediaType === "application/xml"
+    || mediaType === "application/yaml"
+    || mediaType === "image/svg+xml"
+    || mediaType.endsWith("+json")
+    || mediaType.endsWith("+xml");
+}
+
+async function tryInlineTextPreview(runtime: AppRuntime, resourceUri: string, sizeBytes: number, mediaType: string, delivery: string): Promise<{ preview_bytes: number; preview_complete: true; preview_text: string } | undefined> {
+  if (delivery !== "mcp_resource") return undefined;
+  if (sizeBytes > PREVIEW_MAX_BYTES) return undefined;
+  if (!isPreviewableMediaType(mediaType)) return undefined;
+  const verified = await runtime.evidence.readTextPreview(resourceUri, PREVIEW_MAX_BYTES);
+  return verified ? { preview_bytes: verified.bytes, preview_complete: true, preview_text: verified.text } : undefined;
+}
+
+function buildContentDelivery(resource: JsonObject, hasInlinePreview: boolean, previewRequested: boolean): JsonObject {
+  const mediaType = typeof resource.media_type === "string" ? resource.media_type : "application/octet-stream";
+  if (resource.delivery === "multipart_resource") {
+    return {
+      mode: "multipart_manifest_only",
+      resource_fetch_required: true,
+      embedded_resource_in_tool_result: false,
+      host_auto_fetch_not_guaranteed: true,
+      still_must_release: true,
+      next_step: "Read the multipart manifest at resource.resource_uri, fetch each part URI, then call yfy_resource_release.",
+      reason: "multipart_resources_never_inline"
+    };
+  }
+  if (hasInlinePreview) {
+    return {
+      mode: "inline_preview",
+      resource_fetch_required: false,
+      embedded_resource_in_tool_result: true,
+      host_auto_fetch_not_guaranteed: true,
+      still_must_release: true,
+      next_step: "Use the embedded text resource or resource.preview_text; still call yfy_resource_release when finished.",
+      preview_kind: mediaType,
+      preview_bytes: resource.preview_bytes,
+      preview_complete: true,
+      preview_charset: "utf-8"
+    };
+  }
+  if (isPreviewableMediaType(mediaType)) {
+    return {
+      mode: "resource_link_only",
+      resource_fetch_required: true,
+      embedded_resource_in_tool_result: false,
+      host_auto_fetch_not_guaranteed: true,
+      still_must_release: true,
+      next_step: "Host may not auto-read resource_link. Call resources/read on resource.resource_uri, then yfy_resource_release.",
+      reason: previewRequested ? "preview_unavailable_use_resource_link" : "preview_disabled_by_request"
+    };
+  }
+  return {
+    mode: "binary_no_preview",
+    resource_fetch_required: true,
+    embedded_resource_in_tool_result: false,
+    host_auto_fetch_not_guaranteed: true,
+    still_must_release: true,
+    next_step: "Call resources/read on resource.resource_uri for verified bytes, then yfy_resource_release. Binary rendering depends on client attachment support.",
+    reason: "binary_or_non_previewable_media_type"
+  };
+}
+
+function assertContentDeliveryConsistency(resource: JsonObject, delivery: JsonObject): void {
+  const mode = delivery.mode;
+  const hasPreview = typeof resource.preview_text === "string" && resource.preview_complete === true;
+  const valid = mode === "inline_preview"
+    ? resource.delivery === "mcp_resource" && hasPreview && delivery.embedded_resource_in_tool_result === true && delivery.resource_fetch_required === false
+    : mode === "multipart_manifest_only"
+      ? resource.delivery === "multipart_resource" && !hasPreview
+      : (mode === "resource_link_only" || mode === "binary_no_preview")
+        ? resource.delivery === "mcp_resource" && !hasPreview && delivery.resource_fetch_required === true
+        : false;
+  if (!valid) {
+    throw new YifangyunError("Content delivery state is internally inconsistent.", {
+      code: "YFY_TOOL_OUTPUT_INVALID",
+      phase: "content_delivery",
+      suggestedAction: "Upgrade or fix the MCP server before using this content."
+    });
+  }
 }
 
 async function removeEvidenceTemp(tempPath: string): Promise<void> {
@@ -106,7 +416,8 @@ function canTryAnotherHistoricalSelector(error: unknown): boolean {
 async function attachEvidenceArtifact(runtime: AppRuntime, evidence: JsonObject): Promise<JsonObject> {
   const sizeBytes = typeof evidence.size_bytes === "number" ? evidence.size_bytes : Number.MAX_SAFE_INTEGER;
   const maxResourceBytes = runtime.config.maxEvidenceResourceBytes ?? 16777216;
-  const mediaType = normalizedMediaType(evidence.content_type, evidence.detected_content_type);
+  const resolved = resolveMediaType(evidence.content_type, evidence.detected_content_type, evidence.file_name);
+  const mediaType = resolved.media_type;
   const detectedMediaType = normalizeSingleMediaType(evidence.detected_content_type);
   const common: JsonObject = {
     file: String(evidence.file_ref),
@@ -115,6 +426,7 @@ async function attachEvidenceArtifact(runtime: AppRuntime, evidence: JsonObject)
     sha256: String(evidence.sha256),
     size_bytes: sizeBytes,
     media_type: mediaType,
+    media_type_source: resolved.media_type_source,
     ...(detectedMediaType ? { detected_media_type: detectedMediaType } : {})
   };
   if (sizeBytes > maxResourceBytes) {
@@ -185,7 +497,7 @@ async function getScopedFile(runtime: AppRuntime, fileRef: string, workspaceRef:
   ]);
   const file = projectItem(response.data, "evidence");
   const rootFolder = projectItem(rootResponse.data, "evidence");
-  const membership = membershipProof(file, rootFolder, scope.scope.rootFolderId);
+  const membership = workspaceMembershipProof(file, rootFolder, scope.scope.rootFolderId);
   return { file, fileId, fileRef, membership, response, rootResponse, scope };
 }
 
@@ -400,18 +712,46 @@ function registerAuthorityTools(server: McpServer, runtime: AppRuntime): void {
 
   registerTool(server, "yfy_membership_check", {
     title: "Check Yifangyun Workspace Membership",
-    description: "Check whether a context-bound file belongs to a configured workspace. Membership may be inside, outside, or unavailable.",
+    description: "Check whether a context-bound file belongs to a configured workspace. Membership may be inside, outside, or unavailable. Read agent_interpretation before claiming membership; unavailable means neither inside nor outside may be claimed.",
     inputSchema: { file: FileRefSchema, workspace: WorkspaceRefSchema, mode: z.enum(["query", "assert"]).default("query") },
-    outputSchema: { file: ItemSchema.extend({ ref: FileRefSchema }), workspace: z.object({ ref: WorkspaceRefSchema, root: FolderRefSchema, access_context: z.string() }).strict(), membership: z.enum(["inside", "outside", "unavailable"]), ancestor_folders: z.array(FolderRefSchema), relative_ancestor_chain: z.array(PathEntrySchema), path_basis: z.literal("configured_workspace_root"), provenance: z.array(ProvenanceSchema) }
+    outputSchema: {
+      file: ItemSchema.extend({ ref: FileRefSchema }),
+      workspace: z.object({ ref: WorkspaceRefSchema, root: FolderRefSchema, access_context: z.string() }).strict(),
+      membership: z.enum(["inside", "outside", "unavailable"]),
+      agent_interpretation: z.object({
+        may_claim_inside: z.boolean(),
+        may_claim_outside: z.boolean(),
+        may_capture: z.boolean(),
+        narrative: z.string(),
+        next_steps: z.array(z.string())
+      }).strict(),
+      diagnostics: z.object({
+        reason: z.string(),
+        observed_file_space: z.record(z.unknown()).optional(),
+        observed_root_space: z.record(z.unknown()).optional(),
+        observed_ancestor_folder_ids: z.array(z.string())
+      }).strict(),
+      ancestor_folders: z.array(FolderRefSchema),
+      relative_ancestor_chain: z.array(PathEntrySchema),
+      path_basis: z.literal("configured_workspace_root"),
+      provenance: z.array(ProvenanceSchema)
+    }
   }, { readOnly: true }, async ({ file, workspace, mode }, extra) => {
     const result = await getScopedFile(runtime, String(file), String(workspace), extra.signal);
     metrics.increment("scope_assertion_total", { outcome: `${result.membership.status}_scope` });
     if (mode === "assert" && result.membership.status !== "inside") {
       throw new YifangyunError(result.membership.status === "outside" ? "File is outside the configured workspace." : "Workspace membership could not be proven from Provider metadata.", {
         code: result.membership.status === "outside" ? "YFY_WORKSPACE_MEMBERSHIP_FAILED" : "YFY_WORKSPACE_MEMBERSHIP_UNAVAILABLE",
-        agentDetails: { file_ref: String(file), workspace: String(workspace), root_folder_id: result.scope.scope.rootFolderId, observed_ancestor_folder_ids: result.membership.ancestorIds, membership: result.membership.status },
+        agentDetails: membershipDiagnostics(result.membership, {
+          file_ref: String(file),
+          workspace: String(workspace),
+          root_folder_id: result.scope.scope.rootFolderId,
+          membership: result.membership.status
+        }),
         phase: "workspace_membership",
-        suggestedAction: result.membership.status === "unavailable" ? "Retry after the Provider exposes a complete ancestry chain." : undefined
+        suggestedAction: result.membership.status === "unavailable"
+          ? "Do not claim inside or outside. Resolve via workspace path or wait for complete Provider ancestry/space metadata."
+          : "Do not claim this file is inside the workspace."
       });
     }
     const ancestorFolders = result.membership.ancestorIds.map((id) => formatItemRef("folder", id, result.scope.context.id, result.scope.identityRef));
@@ -419,6 +759,13 @@ function registerAuthorityTools(server: McpServer, runtime: AppRuntime): void {
       file: { ...result.file, ref: String(file) },
       workspace: { ref: String(workspace), root: formatItemRef("folder", result.scope.scope.rootFolderId, result.scope.context.id, result.scope.identityRef), access_context: result.scope.context.id },
       membership: result.membership.status,
+      agent_interpretation: result.membership.agent_interpretation,
+      diagnostics: {
+        reason: result.membership.reason,
+        ...(result.membership.observed_file_space ? { observed_file_space: result.membership.observed_file_space } : {}),
+        ...(result.membership.observed_root_space ? { observed_root_space: result.membership.observed_root_space } : {}),
+        observed_ancestor_folder_ids: result.membership.ancestorIds
+      },
       ancestor_folders: ancestorFolders,
       relative_ancestor_chain: workspaceRelativeAncestors(result.file, result.scope.scope.rootFolderId),
       path_basis: "configured_workspace_root",
@@ -430,6 +777,7 @@ function registerAuthorityTools(server: McpServer, runtime: AppRuntime): void {
 async function captureVersionContent(runtime: AppRuntime, input: {
   expected?: Record<string, unknown>;
   fileRef: string;
+  includeTextPreview: boolean;
   onProgress?: (bytes: number, totalBytes?: number) => void;
   selector: VersionSelector;
   signal?: AbortSignal;
@@ -447,7 +795,15 @@ async function captureVersionContent(runtime: AppRuntime, input: {
     throw new YifangyunError(scopedBefore.membership.status === "outside" ? "The file is outside the configured workspace." : "Workspace membership could not be proven from Provider metadata.", {
       code: scopedBefore.membership.status === "outside" ? "YFY_WORKSPACE_MEMBERSHIP_FAILED" : "YFY_WORKSPACE_MEMBERSHIP_UNAVAILABLE",
       phase: "workspace_membership",
-      agentDetails: { file_ref: input.fileRef, workspace: input.workspaceRef!, root_folder_id: scopedBefore.scope.scope.rootFolderId, observed_ancestor_folder_ids: scopedBefore.membership.ancestorIds, membership: scopedBefore.membership.status }
+      agentDetails: membershipDiagnostics(scopedBefore.membership, {
+        file_ref: input.fileRef,
+        workspace: input.workspaceRef!,
+        root_folder_id: scopedBefore.scope.scope.rootFolderId,
+        membership: scopedBefore.membership.status
+      }),
+      suggestedAction: scopedBefore.membership.status === "unavailable"
+        ? "Do not claim inside or outside. Resolve via workspace path or wait for complete Provider ancestry/space metadata."
+        : "Do not claim this file is inside the workspace."
     });
   }
   const versionsBefore = await observeVersions(runtime, item.id, access.context.id, input.signal);
@@ -542,14 +898,33 @@ async function captureVersionContent(runtime: AppRuntime, input: {
       workspace_membership: input.workspaceRef ? "pass" : "not_applicable"
     };
     const resource = await attachEvidenceArtifact(runtime, downloaded.evidence);
+    const inlinePreview = input.includeTextPreview && typeof resource.resource_uri === "string"
+      ? await tryInlineTextPreview(
+        runtime,
+        String(resource.resource_uri),
+        typeof resource.size_bytes === "number" ? resource.size_bytes : Number.MAX_SAFE_INTEGER,
+        typeof resource.media_type === "string" ? resource.media_type : "application/octet-stream",
+        String(resource.delivery)
+      )
+      : undefined;
+    const resourceWithDelivery: JsonObject = {
+      ...resource,
+      must_release: true,
+      ...(inlinePreview ?? {})
+    };
+    const contentDelivery = buildContentDelivery(resourceWithDelivery, Boolean(inlinePreview), input.includeTextPreview);
+    assertContentDeliveryConsistency(resourceWithDelivery, contentDelivery);
+    // must_release 置顶：序列化时优先提醒 Agent 释放资源
     return {
+      must_release: true,
+      content_delivery: contentDelivery,
       file: { ...after, ref: input.fileRef },
       version: { ...selected, ...(!selected.current ? { ref: formatVersionRef(input.fileRef, selected.provider_version_id!) } : {}) },
       selection: versionSelectionProof(selected, input.selector, downloaded.strategy),
       assurance: { level: input.workspaceRef ? "workspace_bound" : "content_integrity", verdict: "verified", checks },
       ...(input.workspaceRef && scopedAfter ? { workspace: { ref: input.workspaceRef, root: formatItemRef("folder", scopedAfter.scope.scope.rootFolderId, scopedAfter.scope.context.id, scopedAfter.scope.identityRef), ancestor_folders: scopedAfter.membership.ancestorIds.map((id) => formatItemRef("folder", id, scopedAfter.scope.context.id, scopedAfter.scope.identityRef)), relative_ancestor_chain: workspaceRelativeAncestors(after, scopedAfter.scope.scope.rootFolderId), path_basis: "configured_workspace_root", membership: "inside" } } : {}),
       expectation: { verdict: Object.keys(expectationChecks).length > 0 ? "matched" : "not_provided", checks: expectationChecks },
-      resource,
+      resource: resourceWithDelivery,
       provenance: observations
     };
   } catch (error) {
@@ -565,7 +940,12 @@ const EvidenceArtifactBaseShape = {
   sha256: z.string().regex(/^[a-f\d]{64}$/i),
   size_bytes: z.number().int().nonnegative(),
   media_type: z.string(),
-  detected_media_type: z.string().optional()
+  media_type_source: z.enum(["content_type", "magic_sniff", "file_extension", "octet_stream"]),
+  detected_media_type: z.string().optional(),
+  must_release: z.literal(true),
+  preview_text: z.string().optional(),
+  preview_bytes: z.number().int().nonnegative().optional(),
+  preview_complete: z.literal(true).optional()
 };
 const EvidenceResourceUriSchema = z.string().regex(/^yfy:\/\/evidence\/[a-f0-9]{48}$/);
 const EvidenceManifestUriSchema = z.string().regex(/^yfy:\/\/evidence\/[a-f0-9]{48}\/manifest$/);
@@ -579,7 +959,51 @@ const ExpectationSchema = z.object({
   checks: z.record(z.boolean())
 });
 
+const ContentDeliverySchema = z.discriminatedUnion("mode", [
+  z.object({
+    mode: z.literal("inline_preview"),
+    resource_fetch_required: z.literal(false),
+    embedded_resource_in_tool_result: z.literal(true),
+    host_auto_fetch_not_guaranteed: z.literal(true),
+    still_must_release: z.literal(true),
+    next_step: z.string(),
+    preview_kind: z.string(),
+    preview_bytes: z.number().int().nonnegative(),
+    preview_complete: z.literal(true),
+    preview_charset: z.literal("utf-8")
+  }).strict(),
+  z.object({
+    mode: z.literal("resource_link_only"),
+    resource_fetch_required: z.literal(true),
+    embedded_resource_in_tool_result: z.literal(false),
+    host_auto_fetch_not_guaranteed: z.literal(true),
+    still_must_release: z.literal(true),
+    next_step: z.string(),
+    reason: z.enum(["preview_unavailable_use_resource_link", "preview_disabled_by_request"])
+  }).strict(),
+  z.object({
+    mode: z.literal("multipart_manifest_only"),
+    resource_fetch_required: z.literal(true),
+    embedded_resource_in_tool_result: z.literal(false),
+    host_auto_fetch_not_guaranteed: z.literal(true),
+    still_must_release: z.literal(true),
+    next_step: z.string(),
+    reason: z.literal("multipart_resources_never_inline")
+  }).strict(),
+  z.object({
+    mode: z.literal("binary_no_preview"),
+    resource_fetch_required: z.literal(true),
+    embedded_resource_in_tool_result: z.literal(false),
+    host_auto_fetch_not_guaranteed: z.literal(true),
+    still_must_release: z.literal(true),
+    next_step: z.string(),
+    reason: z.literal("binary_or_non_previewable_media_type")
+  }).strict()
+]);
+
 const ContentResultSchema = z.object({
+  must_release: z.literal(true),
+  content_delivery: ContentDeliverySchema,
   file: ItemSchema.extend({ ref: FileRefSchema }),
   version: FileVersionSchema.extend({ ref: VersionRefSchema.optional() }),
   selection: VersionSelectionProofSchema,
@@ -656,14 +1080,15 @@ function registerArtifactTools(server: McpServer, runtime: AppRuntime): void {
 function registerOpenTool(server: McpServer, runtime: AppRuntime): void {
   registerTool(server, "yfy_open", {
     title: "Open Yifangyun File Content",
-    description: "Open verified current or historical file bytes. Omit version for current content; copy a historical version ref from yfy_versions when needed. Always release the returned resource after use.",
-    inputSchema: { file: FileRefSchema, version: VersionRefSchema.optional() },
+    description: "Open verified current or historical file bytes. Omit version for current content; copy a historical version ref from yfy_versions when needed. include_text_preview defaults true and may add a standard embedded MCP text resource. Inspect content_delivery and always release the returned resource.",
+    inputSchema: { file: FileRefSchema, version: VersionRefSchema.optional(), include_text_preview: z.boolean().default(true) },
     outputSchema: ContentResultSchema
-  }, { readOnly: true, idempotent: false, onInvalidOutput: (result) => rollbackResource(runtime, result) }, async ({ file, version }, extra) => {
+  }, { readOnly: true, idempotent: false, onInvalidOutput: (result) => rollbackResource(runtime, result) }, async ({ file, version, include_text_preview }, extra) => {
     const fileRef = String(file);
     const selector = selectorFor(fileRef, version);
     return captureVersionContent(runtime, {
       fileRef,
+      includeTextPreview: include_text_preview !== false,
       onProgress: progressReporter(extra),
       selector,
       signal: extra.signal
@@ -674,11 +1099,12 @@ function registerOpenTool(server: McpServer, runtime: AppRuntime): void {
 function registerEvidenceTools(server: McpServer, runtime: AppRuntime): void {
   registerTool(server, "yfy_capture", {
     title: "Capture Yifangyun Workspace Content",
-    description: "Capture verified current or historical bytes inside a configured workspace. Workspace membership is checked before and after download. Always release the returned resource after use.",
+    description: "Capture verified current or historical bytes inside a configured workspace. Membership is checked before and after download. include_text_preview defaults true and may add a standard embedded MCP text resource. Inspect content_delivery and always release the returned resource.",
     inputSchema: {
       workspace: WorkspaceRefSchema,
       file: FileRefSchema,
       version: VersionRefSchema.optional(),
+      include_text_preview: z.boolean().default(true),
       expected: z.object({
         sha1: z.string().trim().regex(/^[a-f\d]{40}$/i).optional(),
         sha256: z.string().trim().regex(/^[a-f\d]{64}$/i).optional(),
@@ -702,6 +1128,7 @@ function registerEvidenceTools(server: McpServer, runtime: AppRuntime): void {
     return captureVersionContent(runtime, {
       expected,
       fileRef,
+      includeTextPreview: args.include_text_preview !== false,
       onProgress: progressReporter(extra),
       selector,
       signal: extra.signal,

@@ -1,6 +1,6 @@
-# OpenAPI 覆盖矩阵
+﻿# OpenAPI 覆盖矩阵
 
-beta.7 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Drive、Workspace、Inventory、Content 和 Organization Module 内。所有项目工具使用 context-bound Ref，分页工具统一使用严格的 first request/continuation 契约。
+beta.8 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Drive、Workspace、Inventory、Content 和 Organization Module 内。所有项目工具使用 context-bound Ref，分页工具统一使用严格的 first request/continuation 契约。
 
 ## Drive
 
@@ -20,8 +20,8 @@ beta.7 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Driv
 |---|---|---|
 | folder/department ancestry | `yfy_workspace_validate` | 组合覆盖，检查为 pass/fail/unavailable |
 | file path membership | `yfy_membership_check` | 组合覆盖，结果为 inside/outside/unavailable |
-| recursive complete observation | `yfy_inventory_*` | SQLite schema 4 后台覆盖，支持 refresh、固定 commit watermark 和显式 release |
-| validated current/historical bytes | `yfy_capture` | Workspace-bound 组合覆盖 |
+| recursive complete observation | `yfy_inventory_*` | SQLite schema 5 后台覆盖，分离 Workspace root/scan root，支持 refresh、固定 commit watermark 和显式 release |
+| validated current/historical bytes | `yfy_open`、`yfy_capture` | Workspace-bound 组合覆盖；小文本可按 MCP embedded resource 交付 |
 | expected metadata/content assertions | `yfy_capture.expected` | mismatch 为错误并回滚 |
 | resource lifecycle | `yfy_resource_release` | 单体和 multipart 均覆盖 |
 | inventory artifact lifecycle | `yfy_inventory_release` | Inventory、cursor、manifest 和 receipt 一并失效 |
