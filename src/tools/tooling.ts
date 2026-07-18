@@ -16,6 +16,7 @@ type ToolExtra = {
 type ToolHandler = (args: Record<string, unknown>, extra: ToolExtra) => Promise<Record<string, unknown>>;
 
 export interface ToolDefinition {
+  continuationFixedKeys?: readonly string[];
   description: string;
   inputSchema: z.ZodRawShape;
   inputValidator?: z.ZodTypeAny;
@@ -165,6 +166,9 @@ export function registerTool(
     outputSchema: protocolJsonSchema(outputValidator, true),
     title: definition.title
   });
+  // tools/list uses inputValidator when present (strict first-page | cursor union).
+  // SDK registration keeps a discoverable flat shape for hosts that only surface property names;
+  // runtime always re-validates with inputValidator so list contract and execution stay aligned.
   sdkRegisterTool(name, {
     title: definition.title,
     description: definition.description,
@@ -179,11 +183,23 @@ export function registerTool(
       if (definition.inputValidator) {
         const parsed = definition.inputValidator.safeParse(args);
         if (!parsed.success) {
+          const hasCursor = typeof (args as { cursor?: unknown }).cursor === "string" && String((args as { cursor?: unknown }).cursor).trim().length > 0;
+          const continuationFixedKeys = new Set(definition.continuationFixedKeys ?? []);
+          const mixedKeys = Object.entries(args as Record<string, unknown>)
+            .filter(([key, value]) => value !== undefined && key !== "cursor" && !continuationFixedKeys.has(key))
+            .map(([key]) => key);
           throw new YifangyunError("Tool input is invalid.", {
             code: "YFY_INPUT_INVALID",
             phase: `${name}_input`,
-            agentDetails: { issues: parsed.error.issues.map((issue) => ({ code: issue.code, path: issue.path.join(".") })) },
-            suggestedAction: "Use the fields shown by tools/list. For pagination, pass first-page business fields or execute next_action with cursor exactly."
+            agentDetails: {
+              issues: parsed.error.issues.map((issue) => ({ code: issue.code, path: issue.path.join(".") })),
+              ...(hasCursor && mixedKeys.length > 0
+                ? { reason: "pagination_mixed_args", unexpected_keys: mixedKeys }
+                : {})
+            },
+            suggestedAction: hasCursor
+              ? "Continuation: pass only cursor plus the fixed fields returned by next_action. Do not mix first-page fields with cursor. Or restart with first-page fields and omit cursor."
+              : "Use the fields shown by tools/list. For pagination, pass first-page business fields or execute next_action with cursor exactly."
           });
         }
         validatedArgs = parsed.data as Record<string, unknown>;

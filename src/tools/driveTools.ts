@@ -313,7 +313,7 @@ function recommendedWorkflows(runtime: AppRuntime): JsonObject[] {
     },
     {
       id: "transfer_url_only",
-      when: "User/integration explicitly needs a short-lived Provider URL",
+      when: "Special integration only: short-lived Provider URL (never for evidence or ordinary reads)",
       steps: ["yfy_transfer_ticket_get", "do_not_echo_url; not_for_evidence; prefer yfy_open/yfy_capture otherwise"],
       enabled: transfer
     }

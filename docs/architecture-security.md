@@ -61,7 +61,7 @@ SQLite 表：
 - `snapshot_items_fts_map`
 - `snapshot_storage`
 
-schema version 为 5。启用 WAL、外键、事务、incremental auto-vacuum 和 busy timeout。`snapshot_items` 直接保存 item digest、commit sequence、原始/规范化 name/path 和稳定排序键，同时承担全局判重；不再维护重复的 `snapshot_seen_items` 或整页 artifact JSON。`snapshot_frontier` 将 FIFO cursor 独立持久化，避免宽树每页重写完整 state JSON；`snapshot_items_fts` 与映射表为 trigram 子串搜索提供索引；`snapshot_storage` 记录逻辑占用，运行时另统计数据库和 WAL 物理字节。schema 5 state 明确区分 `workspaceRootFolderId` 与 `rootFolderId`（scan root）。
+SQLite 启用 WAL、外键、事务、incremental auto-vacuum 和 busy timeout。`snapshot_items` 直接保存 item digest、commit sequence、原始/规范化 name/path 和稳定排序键，同时承担全局判重；不再维护重复的 `snapshot_seen_items` 或整页 artifact JSON。`snapshot_frontier` 将 FIFO cursor 独立持久化，避免宽树每页重写完整 state JSON；`snapshot_items_fts` 与映射表为 trigram 子串搜索提供索引；`snapshot_storage` 记录逻辑占用，运行时另统计数据库和 WAL 物理字节。状态明确区分 `workspaceRootFolderId` 与 `rootFolderId`（scan root）。
 
 每个 Provider page receipt、item 索引、frontier 变化和 state checkpoint 在同一事务中提交。提交时递增 `commit_watermark`，查询只读取 `commit_seq <= watermark` 的 item。cursor 保存首次查询水位、查询规格哈希、Workspace fingerprint 和签名，所以后台扫描继续提交时，已开始的分页仍保持稳定；新的 first request 才观察更新后的水位。可选 `root_folder` 将扫描根限制为 Workspace 内已验证子树；create/get/search/manifest 使用同一范围投影，摘要暴露 `scan_root`、`agent_guidance` 与运行中 `suggested_wait_ms`。普通和 Inventory cursor 错误只在 `error.diagnostics.reason` 返回稳定枚举，不回传解码碎片。
 

@@ -3,18 +3,19 @@ import { YifangyunError } from "../client.js";
 import type { JsonObject } from "../types.js";
 import { decodeCanonicalBase64Url } from "./base64url.js";
 import { z } from "zod";
+import { CURSOR_ENVELOPE_VERSION } from "../version.js";
 
 export interface CursorEnvelope<T extends JsonObject = JsonObject> {
   config_fingerprint: string;
   operation: string;
   payload: T;
-  version: 2;
+  version: typeof CURSOR_ENVELOPE_VERSION;
 }
 
 export type CursorInvalidReason = "envelope_invalid" | "signature_invalid" | "payload_invalid" | "not_base64url";
 
 export function encodeCursor<T extends JsonObject>(secret: string, configFingerprint: string, operation: string, payload: T): string {
-  const envelope: CursorEnvelope<T> = { config_fingerprint: configFingerprint, operation, payload, version: 2 };
+  const envelope: CursorEnvelope<T> = { config_fingerprint: configFingerprint, operation, payload, version: CURSOR_ENVELOPE_VERSION };
   const serialized = JSON.stringify(envelope);
   const signature = crypto.createHmac("sha256", secret).update(serialized).digest("hex");
   return Buffer.from(JSON.stringify({ ...envelope, signature }), "utf8").toString("base64url");
@@ -39,7 +40,7 @@ export function decodeCursor<T extends z.ZodTypeAny>(secret: string, configFinge
       throw new Error("envelope_invalid");
     }
 
-    if (decoded.version !== 2 || decoded.config_fingerprint !== configFingerprint || decoded.operation !== operation || typeof decoded.signature !== "string" || typeof decoded.payload !== "object" || decoded.payload === null) {
+    if (decoded.version !== CURSOR_ENVELOPE_VERSION || decoded.config_fingerprint !== configFingerprint || decoded.operation !== operation || typeof decoded.signature !== "string" || typeof decoded.payload !== "object" || decoded.payload === null) {
       reason = "envelope_invalid";
       throw new Error("envelope_invalid");
     }

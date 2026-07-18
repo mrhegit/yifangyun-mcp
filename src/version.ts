@@ -1,5 +1,10 @@
 export const SERVER_NAME = "yifangyun-mcp-server";
-export const SERVER_VERSION = "1.0.0-beta.9";
-export const CONTRACT_VERSION = 4;
+export const SERVER_VERSION = "1.0.0-beta.10";
+export const CONTRACT_VERSION = 1;
+export const CURSOR_ENVELOPE_VERSION = 1;
+export const INVENTORY_CURSOR_VERSION = 1;
+export const INVENTORY_REF_VERSION = 1;
+export const SNAPSHOT_SCHEMA_VERSION = 1;
+export const WORKSPACE_FINGERPRINT_VERSION = 1;
 export const BUILD_ID = process.env.YFY_BUILD_ID?.trim() || "development";
 export const BUILD_COMMIT = process.env.YFY_BUILD_COMMIT?.trim() || "unknown";

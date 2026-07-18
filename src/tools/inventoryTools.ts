@@ -11,15 +11,19 @@ import type { ResolvedScope } from "../runtime/access.js";
 import { projectInventoryReceipt } from "../scan/projectors.js";
 import type { ScopeItemCursor, ScopeScanState } from "../scan/types.js";
 import type { JsonObject } from "../types.js";
+import { INVENTORY_CURSOR_VERSION, INVENTORY_REF_VERSION, WORKSPACE_FINGERPRINT_VERSION } from "../version.js";
 import { continuationAction, pageOutput, paginatedInputSchemaWithFixed, resolvePaginationArgs } from "./pagination.js";
 import { FolderRefSchema, NextActionSchema, SimplePageSchema, WorkspaceRefSchema } from "./schemas.js";
 import { registerTool } from "./tooling.js";
 import { workspaceMembershipProof } from "./workspaceContentTools.js";
 
 const InventoryStatusSchema = z.enum(["running", "retry_wait", "complete", "partial", "cancelled", "failed"]);
-/** Encrypted, authenticated inventory reference. */
-const InventoryRefSchema = z.string().regex(/^inventory:[A-Za-z0-9_-]+$/).describe("Copy the opaque inventory ref returned by this server. inventory_id is display-only and is not accepted.");
+/** Stable MAC-bound inventory reference: inventory:<uuid>@<access_context>.<mac24>. */
+const InventoryRefSchema = z.string()
+  .regex(/^inventory:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}@[A-Za-z0-9_-]+\.[a-f0-9]{24}$/i)
+  .describe("Copy the inventory ref returned by this server (stable across create/get/search). Bare inventory_id is not accepted.");
 const InventoryHandleSchema = InventoryRefSchema;
+const INVENTORY_REF_MAC_PATTERN = /^inventory:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})@([A-Za-z0-9_-]+)\.([a-f0-9]{24})$/i;
 const DEFAULT_INVENTORY_PAGE_SIZE = 25;
 const CompletenessSchema = z.object({
   pagination_complete: z.boolean(),
@@ -86,61 +90,63 @@ const InventorySearchInputSchema = paginatedInputSchemaWithFixed(
 );
 
 const CursorSchema = z.object({
-  item_id: z.string().min(1), item_type: z.enum(["file", "folder", "all"]), mode: z.enum(["search", "list"]), page_limit: z.number().int().min(1).max(100), query: z.string().optional(), match_fields: z.array(z.enum(["name", "path"])).min(1).max(2), case_sensitive: z.boolean(), query_spec_hash: z.string().regex(/^[a-f0-9]{64}$/), signature: z.string().regex(/^[a-f0-9]{64}$/), inventory_id: z.string().uuid(), workspace_fingerprint: z.string().regex(/^[a-f0-9]{64}$/), sort_path: z.string(), total: z.number().int().nonnegative(), watermark: z.number().int().nonnegative(), version: z.literal(3)
+  item_id: z.string().min(1), item_type: z.enum(["file", "folder", "all"]), mode: z.enum(["search", "list"]), page_limit: z.number().int().min(1).max(100), query: z.string().optional(), match_fields: z.array(z.enum(["name", "path"])).min(1).max(2), case_sensitive: z.boolean(), query_spec_hash: z.string().regex(/^[a-f0-9]{64}$/), signature: z.string().regex(/^[a-f0-9]{64}$/), inventory_id: z.string().uuid(), workspace_fingerprint: z.string().regex(/^[a-f0-9]{64}$/), sort_path: z.string(), total: z.number().int().nonnegative(), watermark: z.number().int().nonnegative(), version: z.literal(INVENTORY_CURSOR_VERSION)
 }).strict();
-const CursorEnvelopeSchema = z.object({ signature: z.string().regex(/^[a-f0-9]{64}$/), version: z.literal(3) }).passthrough();
+const CursorEnvelopeSchema = z.object({ signature: z.string().regex(/^[a-f0-9]{64}$/), version: z.literal(INVENTORY_CURSOR_VERSION) }).passthrough();
 
 function signature(secret: string, value: unknown): string {
   return crypto.createHmac("sha256", secret).update(JSON.stringify(value)).digest("hex");
 }
 
 function workspaceFingerprint(state: { contextId: string; identityRef: string; scanRootFolderId: string; workspaceId: string; workspaceRootFolderId: string }, secret: string): string {
-  return signature(secret, { access_context: state.contextId, identity_ref: state.identityRef, scan_root_folder_id: state.scanRootFolderId, workspace_id: state.workspaceId, workspace_root_folder_id: state.workspaceRootFolderId, version: 3 });
+  return signature(secret, { access_context: state.contextId, identity_ref: state.identityRef, scan_root_folder_id: state.scanRootFolderId, workspace_id: state.workspaceId, workspace_root_folder_id: state.workspaceRootFolderId, version: WORKSPACE_FINGERPRINT_VERSION });
 }
 
 interface InventoryRefPayload {
   accessContext: string;
   handle: string;
   inventoryId: string;
-  workspaceFingerprint: string;
 }
 
-const INVENTORY_REF_AAD = Buffer.from("yifangyun-inventory-ref-v4", "utf8");
-const InventoryRefPayloadSchema = z.object({ access_context: z.string(), inventory_id: z.string().uuid(), version: z.literal(4), workspace_fingerprint: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
-
-function inventoryRefKey(secret: string): Buffer {
-  return crypto.createHash("sha256").update(`inventory-ref:${secret}`).digest();
+function inventoryRefMac(secret: string, inventoryId: string, accessContext: string): string {
+  return crypto.createHmac("sha256", secret)
+    .update(`inventory-ref-v${INVENTORY_REF_VERSION}\n${inventoryId}\n${accessContext}`)
+    .digest("hex")
+    .slice(0, 24);
 }
 
-function inventoryRef(runtime: AppRuntime, state: ScopeScanState): string {
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", inventoryRefKey(runtime.config.clientSecret), iv);
-  cipher.setAAD(INVENTORY_REF_AAD);
-  const plaintext = Buffer.from(JSON.stringify({ access_context: state.accessContextId, inventory_id: state.scanId, version: 4, workspace_fingerprint: state.workspaceFingerprint }), "utf8");
-  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-  return `inventory:${Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString("base64url")}`;
+function inventoryRef(_runtime: AppRuntime, state: ScopeScanState): string {
+  const mac = inventoryRefMac(_runtime.config.clientSecret, state.scanId, state.accessContextId);
+  return `inventory:${state.scanId}@${state.accessContextId}.${mac}`;
 }
 
-function parseInventoryRef(runtime: AppRuntime, raw: string): InventoryRefPayload {
-  const token = decodeCanonicalBase64Url(raw.slice("inventory:".length));
-  if (token.length <= 28) throw new Error("inventory token is too short");
-  const decipher = crypto.createDecipheriv("aes-256-gcm", inventoryRefKey(runtime.config.clientSecret), token.subarray(0, 12));
-  decipher.setAAD(INVENTORY_REF_AAD);
-  decipher.setAuthTag(token.subarray(12, 28));
-  const parsed = InventoryRefPayloadSchema.parse(JSON.parse(Buffer.concat([decipher.update(token.subarray(28)), decipher.final()]).toString("utf8")));
-  return { accessContext: parsed.access_context, handle: raw, inventoryId: parsed.inventory_id, workspaceFingerprint: parsed.workspace_fingerprint };
+function parseInventoryRefParts(raw: string): { accessContext: string; inventoryId: string; mac: string } {
+  const match = INVENTORY_REF_MAC_PATTERN.exec(raw.trim());
+  if (!match) throw new Error("inventory ref format is invalid");
+  return {
+    inventoryId: match[1]!.toLowerCase(),
+    accessContext: match[2]!,
+    mac: match[3]!.toLowerCase()
+  };
 }
 
 function resolveInventoryHandle(runtime: AppRuntime, value: unknown): InventoryRefPayload {
   const raw = String(value).trim();
+  let parts: { accessContext: string; inventoryId: string; mac: string };
   try {
-    if (raw.startsWith("inventory:")) return parseInventoryRef(runtime, raw);
-  } catch {}
-  throw new YifangyunError("Inventory reference is invalid.", {
-    code: "YFY_INPUT_INVALID",
-    phase: "inventory_reference",
-    suggestedAction: "Copy the opaque inventory ref returned by yfy_inventory_create/get/search. inventory_id is display-only."
-  });
+    parts = parseInventoryRefParts(raw);
+  } catch {
+    throw new YifangyunError("Inventory reference is invalid.", {
+      code: "YFY_INPUT_INVALID",
+      phase: "inventory_reference",
+      suggestedAction: "Copy the inventory ref returned by yfy_inventory_create/get/search exactly. Bare inventory_id is not accepted."
+    });
+  }
+  return {
+    accessContext: parts.accessContext,
+    handle: raw,
+    inventoryId: parts.inventoryId
+  };
 }
 
 function querySpec(value: { caseSensitive: boolean; itemType: string; limit: number; matchFields: string[]; mode: string; query?: string }) {
@@ -196,13 +202,26 @@ function decodeCursor(value: unknown, ref: { inventoryId: string; workspaceFinge
 
 function encodeInventoryCursor(input: { caseSensitive: boolean; cursor: ScopeItemCursor; inventoryId: string; itemType: "file" | "folder" | "all"; limit: number; matchFields: Array<"name" | "path">; mode: "search" | "list"; query?: string; workspaceFingerprint: string }, secret: string): string {
   const spec = querySpec(input);
-  const payload = { item_id: input.cursor.itemId, item_type: input.itemType, mode: input.mode, page_limit: input.limit, ...(input.query ? { query: input.query } : {}), match_fields: input.matchFields, case_sensitive: input.caseSensitive, query_spec_hash: signature(secret, spec), inventory_id: input.inventoryId, workspace_fingerprint: input.workspaceFingerprint, sort_path: input.cursor.sortPath, total: input.cursor.total, watermark: input.cursor.watermark, version: 3 as const };
+  const payload = { item_id: input.cursor.itemId, item_type: input.itemType, mode: input.mode, page_limit: input.limit, ...(input.query ? { query: input.query } : {}), match_fields: input.matchFields, case_sensitive: input.caseSensitive, query_spec_hash: signature(secret, spec), inventory_id: input.inventoryId, workspace_fingerprint: input.workspaceFingerprint, sort_path: input.cursor.sortPath, total: input.cursor.total, watermark: input.cursor.watermark, version: INVENTORY_CURSOR_VERSION };
   return Buffer.from(JSON.stringify({ ...payload, signature: signature(secret, payload) }), "utf8").toString("base64url");
 }
 
-async function stateForRef(runtime: AppRuntime, ref: { accessContext: string; inventoryId: string; workspaceFingerprint: string }) {
+async function stateForRef(runtime: AppRuntime, ref: { accessContext: string; handle: string; inventoryId: string }) {
+  const parts = parseInventoryRefParts(ref.handle);
+  const expectedMac = inventoryRefMac(runtime.config.clientSecret, parts.inventoryId, parts.accessContext);
+  const presented = Buffer.from(parts.mac, "utf8");
+  const expected = Buffer.from(expectedMac, "utf8");
+  if (presented.length !== expected.length || !crypto.timingSafeEqual(presented, expected)) {
+    throw new YifangyunError("Inventory reference is invalid.", {
+      code: "YFY_INPUT_INVALID",
+      phase: "inventory_reference",
+      suggestedAction: "Copy the inventory ref returned by yfy_inventory_create/get/search exactly. Refs are bound to the server secret, Inventory ID and Access Context."
+    });
+  }
   const state = await runtime.snapshots.get(ref.inventoryId, ref.accessContext);
-  if (state.workspaceFingerprint !== ref.workspaceFingerprint) throw new YifangyunError("Inventory reference belongs to a different workspace identity.", { code: "YFY_INVENTORY_ACCESS_DENIED", phase: "inventory_access", scanId: state.scanId });
+  if (state.accessContextId !== parts.accessContext || state.scanId !== parts.inventoryId) {
+    throw new YifangyunError("Inventory reference belongs to a different workspace identity.", { code: "YFY_INVENTORY_ACCESS_DENIED", phase: "inventory_access", scanId: state.scanId });
+  }
   assertCurrentWorkspaceState(runtime, state);
   return state;
 }
@@ -510,7 +529,7 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
 
   registerTool(server, "yfy_inventory_get", {
     title: "Get Yifangyun Workspace Inventory",
-    description: "Read inventory identity, progress, diagnostics, retention and completeness. Copy the opaque inventory ref returned by this server.",
+    description: "Read inventory identity, progress, diagnostics, retention and completeness. Copy the inventory ref returned by this server (stable for the same inventory).",
     inputSchema: { inventory: InventoryHandleSchema },
     outputSchema: InventorySummaryShape
   }, { readOnly: true, openWorld: false }, async ({ inventory }) => {
@@ -520,7 +539,8 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
 
   registerTool(server, "yfy_inventory_search", {
     title: "Search Yifangyun Workspace Inventory",
-    description: "WHEN: search fixed inventory watermark. DO NOT: treat empty items as absence unless empty_result_meaning supports it and may_claim_absence=true. EXAMPLE: {\"inventory\":\"inventory:<uuid>\",\"query\":\"投标函\",\"kind\":\"file\"}",
+    description: "WHEN: search fixed inventory watermark. DO NOT: treat empty items as absence unless empty_result_meaning supports it and may_claim_absence=true. EXAMPLE: {\"inventory\":\"inventory:<uuid>@default.<mac>\",\"query\":\"投标函\",\"kind\":\"file\"}",
+    continuationFixedKeys: ["inventory"],
     inputSchema: InventorySearchInputSchema.inputSchema,
     inputValidator: InventorySearchInputSchema.validator,
     outputSchema: {
@@ -540,11 +560,13 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
     const pageArgs = resolvePaginationArgs(args, "inventory_search", { fixedKeys: ["inventory"] });
     const inventoryValue = String(pageArgs.kind === "continuation" ? pageArgs.fixed.inventory : (pageArgs.data as { inventory: string }).inventory);
     const ref = resolveInventoryHandle(runtime, inventoryValue);
-    await stateForRef(runtime, ref);
+    const loaded = await stateForRef(runtime, ref);
     const first = pageArgs.kind === "first" ? pageArgs.data as {
       inventory: string; query?: string; kind: "file" | "folder" | "all"; match_fields: Array<"name" | "path">; case_sensitive: boolean; limit: number;
     } : undefined;
-    const continued = pageArgs.kind === "continuation" ? decodeCursor(pageArgs.cursor, ref, runtime.config.clientSecret) : undefined;
+    const continued = pageArgs.kind === "continuation"
+      ? decodeCursor(pageArgs.cursor, { inventoryId: ref.inventoryId, workspaceFingerprint: loaded.workspaceFingerprint }, runtime.config.clientSecret)
+      : undefined;
     const query = continued?.query ?? first?.query;
     const mode = continued?.mode ?? (query ? "search" as const : "list" as const);
     const itemType = continued?.itemType ?? first?.kind ?? "all";
@@ -552,7 +574,7 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
     const matchFields = continued?.matchFields ?? first?.match_fields ?? ["name", "path"];
     const caseSensitive = continued?.caseSensitive ?? first?.case_sensitive === true;
     const result = await runtime.snapshots.query({ accessContextId: ref.accessContext, cursor: continued?.cursor, limit, mode, queries: query ? [query] : undefined, matchFields, caseSensitive, scanId: ref.inventoryId, type: itemType });
-    const nextCursor = result.nextCursor ? encodeInventoryCursor({ caseSensitive, cursor: result.nextCursor, inventoryId: ref.inventoryId, itemType, limit, matchFields, mode, query, workspaceFingerprint: ref.workspaceFingerprint }, runtime.config.clientSecret) : undefined;
+    const nextCursor = result.nextCursor ? encodeInventoryCursor({ caseSensitive, cursor: result.nextCursor, inventoryId: ref.inventoryId, itemType, limit, matchFields, mode, query, workspaceFingerprint: result.state.workspaceFingerprint }, runtime.config.clientSecret) : undefined;
     const items = result.items.map((item) => typeof item.id === "string" && (item.type === "file" || item.type === "folder") ? { ...item, ref: formatItemRef(item.type, item.id, result.state.accessContextId, result.state.accessIdentityRef) } : item);
     const refValue = inventoryRef(runtime, result.state);
     const next = continuationAction("yfy_inventory_search", nextCursor, { inventory: refValue });

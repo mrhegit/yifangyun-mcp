@@ -54,7 +54,7 @@ export function parseItemRef(value: string): ItemRef {
     throw new YifangyunError("Item reference is invalid.", {
       code: "YFY_INPUT_INVALID",
       phase: "item_reference",
-      suggestedAction: "Copy the complete context-bound item ref returned by this server. beta.6 numeric refs are not accepted."
+      suggestedAction: "Copy the complete context-bound item ref returned by this server. Legacy numeric IDs are not accepted."
     });
   }
   return { type: match[1] as ItemRef["type"], id: match[2]!, accessContextId: match[3]!, identityRef: match[4]! };

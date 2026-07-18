@@ -1,6 +1,6 @@
 ﻿# OpenAPI 覆盖矩阵
 
-beta.9 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Drive、Workspace、Inventory、Content 和 Organization Module 内。所有项目工具使用 context-bound Ref，分页工具统一使用扁平 first 字段 / `cursor` 续页契约（见 `docs/migration-v1.md`）。
+beta.10 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Drive、Workspace、Inventory、Content 和 Organization Module 内。所有项目工具使用 context-bound Ref，分页工具统一使用扁平 first 字段 / `cursor` 续页契约（见 `docs/migration-v1.md`）。当前服务器不包含 PDF/Office 正文解析、OCR 或 Provider 知识库训练/召回；知识库能力需要独立授权与状态工作流，不属于当前工具集。
 
 ## Drive
 
@@ -20,7 +20,7 @@ beta.9 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Driv
 |---|---|---|
 | folder/department ancestry | `yfy_workspace_validate` | 组合覆盖，检查为 pass/fail/unavailable |
 | file path membership | `yfy_membership_check` | 组合覆盖，结果为 inside/outside/unavailable |
-| recursive complete observation | `yfy_inventory_*` | SQLite schema 5 后台覆盖，分离 Workspace root/scan root，支持 refresh、固定 commit watermark 和显式 release |
+| recursive complete observation | `yfy_inventory_*` | SQLite 后台覆盖，分离 Workspace root/scan root，支持 refresh、固定 commit watermark 和显式 release |
 | validated current/historical bytes | `yfy_open`、`yfy_capture` | Workspace-bound 组合覆盖；小文本可按 MCP embedded resource 交付 |
 | expected metadata/content assertions | `yfy_capture.expected` | mismatch 为错误并回滚 |
 | resource lifecycle | `yfy_resource_release` | 单体和 multipart 均覆盖 |

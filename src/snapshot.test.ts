@@ -11,6 +11,7 @@ import { SnapshotService } from "./scan/service.js";
 import { SqliteScopeScanStore } from "./scan/store.js";
 import type { ScopeScanPage, ScopeScanPolicy, ScopeScanProvider } from "./scan/types.js";
 import type { ApiResponseMeta, AppConfig } from "./types.js";
+import { SNAPSHOT_SCHEMA_VERSION } from "./version.js";
 
 function meta(endpoint: string): ApiResponseMeta {
   return { endpoint, fetchedAtIso: new Date().toISOString(), fetchedAtUnix: Math.floor(Date.now() / 1000), sourceApiVersion: "v2", statusCode: 200 };
@@ -316,11 +317,26 @@ test("SQLite snapshot resumes after repository restart", async () => {
   }
 });
 
+test("snapshot store initializes the current schema version", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-snapshot-schema-current-"));
+  const databasePath = path.join(dir, "state.sqlite");
+  const store = new SqliteScopeScanStore(databasePath, 3600, 10_000_000);
+  store.close();
+  const database = new DatabaseSync(databasePath);
+  const row = database.prepare("PRAGMA user_version").get() as { user_version?: unknown };
+  database.close();
+  try {
+    assert.equal(Number(row.user_version), SNAPSHOT_SCHEMA_VERSION);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
 test("snapshot store rejects a database with a different schema version", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-snapshot-schema-"));
   const databasePath = path.join(dir, "state.sqlite");
   const old = new DatabaseSync(databasePath);
-  old.exec("CREATE TABLE snapshots(scan_id TEXT PRIMARY KEY)");
+  old.exec("CREATE TABLE snapshots(scan_id TEXT PRIMARY KEY); PRAGMA user_version=5");
   old.close();
   try {
     assert.throws(() => new SqliteScopeScanStore(databasePath, 3600, 10_000_000), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_STATE_SCHEMA_MISMATCH"));

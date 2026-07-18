@@ -1,6 +1,6 @@
 # 配置指南
 
-beta.9 默认只启用轻量 Drive 平面。Workspace、Inventory、Capture、Organization 和写入能力都必须显式开启。
+beta.10 默认只启用轻量 Drive 平面。Workspace、Inventory、Capture、Organization 和写入能力都必须显式开启。`transfer` 不进 Tender 默认矩阵。
 
 服务只读取当前进程环境变量，不会自动加载项目目录中的 `.env`。本地运行可使用 `node --env-file=.env dist/index.js`；MCP Host、容器和进程管理器应通过各自的 env 配置注入。运行后以 `yfy_status.runtime` 和 `capabilities` 为实际生效值。
 
@@ -105,7 +105,7 @@ Workspace 不会授予 Provider 权限。启动后使用 `yfy_workspace_validate
 
 普通位置引用为 `workspace:<id>`。Workspace、Inventory 和 Capture 工具也只接受该完整 Ref，不接受裸 `id`。Drive 工具可从该位置开始，但只有 Workspace/Inventory/Capture 工具提供范围保证。
 
-Workspace 的 `root_folder_id`、`access_context` 或身份配置变化后，旧 ItemRef、Inventory Ref 和 Inventory cursor 不应继续使用。Inventory 会持久化创建时的配置 Workspace 根和实际 scan root；当前配置根不匹配时返回 `YFY_INVENTORY_STALE`，不会动态重解释旧扫描。`inventory` 是由 `YFY_CLIENT_SECRET` 加密认证的 opaque Ref，可跨服务重启使用；更换 secret 后必须重新创建或复用 Inventory 以取得新 Ref。调用 `yfy_status` 获取新的 PlaceRef，并从 Browse、Resolve、Search 或 Inventory 结果重新发现项目。
+Workspace 的 `root_folder_id`、`access_context` 或身份配置变化后，旧 ItemRef、Inventory Ref 和 Inventory cursor 不应继续使用。Inventory 会持久化创建时的配置 Workspace 根和实际 scan root；当前配置根不匹配时返回 `YFY_INVENTORY_STALE`，不会动态重解释旧扫描。`inventory` 为稳定 MAC 句柄（`inventory:<uuid>@<access_context>.<mac24>`），MAC 绑定 `YFY_CLIENT_SECRET`、Inventory ID 和 Access Context，状态访问时再复核 workspace fingerprint；同一 inventory 多次返回相同字符串。更换 secret 后必须重新创建 Inventory 以取得新 Ref。调用 `yfy_status` 获取新的 PlaceRef，并从 Browse、Resolve、Search 或 Inventory 结果重新发现项目。
 
 ## Inventory
 
@@ -118,7 +118,7 @@ Workspace 的 `root_folder_id`、`access_context` 或身份配置变化后，旧
 
 保留期决定本地状态何时可清理；`yfy_inventory_create.refresh.max_age_seconds` 决定本次调用是否接受复用。两者是独立概念：TTL 长并不表示观察仍足够新，freshness 短也不会立即删除旧状态。
 
-beta.9 SQLite schema 仍为 5，用于持久化配置 Workspace 根与 scan root 的独立身份，并与 beta.8 状态库兼容。`0.4.0`、beta.7 及更早状态库会返回 `YFY_STATE_SCHEMA_MISMATCH`，不会自动迁移、覆盖或删除；这些版本升级时必须停止旧进程并配置新的空 `YFY_STATE_DB`。工具契约破坏性变更见 `docs/migration-v1.md`。
+beta.10 重新建立内部状态和签名格式。`0.4.0` 的 `YFY_SCAN_DIR` 文件状态不兼容，不会自动迁移、覆盖或删除；升级时必须停止旧进程并配置新的空 `YFY_STATE_DB`。
 
 `yfy_inventory_create` 不提供隐藏的 limits 默认值，每次调用必须显式传。可选 `root_folder` 将扫描限制在 Workspace 内已验证的子树（适合大资料库）：
 

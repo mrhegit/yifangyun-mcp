@@ -1,6 +1,8 @@
 # 工具参考
 
-`1.0.0-beta.9`（`contract_version=4`）使用轻量 Drive 平面与可选的 Workspace、Inventory、Evidence、Organization 平面。普通发现工具保持低成本；范围证明、完整性结论和原件固化必须进入对应的受约束工具。相对 beta.8 的破坏性变更见 `docs/migration-v1.md`。
+`1.0.0-beta.10` 是 1.0 正式版前的最后一个 beta，使用轻量 Drive 平面与可选的 Workspace、Inventory、Evidence、Organization 平面。普通发现工具保持低成本；范围证明、完整性结论和原件固化必须进入对应的受约束工具。`0.4.0` 的破坏性迁移见 `docs/migration-v1.md`。
+
+**能力边界：** 本服务不提供 PDF/Office 正文解析或 OCR。Provider 的知识库训练与召回属于独立授权和状态工作流，不在当前工具集内。`yfy_open` / `yfy_capture` 交付校验后的字节与可选小文本预览；二进制成功不等于模型已读正文。
 
 ## 通用结果契约
 
@@ -12,7 +14,7 @@
 
 优先级字段（如 `agent_warnings`、`content_delivery.agent_readable`、`agent_guidance`）优先保留在 control。`resource.preview_text` 不进入 compact text；正文通过 embedded resource、resources/read 或 `structuredContent` 提供。
 
-失败返回 `isError=true` 和结构化错误：
+业务错误及运行时校验错误返回 `isError=true` 和结构化 JSON：
 
 ```json
 {
@@ -28,6 +30,8 @@
 ```
 
 `category` 可能是 `invalid_input`、`authentication`、`authorization`、`not_found`、`rate_limited`、`timeout`、`provider_unavailable`、`provider_contract`、`stale_state`、`capacity_limit`、`cancelled`、`conflict` 或 `internal`。
+
+MCP SDK 在进入工具 handler 前拒绝的基础 Schema 错误可能是普通文本 Tool Error。调用方应先检查 `isError`，再判断 text 是否为结构化 JSON。
 
 provenance 不返回 endpoint、下载 URL pathname、凭据或 access context：
 
@@ -53,15 +57,15 @@ workspace:tender_public
 file:501@default.aaaaaaaaaaaaaaaaaaaaaaaa
 folder:502@default.aaaaaaaaaaaaaaaaaaaaaaaa
 version:7001@ZmlsZTo1MDFAZGVmYXVsdC5hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh
-inventory:<encrypted-opaque-token>
+inventory:<uuid>@<access_context>.<mac24>
 ```
 
 - ItemRef 绑定项目类型、Provider ID、`access_context` 和身份指纹。
 - VersionRef 绑定 Provider version ID 和完整 FileRef，不能用于另一个文件。
 - Workspace 工具只接受 `workspace:<id>`，不接受裸 Workspace ID。
-- Inventory Ref 由 `YFY_CLIENT_SECRET` 加密认证，可跨服务重启使用且不暴露 scan UUID。`inventory_id` 不能作为工具输入。
+- Inventory Ref 为稳定 MAC 句柄：同一 inventory 在 create/get/search 返回相同字符串；MAC 绑定 secret、Inventory ID 和 Access Context，读取状态时再复核 Workspace fingerprint。`inventory_id` 不能单独作为工具输入。
 - Ref 必须从当前服务结果中原样复制。修改 Context、Workspace 绑定或 `YFY_CLIENT_SECRET` 后，应重新发现 Ref。
-- 旧版短 Ref（如 `file:<id>`）均无效。
+- `0.4.0` 数字 ID、旧版短 Ref 和旧 Inventory Ref 均无效。
 
 ## 分页契约
 
@@ -107,7 +111,7 @@ inventory:<encrypted-opaque-token>
 `yfy_status` 无输入。即使 Provider 暂时不可用，它仍返回本地有效配置：
 
 - `connected` 与 `provider.status=connected|unavailable`
-- `server.version`、`contract_version`（beta.9 为 `4`）、`build_id`、`build_commit`、`instance_id`、`started_at`、`recommended_workflows`
+- `server.version`、`contract_version`、`build_id`、`build_commit`、`instance_id`、`started_at`、`recommended_workflows`
 - `server.config_fingerprint`，用于比较部署配置是否发生变化
 - 默认 identity、可复制 `places`、已启用 `capabilities` 和 Workflow Profile readiness
 - `runtime.configuration_source=process_environment` 及不含敏感值的运行参数摘要
@@ -167,7 +171,7 @@ Provider 索引候选发现，固定返回：
 | `provider_snippet` | false | Provider snippet 含查询词，不可作确认存在 |
 | `unverified_index_hit` | false | 仅索引信号，无法由返回值验证 |
 
-**默认行为（beta.9）**：
+**默认行为**：
 
 - 默认 `hits` 只包含 `claim_allowed=true` 的命中，未验证候选不会占用默认分页额度。
 - 未验证命中默认不进 `hits`，计入 `unverified_index_hits`；`agent_warnings` 会说明省略数量。
@@ -298,8 +302,8 @@ Inventory 状态：
 `yfy_inventory_get` / create 摘要返回：
 
 - `workspace.ref/root/access_context/fingerprint`
-- `inventory` 是加密认证的 opaque Ref，可跨服务重启使用且不暴露 Access Context、scan UUID 或 Workspace fingerprint
-- `inventory_id` 是内部 scan UUID，仅用于显示和日志，不能作为工具输入
+- `inventory` 是稳定 MAC 句柄（`inventory:<uuid>@<access_context>.<mac24>`），同一 inventory 多次返回相同字符串；跨重启可用，MAC 绑定 secret/ID/Context，状态访问复核 workspace fingerprint
+- `inventory_id` 是内部 scan UUID，仅用于显示和日志，不能单独作为工具输入
 - `scan_root.id/ref`（实际扫描根；可能是子树）
 - `counts.files/folders/pages`
 - `completeness.pagination_complete/safe_to_claim_absence/scope/consistency_level/incomplete_reasons`
@@ -317,7 +321,7 @@ Inventory 搜索首次调用：
 
 ```json
 {
-  "inventory": "inventory:<encrypted-opaque-token>",
+  "inventory": "inventory:<uuid>@default.<mac24>",
   "query": "招标文件",
   "kind": "file",
   "match_fields": ["name", "path"],

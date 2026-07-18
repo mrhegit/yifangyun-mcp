@@ -32,6 +32,9 @@ test("ordinary cursor errors expose only the stable reason enum", () => {
   expectReason("%%%", "not_base64url");
   expectReason(Buffer.from("{}", "utf8").toString("base64url"), "envelope_invalid");
   const valid = encodeCursor("secret", WORKSPACE_FINGERPRINT, "test", { offset: 1 });
+  const legacyVersion = JSON.parse(decodeCanonicalBase64Url(valid).toString("utf8")) as Record<string, unknown>;
+  legacyVersion.version = 2;
+  expectReason(Buffer.from(JSON.stringify(legacyVersion), "utf8").toString("base64url"), "envelope_invalid");
   const signatureInvalid = JSON.parse(decodeCanonicalBase64Url(valid).toString("utf8")) as Record<string, unknown>;
   signatureInvalid.signature = "0".repeat(64);
   expectReason(Buffer.from(JSON.stringify(signatureInvalid), "utf8").toString("base64url"), "signature_invalid");
@@ -284,6 +287,13 @@ test("the MCP client validates a paginated success result", async () => {
     assert.deepEqual(Object.keys(nextAction.arguments), ["cursor"]);
     const mixed = await client.callTool({ name: nextAction.tool, arguments: { ...nextAction.arguments, limit: 5 } });
     assert.equal(mixed.isError, true);
+    const mixedContent = mixed.content as Array<{ text?: string; type: string }>;
+    const mixedError = JSON.parse(mixedContent.find((entry) => entry.type === "text")?.text ?? "{}") as {
+      error?: { diagnostics?: Record<string, unknown>; suggested_action?: string };
+    };
+    assert.equal(mixedError.error?.diagnostics?.reason, "pagination_mixed_args");
+    assert.deepEqual(mixedError.error?.diagnostics?.unexpected_keys, ["limit"]);
+    assert.match(mixedError.error?.suggested_action ?? "", /fixed fields returned by next_action/);
     const second = await client.callTool({ name: nextAction.tool, arguments: nextAction.arguments });
     assert.equal(second.isError, undefined, JSON.stringify(second.content));
     assert.equal((((second.structuredContent as Record<string, unknown>).shares as Array<Record<string, unknown>>)[0]?.id), "2");

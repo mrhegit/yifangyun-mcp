@@ -24,7 +24,7 @@ function loadDotEnv(filePath: string): void {
   }
 }
 
-test("live MCP protocol exposes and executes the beta.9 capture workflow", { skip: process.env.YFY_LIVE_MCP_TESTS !== "enabled" }, async () => {
+test("live MCP protocol exposes and executes the current capture workflow", { skip: process.env.YFY_LIVE_MCP_TESTS !== "enabled" }, async () => {
   const envPath = process.env.YFY_LIVE_ENV_PATH ?? path.resolve(process.cwd(), ".env");
   assert.ok(fs.existsSync(envPath), `Live env file not found: ${envPath}`);
   loadDotEnv(envPath);

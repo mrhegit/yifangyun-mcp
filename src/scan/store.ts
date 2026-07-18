@@ -4,10 +4,10 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { YifangyunError } from "../client.js";
 import type { JsonObject } from "../types.js";
+import { SNAPSHOT_SCHEMA_VERSION } from "../version.js";
 import type { ScopeItemCursor, ScopeItemPage, ScopePageArtifact, ScopePageReceipt, ScopeScanFrontier, ScopeScanRepository, ScopeScanState, ScopeSeenItem } from "./types.js";
 
 type Row = Record<string, unknown>;
-const SNAPSHOT_SCHEMA_VERSION = 5;
 
 function normalizeText(value: string, caseSensitive: boolean): string {
   const normalized = value.normalize("NFKC")

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -8,6 +9,7 @@ import { z } from "zod";
 import type { AppConfig } from "./types.js";
 import { AppRuntime } from "./runtime/runtime.js";
 import { registerCatalog } from "./tools/registerCatalog.js";
+import { CONTRACT_VERSION, CURSOR_ENVELOPE_VERSION, INVENTORY_CURSOR_VERSION, INVENTORY_REF_VERSION, SERVER_VERSION, SNAPSHOT_SCHEMA_VERSION, WORKSPACE_FINGERPRINT_VERSION } from "./version.js";
 
 type Handler = (args: Record<string, unknown>, extra: { signal: AbortSignal; sendNotification: () => Promise<void> }) => Promise<{ structuredContent?: Record<string, unknown>; isError?: boolean }>;
 
@@ -55,6 +57,20 @@ function config(toolsets: AppConfig["toolsets"]): AppConfig {
     workflowProfiles: ["tender"]
   };
 }
+
+test("the final beta starts all internal format versions at one", () => {
+  const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
+  assert.equal(SERVER_VERSION, "1.0.0-beta.10");
+  assert.equal(packageJson.version, SERVER_VERSION);
+  assert.deepEqual([
+    CONTRACT_VERSION,
+    CURSOR_ENVELOPE_VERSION,
+    INVENTORY_CURSOR_VERSION,
+    INVENTORY_REF_VERSION,
+    SNAPSHOT_SCHEMA_VERSION,
+    WORKSPACE_FINGERPRINT_VERSION
+  ], [1, 1, 1, 1, 1, 1]);
+});
 
 test("default catalog exposes the current tools and schemas", async () => {
   const runtime = await AppRuntime.create(config(["drive", "workspace", "inventory", "evidence", "organization"]));
@@ -115,6 +131,7 @@ test("the MCP client compiles every catalog output schema", async () => {
     assert.ok(listed.tools.length > 0);
     assert.ok(listed.tools.every((tool) => tool.outputSchema));
     for (const tool of listed.tools) {
+      assert.ok(schemaVariants(tool.inputSchema as Record<string, unknown>).every((variant) => variant.additionalProperties === false), `${tool.name} input branches must be strict`);
       if (tool.name === "yfy_status") continue;
       assert.equal(tool.inputSchema.type, "object");
       assert.ok(schemaPropertyNames(tool.inputSchema as Record<string, unknown>).length > 0, `${tool.name} must expose discoverable input properties`);
@@ -183,6 +200,9 @@ test("status enables only workflows whose complete tool chain is registered", as
     const server = new FakeServer();
     registerCatalog(server as unknown as McpServer, runtime);
     const result = await server.tools.get("yfy_status")!.handler({}, { signal: new AbortController().signal, sendNotification: async () => undefined });
+    const serverIdentity = result.structuredContent?.server as Record<string, unknown>;
+    assert.equal(serverIdentity.version, SERVER_VERSION);
+    assert.equal(serverIdentity.contract_version, CONTRACT_VERSION);
     const workflows = result.structuredContent?.recommended_workflows as Array<Record<string, unknown>>;
     assert.deepEqual(workflows.filter((workflow) => workflow.enabled === true).map((workflow) => workflow.id), item.enabled);
   }

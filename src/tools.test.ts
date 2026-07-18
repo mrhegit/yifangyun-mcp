@@ -95,7 +95,7 @@ test("media type falls back from magic sniff then file extension including svg",
   assert.equal(normalizedMediaType("application/octet-stream", undefined, "blob.bin"), "application/octet-stream");
 });
 
-test("context-bound refs reject beta.6 numeric refs and preserve identity", () => {
+test("context-bound refs reject legacy numeric IDs and preserve identity", () => {
   assert.deepEqual(parseItemRef(FILE_10), { type: "file", id: "10", accessContextId: "default", identityRef: IDENTITY_REF });
   assert.throws(() => parseItemRef("file:10"), /Item reference is invalid/);
 });
@@ -403,7 +403,12 @@ test("admin log pagination counts user activity rows", async () => {
   const page = result.structuredContent?.page as Record<string, unknown>;
   assert.equal(page.returned_count, 2);
   assert.equal(page.has_more, true);
-  assert.equal(((result.structuredContent?.next_action as Record<string, unknown>).arguments as Record<string, unknown>).action, "list");
+  const nextArguments = ((result.structuredContent?.next_action as Record<string, unknown>).arguments as Record<string, unknown>);
+  assert.equal(nextArguments.action, "list");
+  const mixed = await call(server, "yfy_admin_log_query", { ...nextArguments, limit: 1 });
+  const mixedError = JSON.parse(mixed.content?.find((entry) => entry.type === "text")?.text ?? "{}") as { error?: { diagnostics?: Record<string, unknown> } };
+  assert.equal(mixedError.error?.diagnostics?.reason, "pagination_mixed_args");
+  assert.deepEqual(mixedError.error?.diagnostics?.unexpected_keys, ["limit"]);
 });
 
 test("admin log pagination uses the capacity actually sent to Provider", async () => {
@@ -767,9 +772,13 @@ test("inventory search returns a signed context-bound cursor", async () => {
   assert.equal((created.structuredContent?.agent_guidance as Record<string, unknown>)?.may_claim_absence, true);
   assert.equal((created.structuredContent?.scan_root as Record<string, unknown>)?.id, "10");
   const inventory = String(created.structuredContent?.inventory);
+  assert.match(inventory, /^inventory:123e4567-e89b-12d3-a456-426614174000@default\.[a-f0-9]{24}$/);
   assert.notEqual(inventory, `inventory:${String(state.scanId)}`);
   assert.equal(created.structuredContent?.inventory_id, state.scanId);
+  const got = await call(server, "yfy_inventory_get", { inventory });
+  assert.equal(String(got.structuredContent?.inventory), inventory);
   const first = await call(server, "yfy_inventory_search", { inventory, query: "证书", kind: "all", limit: 1 });
+  assert.equal(String(first.structuredContent?.inventory), inventory);
   assert.equal((first.structuredContent?.scan_root as Record<string, unknown>)?.id, "10");
   assert.equal((first.structuredContent?.agent_guidance as Record<string, unknown>)?.may_claim_absence, true);
   assert.equal(((first.structuredContent?.completeness as Record<string, unknown>)?.scope), "observed_subtree");
@@ -783,6 +792,21 @@ test("inventory search returns a signed context-bound cursor", async () => {
   const second = await call(server, "yfy_inventory_search", { inventory, cursor });
   assert.notEqual(second.isError, true, JSON.stringify(second.content));
   assert.deepEqual(receivedCursor, { itemId: "file:10", sortPath: "Root/A", total: 2, watermark: 1 });
+  const mixed = await call(server, "yfy_inventory_search", { inventory, cursor, limit: 2 });
+  const mixedError = JSON.parse(mixed.content?.find((entry) => entry.type === "text")?.text ?? "{}") as { error?: { diagnostics?: Record<string, unknown> } };
+  assert.equal(mixedError.error?.diagnostics?.reason, "pagination_mixed_args");
+  assert.deepEqual(mixedError.error?.diagnostics?.unexpected_keys, ["limit"]);
+  const currentEnvelope = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as Record<string, unknown>;
+  const legacyEnvelope: Record<string, unknown> = { ...currentEnvelope, version: 3 };
+  delete legacyEnvelope.signature;
+  const legacyCursor = Buffer.from(JSON.stringify({
+    ...legacyEnvelope,
+    signature: crypto.createHmac("sha256", "secret").update(JSON.stringify(legacyEnvelope)).digest("hex")
+  }), "utf8").toString("base64url");
+  const legacy = await call(server, "yfy_inventory_search", { inventory, cursor: legacyCursor });
+  assert.equal(errorCode(legacy), "YFY_INVENTORY_CURSOR_INVALID");
+  const legacyError = JSON.parse(legacy.content?.find((entry) => entry.type === "text")?.text ?? "{}") as { error?: { diagnostics?: Record<string, unknown> } };
+  assert.equal(legacyError.error?.diagnostics?.reason, "envelope_invalid");
   const invalid = await call(server, "yfy_inventory_search", { inventory, cursor: "%%%" });
   const error = JSON.parse(invalid.content?.find((entry) => entry.type === "text")?.text ?? "{}") as { error?: { diagnostics?: Record<string, unknown> } };
   assert.equal(error.error?.diagnostics?.reason, "not_base64url");
@@ -831,10 +855,13 @@ test("inventory refs preserve non-default identity across instances and release 
   registerInventoryTools(server as unknown as McpServer, runtime);
   const created = await call(server, "yfy_inventory_create", { workspace: "workspace:secondary-scope", refresh: { mode: "force_refresh" }, limits: { max_item_depth: 8, max_items: 1000 } });
   const inventory = String(created.structuredContent?.inventory);
-  assert.doesNotMatch(Buffer.from(inventory.slice("inventory:".length), "base64url").toString("utf8"), /secondary|123e4567/);
+  assert.match(inventory, /^inventory:123e4567-e89b-12d3-a456-426614174099@secondary\.[a-f0-9]{24}$/);
   const read = await call(server, "yfy_inventory_get", { inventory });
   assert.notEqual(read.isError, true, JSON.stringify(read.content));
+  assert.equal(String(read.structuredContent?.inventory), inventory);
   assert.equal((read.structuredContent?.workspace as Record<string, unknown>).access_context, "secondary");
+  const forged = await call(server, "yfy_inventory_get", { inventory: inventory.slice(0, -4) + "dead" });
+  assert.equal(errorCode(forged), "YFY_INPUT_INVALID");
 
   const restartedServer = new FakeServer();
   const restartedRuntime = { ...runtime } as AppRuntime;
@@ -852,6 +879,10 @@ test("inventory refs preserve non-default identity across instances and release 
   assert.equal(released.structuredContent?.status, "released");
   const repeated = await call(server, "yfy_inventory_release", { inventory });
   assert.equal(repeated.structuredContent?.status, "already_unavailable");
+  const forgedMissing = await call(server, "yfy_inventory_release", { inventory: inventory.replace("174099", "174098") });
+  assert.equal(errorCode(forgedMissing), "YFY_INPUT_INVALID");
+  const wrongSecretRelease = await call(wrongSecretServer, "yfy_inventory_release", { inventory });
+  assert.equal(errorCode(wrongSecretRelease), "YFY_INPUT_INVALID");
 });
 
 test("inventory refs become stale when the configured workspace root changes", async () => {

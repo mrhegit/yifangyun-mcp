@@ -156,6 +156,7 @@ function registerDepartmentTools(server: McpServer, runtime: AppRuntime): void {
   registerTool(server, "yfy_admin_department_read", {
     title: "Read Yifangyun Admin Departments",
     description: "Get department metadata, children, users, or space usage through the enterprise plane.",
+    continuationFixedKeys: ["action"],
     inputSchema: AdminDepartmentReadInputShape,
     inputValidator: AdminDepartmentReadInputValidator,
     outputSchema: { department: DepartmentSchema.optional(), departments: z.array(DepartmentSchema).optional(), users: z.array(UserSchema).optional(), spaces: z.unknown().optional(), ...AdminPageOutputShape, provenance: ProvenanceSchema }
@@ -253,6 +254,7 @@ function registerGroupTools(server: McpServer, runtime: AppRuntime): void {
   registerTool(server, "yfy_admin_group_read", {
     title: "Read Yifangyun Admin Groups",
     description: "List groups, get group metadata, or list group users.",
+    continuationFixedKeys: ["action"],
     inputSchema: AdminGroupReadInputShape,
     inputValidator: AdminGroupReadInputValidator,
     outputSchema: { group: GroupSchema.optional(), groups: z.array(GroupSchema).optional(), users: z.array(UserSchema).optional(), ...AdminPageOutputShape, provenance: ProvenanceSchema }
@@ -375,6 +377,7 @@ function registerLogTools(server: McpServer, runtime: AppRuntime): void {
   registerTool(server, "yfy_admin_log_query", {
     title: "Query Yifangyun Admin Logs",
     description: "Resolve action types or query admin logs through official read-oriented POST endpoints.",
+    continuationFixedKeys: ["action"],
     inputSchema: AdminLogQueryInputShape,
     inputValidator: AdminLogQueryInputValidator,
     outputSchema: { result: JsonValueSchema, ...AdminPageOutputShape, provenance: ProvenanceSchema }

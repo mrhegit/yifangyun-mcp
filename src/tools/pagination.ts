@@ -76,8 +76,8 @@ export function resolvePaginationArgs<T extends Record<string, unknown>>(
       throw new YifangyunError("Continuation requests may only include cursor and fixed fields.", {
         code: "YFY_INPUT_INVALID",
         phase,
-        agentDetails: { unexpected_key: key },
-        suggestedAction: "Continue with only cursor (plus fixed fields such as inventory/action when required), or restart with first-page business fields."
+        agentDetails: { reason: "pagination_mixed_args", unexpected_keys: [key] },
+        suggestedAction: "Continue with only cursor plus the fixed fields returned by next_action. Do not pass first-page fields together with cursor; or restart with first-page fields and omit cursor."
       });
     }
     const fixed: Record<string, unknown> = {};

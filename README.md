@@ -2,7 +2,14 @@
 
 亿方云 OpenAPI 的通用 MCP Server。默认提供轻量 Drive 平面；需要范围证明、完整性判断或原件固化时，可启用 Workspace、Inventory 和 Evidence 平面。
 
-当前开发版本：`1.0.0-beta.9`（`contract_version=4`）。在 beta.8 Agent 护栏基础上：扁平分页输入、text 通道 control 平面永不截断操作锚点、Search `selection_policy` / content 策略、Open/Capture `agent_readable` 与释放 `next_action`、加密 opaque Inventory Ref 与空搜语义、Transfer 敏感 URL text 脱敏。破坏性变更见 `docs/migration-v1.md`。
+当前开发版本：`1.0.0-beta.10`，作为 1.0 正式版前的最后一个 beta。当前契约包含稳定 MAC Inventory Ref、严格首次页/续页输入、可执行分页诊断、结构化结果校验和证据释放流程。`0.4.0` 的破坏性迁移见 `docs/migration-v1.md`。
+
+## 能力边界
+
+- **支持**：浏览/搜索/路径解析、元数据、下载与哈希校验（`yfy_open` / `yfy_capture`）、Workspace 范围与 Inventory 完备性、小文本 UTF-8 内嵌预览。
+- **当前服务不提供**：PDF/Office 正文解析或 OCR。Provider 的知识库训练与召回属于独立授权和状态工作流，不在当前工具集内。`binary_no_preview` / `agent_readable=false` 表示模型未获得正文，不是故障。
+- **搜索不证明缺失**；缺失结论仅当 Inventory 终态且 `may_claim_absence=true`。
+- **`transfer` 不进 Tender 默认矩阵**；仅特殊集成显式启用，不可当证据或普通读路径。
 
 ## Interface
 
@@ -53,6 +60,14 @@ version:7001@ZmlsZTo1MDFAZGVmYXVsdC5hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh
 ```
 
 ItemRef 绑定 `access_context` 和身份指纹。不要构造或修改 Ref；Context 配置变化后应重新发现项目。
+
+Inventory Ref（beta.10+）为稳定可复制形式：
+
+```text
+inventory:123e4567-e89b-12d3-a456-426614174000@default.a1b2c3d4e5f6789012345678
+```
+
+同一 inventory 在 create/get/search 间字符串不变；`inventory_id` 不能单独作为工具输入。Client secret 或 Workspace 绑定变化后须重建 Inventory。
 
 分页输入使用扁平字段：首次调用直接传业务参数（如 `at`/`query`/`limit`），续页只执行返回的 `next_action`（参数为 `cursor`，inventory 等固定字段除外）。Provider 页码、页内 offset 和签名细节由服务端隐藏。
 
@@ -176,4 +191,4 @@ npm pack --dry-run
 - [架构与安全](docs/architecture-security.md)
 - [部署](docs/deployment.md)
 - [OpenAPI 覆盖](docs/openapi-coverage.md)
-- [迁移到 1.0.0-beta.9](docs/migration-v1.md)
+- [迁移说明](docs/migration-v1.md)

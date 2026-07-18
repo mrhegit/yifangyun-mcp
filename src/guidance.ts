@@ -12,13 +12,13 @@ export function serverInstructions(runtime: AppRuntime): string {
     instructions.push(
       "With a context-bound ItemRef use yfy_get for metadata or yfy_open for bytes; with an exact relative path use yfy_resolve; otherwise use yfy_search for candidates.",
       "Indexed search is non-exhaustive and never proves absence. claim_allowed=true only means returned metadata supports the query match; use yfy_get to confirm current existence. Execute next_action for selection_policy=continue_search; for must_disambiguate do not open/capture hits[0] without path uniqueness. Content field hits never claim_allowed.",
-      "yfy_open may embed a verified small-text MCP resource when include_text_preview=true; inspect content_delivery (agent_readable/model_has_body_text) and always honor must_release and next_action (yfy_resource_release). Resource links are not guaranteed to be auto-fetched.",
+      "yfy_open may embed a verified small-text MCP resource when include_text_preview=true; inspect content_delivery (agent_readable/model_has_body_text) and always honor must_release and next_action (yfy_resource_release). Resource links are not guaranteed to be auto-fetched. This server does not provide PDF/Office body parsing or OCR; Provider knowledge workflows are outside this toolset. Binary success does not mean the model read the body.",
       "Paginated tools use flat first-page fields or top-level cursor continuation; copy next_action exactly. Large text responses keep exact operational anchors in control and never copy resource.preview_text into compact text."
     );
   }
   if (runtime.config.toolsets.includes("inventory") && runtime.config.authorityScopes.length > 0) {
     instructions.push(
-      "For completeness or absence, create one workspace inventory with explicit limits and refresh mode (optional root_folder for a verified subtree), follow next_action until terminal, then search it. inventory is an encrypted opaque cross-restart reference; inventory_id is display-only.",
+      "For completeness or absence, create one workspace inventory with explicit limits and refresh mode (optional root_folder for a verified subtree), follow next_action until terminal, then search it. inventory is a stable MAC-bound ref (inventory:<uuid>@<context>.<mac>); copy it exactly; bare inventory_id is not accepted.",
       "Absence is valid only when safe_to_claim_absence=true / agent_guidance.may_claim_absence=true; read agent_guidance, empty_result_meaning, and suggested_wait_ms. Partial empty search means not_found_in_observed_prefix_only; absence_forbidden."
     );
   }
@@ -60,7 +60,7 @@ export function registerGuidance(server: McpServer, runtime: AppRuntime): void {
       "4. Known exact relative path: call `yfy_resolve`.",
       "5. Unknown location: call `yfy_search` for candidates only; `claim_allowed=true` supports the query match but current existence still requires `yfy_get`. Disambiguate before opening or capturing."
     ] : []),
-    ...(runtime.config.toolsets.includes("inventory") && runtime.config.authorityScopes.length > 0 ? ["6. Completeness or absence question: call `yfy_inventory_create` with `workspace:<id>`, explicit `limits`, and a refresh mode (optional `root_folder` for a verified subtree); follow next_action until terminal, then call `yfy_inventory_search`. Absence is valid only when `safe_to_claim_absence=true` / `agent_guidance.may_claim_absence=true`. Read `agent_guidance` and `suggested_wait_ms`."] : []),
+    ...(runtime.config.toolsets.includes("inventory") && runtime.config.authorityScopes.length > 0 ? ["6. Completeness or absence question: call `yfy_inventory_create` with `workspace:<id>`, explicit `limits`, and a refresh mode (optional `root_folder` for a verified subtree); follow next_action until terminal, then call `yfy_inventory_search`. Copy the stable inventory ref (inventory:<uuid>@<context>.<mac>). Absence is valid only when `safe_to_claim_absence=true` / `agent_guidance.may_claim_absence=true`. Read `agent_guidance` and `suggested_wait_ms`."] : []),
     ...(runtime.config.toolsets.includes("evidence") && runtime.config.authorityScopes.length > 0 ? ["7. Workspace-bound original bytes required: call `yfy_capture`, process the Resource, then execute `next_action` (`yfy_resource_release`). Inspect `content_delivery.agent_readable` and honor `must_release`. Binary modes do not prove the model read the body."] : []),
     ...(runtime.config.toolsets.includes("transfer") ? ["8. Never use `yfy_transfer_ticket_get` as an evidence or ordinary read path (`usage_policy=special_integration_only`); prefer `yfy_open`/`yfy_capture`. Do not echo transfer URLs (`do_not_echo_url`)."] : []),
     "",
