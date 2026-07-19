@@ -40,7 +40,7 @@ test("live MCP protocol exposes and executes the current download workflow", { s
   process.env.YFY_WORKSPACES_JSON = JSON.stringify([{ id: "live_scope", root_folder_id: rootFolderId, access_context: "default", tags: ["live-test"] }]);
   const runtime = await AppRuntime.create(loadConfig());
   const server = new McpServer({ name: "live-yifangyun", version: SERVER_VERSION });
-  const client = new Client({ name: "live-regression", version: "1.1.0-beta.2" });
+  const client = new Client({ name: "live-regression", version: "1.1.0-beta.3" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   try {
     registerCatalog(server, runtime);

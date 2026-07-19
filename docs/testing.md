@@ -23,6 +23,7 @@ npm pack --dry-run --json
 | Worker SQLite | `src/workerStore.test.ts`、`src/snapshot.test.ts` | Worker 退出、pending RPC、clone 失败、start lock、活动扫描关闭、Inventory 行为 |
 | MCP Tools | `src/tools.test.ts`、`src/tooling.test.ts` | schema、错误分类、下载 deadline、progress、版本、structuredContent |
 | HTTP | `src/httpDownloads.test.ts` | Bearer、Host、Origin、staged 流、fetch 限制、活动中 release |
+| 进程生命周期 | `src/processLifecycle.test.ts` | stdio EOF、启动期断连、Worker 与 SQLite 释放、重复关闭去重 |
 | Catalog / Config | `src/catalog.test.ts`、`src/config.test.ts` | 工具目录、annotations、配置矩阵、安全启动条件 |
 
 ---
@@ -82,6 +83,7 @@ YFY_LIVE_WORKSPACE_ROOT_FOLDER_ID=<workspace-root-folder-id>
 | 批量 ZIP | 真实中央目录、空 ZIP、截断 ZIP、统一 deadline、4 路 Workspace 校验上限 |
 | MCP 非法输入 | 缺字段、错误类型、未知字段均返回统一 `YFY_INPUT_INVALID` envelope |
 | staged 慢客户端 | 读租约达到 wall timeout 后中止并释放并发槽 |
+| stdio Host 退出 | stdin EOF 后及时退出；重复关闭只执行一次；同一状态库可立即重启 |
 
 ---
 

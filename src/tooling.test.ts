@@ -354,7 +354,7 @@ test("the real MCP client validates yfy_download path and release", async () => 
   const sha256 = crypto.createHash("sha256").update(body).digest("hex");
   const tempStorage = new TempStorageManager(dir, 1_048_576, 60);
   const downloads = new DownloadRegistry(tempStorage, 60);
-  const server = new McpServer({ name: "test-server", version: "1.1.0-beta.2" });
+  const server = new McpServer({ name: "test-server", version: "1.1.0-beta.3" });
   const runtime = {
     config: { tempFileTtlSeconds: 60, toolsets: ["drive"], transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false },
     access: { resolveWorkspaceRef: () => ({ context: { id: "default", userId: "530" }, identityRef: IDENTITY_REF, scope: { id: "scope", rootFolderId: "501", accessContext: "default", tags: [] } }) },
@@ -404,7 +404,7 @@ test("the real MCP client returns text preview for yfy_download", async () => {
   const sha256 = crypto.createHash("sha256").update(body).digest("hex");
   const tempStorage = new TempStorageManager(dir, 1_048_576, 60);
   const downloads = new DownloadRegistry(tempStorage, 60);
-  const server = new McpServer({ name: "test-server", version: "1.1.0-beta.2" });
+  const server = new McpServer({ name: "test-server", version: "1.1.0-beta.3" });
   const runtime = {
     config: { tempFileTtlSeconds: 60, toolsets: ["drive"], transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false, textPreviewMaxBytes: 32768 },
     gateway: {

@@ -66,7 +66,7 @@ function config(toolsets: AppConfig["toolsets"]): AppConfig {
 
 test("the breaking download contract advances only the public contract version", () => {
   const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
-  assert.equal(SERVER_VERSION, "1.1.0-beta.2");
+  assert.equal(SERVER_VERSION, "1.1.0-beta.3");
   assert.equal(packageJson.version, SERVER_VERSION);
   assert.deepEqual([
     CONTRACT_VERSION,
@@ -129,8 +129,8 @@ test("optional toolsets preserve mutation, collaboration, admin and transfer cap
 
 test("the MCP client compiles every catalog output schema", async () => {
   const runtime = await AppRuntime.create(config(["drive", "workspace", "inventory", "organization", "mutation", "collaboration", "admin", "transfer"]));
-  const server = new RealMcpServer({ name: "schema-test", version: "1.1.0-beta.2" });
-  const client = new Client({ name: "schema-client", version: "1.1.0-beta.2" });
+  const server = new RealMcpServer({ name: "schema-test", version: "1.1.0-beta.3" });
+  const client = new Client({ name: "schema-client", version: "1.1.0-beta.3" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   try {
     registerCatalog(server, runtime);

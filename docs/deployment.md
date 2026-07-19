@@ -3,7 +3,7 @@
 ## 安装
 
 ```bash
-npm install -g yifangyun-mcp-server@1.1.0-beta.2
+npm install -g yifangyun-mcp-server@1.1.0-beta.3
 ```
 
 或由 Host 固定版本运行：
@@ -11,7 +11,7 @@ npm install -g yifangyun-mcp-server@1.1.0-beta.2
 ```json
 {
   "command": "npx",
-  "args": ["-y", "yifangyun-mcp-server@1.1.0-beta.2"],
+  "args": ["-y", "yifangyun-mcp-server@1.1.0-beta.3"],
   "env": {
     "YFY_CLIENT_ID": "...",
     "YFY_CLIENT_SECRET": "...",
@@ -37,6 +37,7 @@ YFY_DOWNLOAD_STAGED_HTTP=disabled
 
 Host 必须能访问 Server 返回的绝对路径。
 容器化 stdio 时，Host 与 Server 需共享同一文件系统命名空间或 volume。
+Host 正常退出时应先关闭 stdin，并在宽限期后终止完整子进程树。Server 会把 stdin EOF、管道关闭或写端失败视为连接终止，停止 transport、Inventory Worker、下载资源和本地客户端；清理默认最多等待 15 秒，超时后以失败状态强制退出。
 
 ---
 

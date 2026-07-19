@@ -1,6 +1,6 @@
 # OpenAPI 覆盖矩阵
 
-版本 `1.1.0-beta.2` **不是**“一个 HTTP endpoint 对应一个 MCP 工具”，而是把 Provider 差异收敛到 Drive、Workspace、Inventory、Download、Organization 等模块中。
+版本 `1.1.0-beta.3` **不是**“一个 HTTP endpoint 对应一个 MCP 工具”，而是把 Provider 差异收敛到 Drive、Workspace、Inventory、Download、Organization 等模块中。
 
 共性约定：
 

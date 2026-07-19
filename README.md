@@ -1,6 +1,6 @@
 # yifangyun-mcp-server
 
-亿方云 OpenAPI 的 MCP Server。当前版本 `1.1.0-beta.2`。
+亿方云 OpenAPI 的 MCP Server。当前版本 `1.1.0-beta.3`。
 
 默认能力：网盘浏览、检索、元数据读取、受控下载。可选启用 **Workspace**（业务范围约束）和 **Inventory**（完整目录清单与缺失审计）。
 

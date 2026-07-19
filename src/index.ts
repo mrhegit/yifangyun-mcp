@@ -21,6 +21,8 @@ export interface RunningServer {
   close(): Promise<void>;
 }
 
+const SHUTDOWN_TIMEOUT_MS = 15_000;
+
 function createServer(runtime: AppRuntime): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: serverInstructions(runtime) });
   registerGuidance(server, runtime);
@@ -263,29 +265,60 @@ export async function runHttp(runtime: AppRuntime): Promise<RunningServer> {
 async function main(): Promise<void> {
   const config = loadConfig();
   configureObservability(config.logLevel);
-  const runtime = await AppRuntime.create(config);
+  let runtime: AppRuntime | undefined;
   let runningServer: RunningServer | undefined;
-  let closing = false;
-  const close = async (signal: string) => {
-    if (closing) return;
-    closing = true;
-    logEvent("info", "server_stopping", { signal });
-    const failures: string[] = [];
-    if (runningServer) try { await runningServer.close(); } catch { failures.push("transport"); }
-    try { await runtime.close(); } catch { failures.push("runtime"); }
-    if (failures.length > 0) throw new Error(`Server cleanup failed: ${failures.join(",")}`);
+  let closePromise: Promise<void> | undefined;
+  let exitRequested = false;
+  let startupPromise!: Promise<void>;
+  const close = (reason: string): Promise<void> => {
+    closePromise ??= (async () => {
+      logEvent("info", "server_stopping", { signal: reason });
+      await startupPromise.catch(() => undefined);
+      const failures: string[] = [];
+      if (runningServer) try { await runningServer.close(); } catch { failures.push("transport"); }
+      if (runtime) try { await runtime.close(); } catch { failures.push("runtime"); }
+      if (failures.length > 0) throw new Error(`Server cleanup failed: ${failures.join(",")}`);
+    })();
+    return closePromise;
   };
-  const onSignal = (signal: string) => void close(signal).then(
-    () => process.exit(0),
-    () => { logEvent("error", "server_stop_failed", { signal }); process.exit(1); }
-  );
-  process.once("SIGINT", () => onSignal("SIGINT"));
-  process.once("SIGTERM", () => onSignal("SIGTERM"));
-  if (config.transport === "http") {
-    runningServer = await runHttp(runtime);
-  } else {
-    runningServer = await runStdio(runtime);
+  const requestShutdown = (reason: string): void => {
+    if (exitRequested) return;
+    exitRequested = true;
+    let timeout: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error(`Server cleanup exceeded ${SHUTDOWN_TIMEOUT_MS}ms.`)), SHUTDOWN_TIMEOUT_MS);
+      timeout.unref();
+    });
+    void Promise.race([close(reason), deadline]).finally(() => {
+      if (timeout) clearTimeout(timeout);
+    }).then(
+      () => { process.exitCode = 0; },
+      (error: unknown) => {
+        logEvent("error", "server_stop_failed", { error: error instanceof Error ? error.message : String(error), signal: reason });
+        process.exit(1);
+      }
+    );
+  };
+  startupPromise = (async () => {
+    runtime = await AppRuntime.create(config);
+    runningServer = config.transport === "http" ? await runHttp(runtime) : await runStdio(runtime);
+  })();
+  process.once("SIGINT", () => requestShutdown("SIGINT"));
+  process.once("SIGTERM", () => requestShutdown("SIGTERM"));
+  if (config.transport === "stdio") {
+    process.stdin.once("end", () => requestShutdown("STDIN_END"));
+    process.stdin.once("close", () => requestShutdown("STDIN_CLOSE"));
+    process.stdin.once("error", (error) => {
+      logEvent("warn", "stdio_stream_failed", { error: error.message, stream: "stdin" });
+      requestShutdown("STDIN_ERROR");
+    });
+    process.stdout.once("error", (error: NodeJS.ErrnoException) => {
+      logEvent("warn", "stdio_stream_failed", { code: error.code, error: error.message, stream: "stdout" });
+      requestShutdown(error.code === "EPIPE" ? "STDOUT_EPIPE" : "STDOUT_ERROR");
+    });
+    if (process.stdin.readableEnded || process.stdin.destroyed) requestShutdown("STDIN_CLOSED");
   }
+  await startupPromise;
 }
 
 const entryPoint = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";

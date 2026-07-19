@@ -85,7 +85,7 @@ test("HTTP staged download enforces auth, streams verified bytes and fetch limit
   } finally {
     await running.close();
     await runtime.close();
-    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }
 });
 
@@ -100,7 +100,7 @@ test("HTTP staged route is absent when the delivery channel is disabled", async 
   } finally {
     await running.close();
     await runtime.close();
-    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }
 });
 
@@ -123,7 +123,7 @@ test("remote staged delivery requires bearer, Host and Origin policy before star
     await assert.rejects(() => runHttp(missingPolicyRuntime), /ALLOWED_HOSTS and YFY_HTTP_ALLOWED_ORIGINS are required/);
   } finally {
     await missingPolicyRuntime.close();
-    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }
 });
 
@@ -156,7 +156,7 @@ test("remote HTTP policy enforces Host, Origin and bearer headers", async () => 
   } finally {
     await running.close();
     await runtime.close();
-    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }
 });
 
@@ -172,7 +172,7 @@ test("HTTP staged download rejects same-size tampering", async () => {
   } finally {
     await running.close();
     await runtime.close();
-    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }
 });
 
@@ -208,7 +208,7 @@ test("release preserves an active streamed HTTP response and deletes staged byte
   } finally {
     await running.close();
     await runtime.close();
-    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }
 });
 
