@@ -72,6 +72,7 @@ export class DownloadRegistry {
   private activeHttpLeases = 0;
   private closing = false;
   private readonly cleanupTimer: NodeJS.Timeout;
+  private cleanupRunning = false;
   private initialized = false;
   private readonly mutex = new AsyncMutex();
   private pendingRegistrations = 0;
@@ -90,7 +91,11 @@ export class DownloadRegistry {
     if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0) throw new Error("Download max entries must be a positive integer.");
     if (!Number.isSafeInteger(maxConcurrentHttpLeases) || maxConcurrentHttpLeases <= 0 || maxConcurrentHttpLeases > 40) throw new Error("Download concurrent HTTP lease limit must be between 1 and 40.");
     const intervalMs = Math.min(Math.max(ttlSeconds * 1000, 1000), 60_000);
-    this.cleanupTimer = setInterval(() => void this.pruneExpired().catch(() => undefined), intervalMs);
+    this.cleanupTimer = setInterval(() => {
+      if (this.cleanupRunning) return;
+      this.cleanupRunning = true;
+      void this.pruneExpired().catch(() => undefined).finally(() => { this.cleanupRunning = false; });
+    }, intervalMs);
     this.cleanupTimer.unref();
   }
 
@@ -199,7 +204,8 @@ export class DownloadRegistry {
       await reservation?.release();
       try {
         if (directoryCreated) await deleteTree(directory);
-        if (moved && sourceIsManaged) await this.storage.releaseUsed(input.sizeBytes);
+        if (!moved) await fs.rm(input.sourcePath, { force: true });
+        if (sourceIsManaged) await this.storage.releaseUsed(input.sizeBytes);
       } catch {
         await this.storage.reconcile().catch(() => undefined);
         throw new YifangyunError("Failed download registration left temporary files that could not be removed.", {
@@ -280,7 +286,7 @@ export class DownloadRegistry {
           const sha256 = crypto.createHash("sha256");
           let sizeBytes = 0;
           for await (const chunk of source) {
-            const bytes = Buffer.from(chunk);
+            const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
             sizeBytes += bytes.length;
             sha1.update(bytes);
             sha256.update(bytes);

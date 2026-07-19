@@ -75,12 +75,44 @@ test("tool errors bypass successful output schema validation", async () => {
   }
 });
 
+test("the real MCP client receives the uniform YFY envelope for schema-invalid input", async () => {
+  const server = new McpServer({ name: "test-server", version: "1.0.0" });
+  registerTool(server, "strict_input", {
+    title: "Strict Input",
+    description: "Requires one numeric value.",
+    inputSchema: { value: z.number().int() },
+    outputSchema: { value: z.number().int() }
+  }, { readOnly: true }, async ({ value }) => ({ value }));
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-client", version: "1.0.0" });
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    for (const argumentsValue of [{}, { value: "1" }, { value: 1, unexpected: true }]) {
+      const result = await client.callTool({ name: "strict_input", arguments: argumentsValue });
+      assert.equal(result.isError, true);
+      const content = result.content as Array<{ text?: string; type: string }>;
+      const parsed = JSON.parse(content.find((entry) => entry.type === "text")?.text ?? "{}") as { error?: { category?: string; code?: string } };
+      assert.equal(parsed.error?.code, "YFY_INPUT_INVALID");
+      assert.equal(parsed.error?.category, "invalid_input");
+    }
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
 test("download integrity, delivery configuration and Provider errors use actionable categories", () => {
   assert.equal(serializeError(new YifangyunError("mismatch", { code: "YFY_DOWNLOAD_CONTENT_MISMATCH" })).category, "provider_contract");
   assert.equal(serializeError(new YifangyunError("integrity", { code: "YFY_DOWNLOAD_INTEGRITY_FAILED" })).category, "conflict");
   assert.equal(serializeError(new YifangyunError("delivery", { code: "YFY_DOWNLOAD_DELIVERY_CHANNEL_UNAVAILABLE" })).category, "configuration");
   assert.equal(serializeError(new YifangyunError("ticket", { code: "YFY_DOWNLOAD_TICKET_INVALID" })).category, "provider_contract");
   assert.equal(serializeError(new YifangyunError("stream", { code: "YFY_DOWNLOAD_STREAM_FAILED", retryable: true })).category, "provider_unavailable");
+  assert.equal(serializeError(new YifangyunError("disk", { code: "YFY_LOCAL_STORAGE_WRITE_FAILED" })).category, "local_storage");
+  assert.equal(serializeError(new YifangyunError("quota", { code: "YFY_LOCAL_STORAGE_INSUFFICIENT" })).category, "capacity_limit");
+  assert.equal(serializeError(new YifangyunError("cleanup", { code: "YFY_DOWNLOAD_CLEANUP_FAILED" })).category, "local_storage");
+  assert.equal(serializeError(new YifangyunError("zip", { code: "YFY_PACK_DOWNLOAD_INVALID" })).category, "provider_contract");
+  assert.equal(serializeError(new YifangyunError("provider", { code: "YFY_PROVIDER_DECLARED_FAILURE" })).category, "provider_contract");
 });
 
 test("stale snapshot cursors expose a recoverable state category and safe diagnostics", () => {
@@ -322,7 +354,7 @@ test("the real MCP client validates yfy_download path and release", async () => 
   const sha256 = crypto.createHash("sha256").update(body).digest("hex");
   const tempStorage = new TempStorageManager(dir, 1_048_576, 60);
   const downloads = new DownloadRegistry(tempStorage, 60);
-  const server = new McpServer({ name: "test-server", version: "1.1.0-beta.1" });
+  const server = new McpServer({ name: "test-server", version: "1.1.0-beta.2" });
   const runtime = {
     config: { tempFileTtlSeconds: 60, toolsets: ["drive"], transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false },
     access: { resolveWorkspaceRef: () => ({ context: { id: "default", userId: "530" }, identityRef: IDENTITY_REF, scope: { id: "scope", rootFolderId: "501", accessContext: "default", tags: [] } }) },
@@ -372,7 +404,7 @@ test("the real MCP client returns text preview for yfy_download", async () => {
   const sha256 = crypto.createHash("sha256").update(body).digest("hex");
   const tempStorage = new TempStorageManager(dir, 1_048_576, 60);
   const downloads = new DownloadRegistry(tempStorage, 60);
-  const server = new McpServer({ name: "test-server", version: "1.1.0-beta.1" });
+  const server = new McpServer({ name: "test-server", version: "1.1.0-beta.2" });
   const runtime = {
     config: { tempFileTtlSeconds: 60, toolsets: ["drive"], transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false, textPreviewMaxBytes: 32768 },
     gateway: {

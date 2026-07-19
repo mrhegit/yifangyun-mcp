@@ -1,6 +1,6 @@
 {
   "name": "yifangyun-mcp-server",
-  "version": "1.1.0-beta.1",
+  "version": "1.1.0-beta.2",
   "description": "MCP server for Yifangyun cloud drive access with enterprise JWT authentication.",
   "repository": {
     "type": "git",
@@ -30,14 +30,19 @@
     "dist",
     "README.md",
     "LICENSE",
-    "docs",
+    "docs/architecture-security.md",
+    "docs/configuration.md",
+    "docs/deployment.md",
+    "docs/openapi-coverage.md",
+    "docs/testing.md",
+    "docs/tools.md",
     ".env.example"
   ],
   "scripts": {
-    "build": "node scripts/clean.mjs dist && tsc -p tsconfig.build.json",
+    "build": "node scripts/generate-build-info.mjs && node scripts/clean.mjs dist && tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
-    "test:compile": "node scripts/clean.mjs dist-test && tsc -p tsconfig.test.json",
+    "dev": "node scripts/generate-build-info.mjs && tsx src/index.ts",
+    "test:compile": "node scripts/generate-build-info.mjs && node scripts/clean.mjs dist-test && tsc -p tsconfig.test.json",
     "test": "npm run test:compile && node --test dist-test/*.test.js",
     "test:perf": "npm run test:compile && node scripts/perf-test.mjs",
     "check": "npm run build && npm test && npm run test:perf",
@@ -49,13 +54,16 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "express": "^5.2.1",
+    "lossless-json": "^4.3.0",
     "undici": "^7.28.0",
+    "yauzl": "^3.4.0",
     "zod": "^3.25.76",
     "zod-to-json-schema": "^3.25.2"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^24.10.1",
+    "@types/yauzl": "^3.4.0",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"
   }

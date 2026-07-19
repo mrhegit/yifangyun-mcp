@@ -58,6 +58,7 @@ YFY_LIVE_WORKSPACE_ROOT_FOLDER_ID=<workspace-root-folder-id>
 ```
 
 运行前配置测试用 Enterprise、用户、Workspace 与受控文件。
+`YFY_LIVE_MCP_TESTS` 会通过 MCP 协议验证单文件下载、Provider 批量 ZIP 和显式 release。
 `YFY_LIVE_INVENTORY_TESTS` 是 `YFY_LIVE_READ_TESTS` 的可选分支，并要求 `YFY_LIVE_WORKSPACE_ROOT_FOLDER_ID`。
 **不要**用生产敏感文件验证下载或写入。
 
@@ -77,6 +78,10 @@ YFY_LIVE_WORKSPACE_ROOT_FOLDER_ID=<workspace-root-folder-id>
 | 大 version id | 超过 `Number.MAX_SAFE_INTEGER` 时最终 URL 仍为精确十进制文本 |
 | stream 重试 | 只用剩余 wall-time；取消不重试；progress 不倒退 |
 | stream 失败 | 删除部分 artifact，不遗留未计费文件 |
+| Registry 注册失败 | Registry 独占 artifact 清理；不重复扣减其他文件配额 |
+| 批量 ZIP | 真实中央目录、空 ZIP、截断 ZIP、统一 deadline、4 路 Workspace 校验上限 |
+| MCP 非法输入 | 缺字段、错误类型、未知字段均返回统一 `YFY_INPUT_INVALID` envelope |
+| staged 慢客户端 | 读租约达到 wall timeout 后中止并释放并发槽 |
 
 ---
 

@@ -5,6 +5,7 @@ import http from "node:http";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import test from "node:test";
 import { runHttp } from "./index.js";
 import { AppRuntime } from "./runtime/runtime.js";
@@ -208,5 +209,65 @@ test("release preserves an active streamed HTTP response and deletes staged byte
     await running.close();
     await runtime.close();
     await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("staged HTTP leases have a bounded lifetime", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-http-lease-timeout-"));
+  const appConfig = config(root);
+  appConfig.downloadWallTimeoutMs = 50;
+  const runtime = await AppRuntime.create(appConfig);
+  let released = false;
+  runtime.downloads.acquireForHttpFetch = async () => ({
+    record: {
+      downloadId: `dl_${"a".repeat(32)}`,
+      expiresAtMs: Date.now() + 60_000,
+      fileName: "slow.bin",
+      identityRef: "default.test",
+      localPath: path.join(root, "slow.bin"),
+      mediaType: "application/octet-stream",
+      remainingDownloads: 1,
+      sha1: "a".repeat(40),
+      sha256: "b".repeat(64),
+      sizeBytes: 1_000_000_000
+    },
+    createReadStream: () => Readable.from((async function* () {
+      while (true) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        yield Buffer.alloc(1024);
+      }
+    })()),
+    release: async () => { released = true; }
+  });
+  const running = await runHttp(runtime);
+  let response: http.IncomingMessage | undefined;
+  try {
+    response = await new Promise<http.IncomingMessage>((resolve, reject) => {
+      const request = http.get(`${running.baseUrl}/staged/v1/dl_${"a".repeat(32)}`, {
+        headers: { Authorization: "Bearer test-token" }
+      }, resolve);
+      request.on("error", reject);
+    });
+    response.pause();
+    await Promise.race([
+      new Promise<void>((resolve) => {
+        response!.once("close", resolve);
+        response!.once("aborted", resolve);
+        response!.once("error", resolve);
+      }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("staged lease did not close")), 1000))
+    ]);
+    for (let attempt = 0; attempt < 50 && !released; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(released, true);
+    const startedAt = Date.now();
+    await running.close();
+    assert.ok(Date.now() - startedAt < 1000);
+  } finally {
+    response?.destroy();
+    await running.close().catch(() => undefined);
+    await runtime.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }
 });

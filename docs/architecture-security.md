@@ -18,11 +18,12 @@ MCP Transport
 
 ## MCP 契约
 
-- 工具使用严格 Zod input / output schema。
+- `tools/list` 暴露严格 Zod input / output schema；执行层自行做同一严格校验，使缺字段、类型错误和未知字段统一返回 `YFY_INPUT_INVALID`，而不是 SDK 的另一套 InvalidParams 文本。
 - 成功：同时提供 `structuredContent` 与 text content。
 - 失败：`isError=true`。
 
 `yfy_download` 会改写本地临时环境，**不是** read-only。
+`yfy_status` 会访问 Provider 检查 token 与用户信息，因此 `openWorldHint=true`。
 `yfy_download_release` 会删除本地文件，标注为 destructive、idempotent、closed-world（`openWorldHint=false`）。
 
 `local_path` 是**同机 stdio Host** 的部署约定，不是 MCP 标准文件 URI。
@@ -50,6 +51,7 @@ Provider transfer URL **不**进入普通工具结果。Client 侧约束：
 - 每次 redirect 重新校验 URL；手工处理 redirect 并限制跳转次数
 - 单文件上限、idle timeout（无进度超时）、wall timeout（总耗时上限）
 - 流式计算 SHA-1、SHA-256 与大小；不把完整文件读入内存
+- Provider JSON 使用无损数值解析；超出 JavaScript 安全范围的 `int64` 保留为十进制字符串
 
 仅当显式启用 `YFY_ALLOW_PRIVATE_TRANSFER_URLS` 时放宽地址限制。
 
@@ -69,6 +71,8 @@ Provider transfer URL **不**进入普通工具结果。Client 侧约束：
 6. **物理删除成功后**才释放 used bytes
 
 配额不足只拒绝新请求，不驱逐仍在有效期内的旧下载。
+Registry 一旦开始接收 artifact，即独占该源文件的移动、失败删除和配额释放责任；工具层不会再次释放同一字节。
+artifact 与 Registry 定时清理均为 single-flight，不会因上轮尚未完成而继续堆积同类任务。
 
 ---
 
@@ -116,10 +120,11 @@ Manifest 记录：版本号、到期时间、文件名与媒体类型、SHA-1/SH
 HTTP GET 会获取**活动读租约**。TTL 到期或 `yfy_download_release` 时：
 
 1. 立即禁止新的本地 registry 查找与新的 HTTP GET
-2. 已开始的读取可以完成
+2. 已开始的读取可在配置的 wall timeout 内完成
 3. 最后一个租约结束后再物理删除
 
 删除失败不会假成功，也不会提前扣减配额；调用方应在关闭本地解析器后重试。
+HTTP 服务关闭会中止 staged 读租约；慢客户端不能无限占据并发槽或阻塞关机。
 
 ---
 

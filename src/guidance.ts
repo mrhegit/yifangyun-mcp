@@ -13,6 +13,7 @@ export function serverInstructions(runtime: AppRuntime): string {
       "With a context-bound ItemRef use yfy_get for metadata or yfy_download for bytes on disk; with an exact relative path use yfy_resolve; otherwise use yfy_search for candidates.",
       "Indexed search is non-exhaustive and never proves absence. claim_allowed=true only means returned metadata supports the query match; use yfy_get to confirm current existence. Execute next_action for selection_policy=continue_search; for must_disambiguate do not download hits[0] without path uniqueness. Content field hits never claim_allowed.",
       "yfy_download writes a verified temp file and returns download.local_path (stdio/co-located) and/or download.fetch_url (HTTP staged GET /staged/v1/...), hashes, optional small UTF-8 text preview, and TTL cleanup. Open path or fetch URL with host parser skills (xlsx/pdf/docx/text). This server does not provide PDF/Office body parsing or OCR. Optional yfy_download_release frees disk sooner; expired files are pruned automatically.",
+      "Use yfy_download_batch only for 1-20 current file/folder refs from one non-external identity. Its verification covers ZIP structure and whole-archive hashes, not semantic completeness of every requested descendant.",
       "Paginated tools use flat first-page fields or top-level cursor continuation; copy next_action exactly. Large text responses keep exact operational anchors in control."
     );
   }
@@ -29,6 +30,9 @@ export function serverInstructions(runtime: AppRuntime): string {
   }
   if (runtime.config.toolsets.includes("transfer")) {
     instructions.push("Do not use yfy_transfer_ticket_get as an ordinary read path (usage_policy=special_integration_only, not_for_verified_download); prefer yfy_download. Transfer URLs are sensitive (do_not_echo_url) and must not be logged.");
+  }
+  if (runtime.config.toolsets.includes("admin")) {
+    instructions.push("Request yfy_admin_user_read login_url/login_params only after explicit user intent; the result contains sensitive short-lived authentication material.");
   }
   return instructions.join(" ");
 }

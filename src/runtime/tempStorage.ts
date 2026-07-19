@@ -8,6 +8,12 @@ export interface TempReservation {
   release(): Promise<void>;
 }
 
+interface ManagedDirectoryIdentity {
+  device: bigint;
+  inode: bigint;
+  realPath: string;
+}
+
 class AsyncMutex {
   private tail = Promise.resolve();
 
@@ -25,11 +31,12 @@ class AsyncMutex {
 }
 
 export class TempStorageManager {
+  private artifactsIdentity?: ManagedDirectoryIdentity;
+  private downloadsIdentity?: ManagedDirectoryIdentity;
   private initialized = false;
   private readonly mutex = new AsyncMutex();
   private reservedBytes = 0;
-  private readonly safeArtifactNamespaces = new Set<string>();
-  private readonly safeDownloadIdentities = new Set<string>();
+  private rootIdentity?: ManagedDirectoryIdentity;
   private usedBytes = 0;
 
   constructor(
@@ -53,12 +60,9 @@ export class TempStorageManager {
     if (!/^[a-zA-Z0-9_-]+$/.test(namespace)) throw unsafeTempDirectory(namespace);
     await this.initialize();
     const target = path.join(this.artifactsRoot(), namespace);
-    if (this.safeArtifactNamespaces.has(namespace)) return target;
     return this.mutex.run(async () => {
-      if (!this.safeArtifactNamespaces.has(namespace)) {
-        await ensureSafeChildDirectory(this.artifactsRoot(), namespace, false);
-        this.safeArtifactNamespaces.add(namespace);
-      }
+      await this.validateManagedRootsLocked();
+      await ensureSafeChildDirectory(this.artifactsRoot(), namespace, false);
       return target;
     });
   }
@@ -67,11 +71,9 @@ export class TempStorageManager {
     if (!/^[a-zA-Z0-9._-]{1,64}$/.test(identity) || !/^dl_[a-f0-9]{32}$/.test(downloadId)) throw unsafeTempDirectory(`${identity}/${downloadId}`);
     await this.initialize();
     return this.mutex.run(async () => {
+      await this.validateManagedRootsLocked();
       const identityDirectory = path.join(this.downloadsRoot(), identity);
-      if (!this.safeDownloadIdentities.has(identity)) {
-        await ensureSafeChildDirectory(this.downloadsRoot(), identity, false);
-        this.safeDownloadIdentities.add(identity);
-      }
+      await ensureSafeChildDirectory(this.downloadsRoot(), identity, false);
       return ensureSafeChildDirectory(identityDirectory, downloadId, true);
     });
   }
@@ -80,14 +82,16 @@ export class TempStorageManager {
     await this.mutex.run(async () => {
       if (this.initialized) return;
       await ensureSafeDirectory(this.rootDir);
-      const realRoot = await fs.realpath(this.rootDir);
+      this.rootIdentity = await captureDirectoryIdentity(this.rootDir);
       for (const managedRoot of [this.artifactsRoot(), this.downloadsRoot()]) {
         await ensureSafeDirectory(managedRoot);
-        const realManagedRoot = await fs.realpath(managedRoot);
-        const relative = path.relative(realRoot, realManagedRoot);
+        const managedIdentity = await captureDirectoryIdentity(managedRoot);
+        const relative = path.relative(this.rootIdentity.realPath, managedIdentity.realPath);
         if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
           throw unsafeTempDirectory(managedRoot);
         }
+        if (managedRoot === this.artifactsRoot()) this.artifactsIdentity = managedIdentity;
+        else this.downloadsIdentity = managedIdentity;
       }
       await this.pruneArtifactsLocked();
       this.usedBytes = await this.directoryFileBytes(this.artifactsRoot()) + await this.directoryFileBytes(this.downloadsRoot());
@@ -104,6 +108,7 @@ export class TempStorageManager {
     if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error("Temporary storage reservation must be a non-negative integer.");
     await this.initialize();
     await this.mutex.run(async () => {
+      await this.validateManagedRootsLocked();
       if (this.usedBytes + this.reservedBytes + bytes > this.maxBytes && this.reservedBytes === 0) {
         await this.pruneArtifactsLocked();
         this.usedBytes = await this.directoryFileBytes(this.artifactsRoot()) + await this.directoryFileBytes(this.downloadsRoot());
@@ -150,6 +155,7 @@ export class TempStorageManager {
   async reconcile(): Promise<void> {
     await this.initialize();
     await this.mutex.run(async () => {
+      await this.validateManagedRootsLocked();
       this.usedBytes = await this.directoryFileBytes(this.artifactsRoot()) + await this.directoryFileBytes(this.downloadsRoot());
       this.assertWithinLimit();
     });
@@ -158,6 +164,7 @@ export class TempStorageManager {
   async pruneArtifacts(): Promise<void> {
     await this.initialize();
     await this.mutex.run(async () => {
+      await this.validateManagedRootsLocked();
       if (this.reservedBytes > 0) return;
       const removedBytes = await this.pruneArtifactsLocked();
       this.usedBytes = Math.max(0, this.usedBytes - removedBytes);
@@ -185,6 +192,13 @@ export class TempStorageManager {
         suggestedAction: "Remove expired files from YFY_TEMP_DIR or raise YFY_MAX_TEMP_BYTES before restarting."
       });
     }
+  }
+
+  private async validateManagedRootsLocked(): Promise<void> {
+    if (!this.rootIdentity || !this.artifactsIdentity || !this.downloadsIdentity) throw unsafeTempDirectory(this.rootDir);
+    await assertDirectoryIdentity(this.rootDir, this.rootIdentity);
+    await assertDirectoryIdentity(this.artifactsRoot(), this.artifactsIdentity);
+    await assertDirectoryIdentity(this.downloadsRoot(), this.downloadsIdentity);
   }
 
   private async pruneArtifactsLocked(): Promise<number> {
@@ -233,6 +247,19 @@ async function ensureSafeDirectory(directory: string): Promise<void> {
   const after = await fs.lstat(directory);
   if (!after.isDirectory() || after.isSymbolicLink()) throw unsafeTempDirectory(directory);
   await fs.chmod(directory, 0o700).catch(() => undefined);
+}
+
+async function captureDirectoryIdentity(directory: string): Promise<ManagedDirectoryIdentity> {
+  const stat = await fs.lstat(directory, { bigint: true });
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw unsafeTempDirectory(directory);
+  return { device: stat.dev, inode: stat.ino, realPath: await fs.realpath(directory) };
+}
+
+async function assertDirectoryIdentity(directory: string, expected: ManagedDirectoryIdentity): Promise<void> {
+  const actual = await captureDirectoryIdentity(directory);
+  if (actual.device !== expected.device || actual.inode !== expected.inode || actual.realPath !== expected.realPath) {
+    throw unsafeTempDirectory(directory);
+  }
 }
 
 function unsafeTempDirectory(directory: string): YifangyunError {

@@ -66,7 +66,7 @@ function config(toolsets: AppConfig["toolsets"]): AppConfig {
 
 test("the breaking download contract advances only the public contract version", () => {
   const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
-  assert.equal(SERVER_VERSION, "1.1.0-beta.1");
+  assert.equal(SERVER_VERSION, "1.1.0-beta.2");
   assert.equal(packageJson.version, SERVER_VERSION);
   assert.deepEqual([
     CONTRACT_VERSION,
@@ -75,7 +75,7 @@ test("the breaking download contract advances only the public contract version",
     INVENTORY_REF_VERSION,
     SNAPSHOT_SCHEMA_VERSION,
     WORKSPACE_FINGERPRINT_VERSION
-  ], [2, 1, 1, 1, 1, 1]);
+  ], [3, 1, 1, 1, 1, 1]);
 });
 
 test("default catalog exposes the current tools and schemas", async () => {
@@ -85,7 +85,7 @@ test("default catalog exposes the current tools and schemas", async () => {
     registerCatalog(server as unknown as McpServer, runtime);
     const expected = [
       "yfy_browse", "yfy_comments", "yfy_department_children", "yfy_department_get", "yfy_department_users",
-      "yfy_download", "yfy_download_release", "yfy_get", "yfy_get_many", "yfy_group_list", "yfy_group_users",
+      "yfy_download", "yfy_download_batch", "yfy_download_release", "yfy_get", "yfy_get_many", "yfy_group_list", "yfy_group_users",
       "yfy_inventory_cancel", "yfy_inventory_create", "yfy_inventory_get", "yfy_inventory_release", "yfy_inventory_search",
       "yfy_membership_check", "yfy_resolve", "yfy_search", "yfy_shares", "yfy_status", "yfy_user_search", "yfy_versions",
       "yfy_workspace_validate"
@@ -101,6 +101,8 @@ test("default catalog exposes the current tools and schemas", async () => {
     assert.equal((server.tools.get("yfy_inventory_cancel")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
     assert.equal((server.tools.get("yfy_inventory_release")!.definition.annotations as { destructiveHint: boolean }).destructiveHint, true);
     assert.equal((server.tools.get("yfy_download")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
+    assert.equal((server.tools.get("yfy_download_batch")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
+    assert.equal((server.tools.get("yfy_status")!.definition.annotations as { openWorldHint: boolean }).openWorldHint, true);
     assert.equal((server.tools.get("yfy_download_release")!.definition.annotations as { destructiveHint: boolean }).destructiveHint, true);
     assert.equal((server.tools.get("yfy_download_release")!.definition.annotations as { openWorldHint: boolean }).openWorldHint, false);
   } finally {
@@ -118,6 +120,7 @@ test("optional toolsets preserve mutation, collaboration, admin and transfer cap
     }
     assert.equal((server.tools.get("yfy_item_mutate")!.definition.annotations as { destructiveHint: boolean }).destructiveHint, true);
     assert.equal((server.tools.get("yfy_file_upload")!.definition.annotations as { destructiveHint: boolean }).destructiveHint, true);
+    assert.equal((server.tools.get("yfy_admin_user_read")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
     for (const [name, tool] of server.tools) assert.ok(tool.definition.outputSchema, `${name} must declare outputSchema`);
   } finally {
     await runtime.close();
@@ -126,8 +129,8 @@ test("optional toolsets preserve mutation, collaboration, admin and transfer cap
 
 test("the MCP client compiles every catalog output schema", async () => {
   const runtime = await AppRuntime.create(config(["drive", "workspace", "inventory", "organization", "mutation", "collaboration", "admin", "transfer"]));
-  const server = new RealMcpServer({ name: "schema-test", version: "1.1.0-beta.1" });
-  const client = new Client({ name: "schema-client", version: "1.1.0-beta.1" });
+  const server = new RealMcpServer({ name: "schema-test", version: "1.1.0-beta.2" });
+  const client = new Client({ name: "schema-client", version: "1.1.0-beta.2" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   try {
     registerCatalog(server, runtime);
@@ -181,8 +184,8 @@ test("drive tools are absent when the drive toolset is disabled", async () => {
 test("status enables only workflows whose complete tool chain is registered", async () => {
   const cases: Array<{ enabled: string[]; toolsets: AppConfig["toolsets"] }> = [
     { toolsets: ["workspace"], enabled: [] },
-    { toolsets: ["drive"], enabled: ["read_small_text"] },
-    { toolsets: ["drive", "workspace"], enabled: ["read_small_text", "workspace_download"] },
+    { toolsets: ["drive"], enabled: ["download_for_host_parsing", "batch_zip_download"] },
+    { toolsets: ["drive", "workspace"], enabled: ["download_for_host_parsing", "workspace_download", "batch_zip_download"] },
     { toolsets: ["inventory"], enabled: [] },
     { toolsets: ["workspace", "inventory"], enabled: ["absence_audit"] }
   ];

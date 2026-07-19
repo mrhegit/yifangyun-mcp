@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { crc32 } from "node:zlib";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { YifangyunError } from "./client.js";
 import { provenance } from "./domain/projectors.js";
@@ -48,6 +49,42 @@ function contentHashes(body: string | Buffer) {
     sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
     sizeBytes: bytes.length
   };
+}
+
+function storedZip(fileName = "file.txt", content = "archive"): Buffer {
+  const name = Buffer.from(fileName);
+  const data = Buffer.from(content);
+  const checksum = crc32(data);
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(20, 4);
+  local.writeUInt32LE(checksum, 14);
+  local.writeUInt32LE(data.length, 18);
+  local.writeUInt32LE(data.length, 22);
+  local.writeUInt16LE(name.length, 26);
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50, 0);
+  central.writeUInt16LE(20, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt32LE(checksum, 16);
+  central.writeUInt32LE(data.length, 20);
+  central.writeUInt32LE(data.length, 24);
+  central.writeUInt16LE(name.length, 28);
+  const centralOffset = local.length + name.length + data.length;
+  const centralSize = central.length + name.length;
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(1, 8);
+  end.writeUInt16LE(1, 10);
+  end.writeUInt32LE(centralSize, 12);
+  end.writeUInt32LE(centralOffset, 16);
+  return Buffer.concat([local, name, data, central, name, end]);
+}
+
+function emptyZip(): Buffer {
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  return end;
 }
 
 function access() {
@@ -620,13 +657,15 @@ test("current file versions omit historical VersionRef values", async () => {
   assert.equal(versions[1]?.ref, VERSION_10_7);
   assert.deepEqual(versions[1]?.usage, {
     for_download: "pass_version_ref",
-    note: "Historical version: pass this ref as the version parameter on yfy_download."
+    note: "Historical Provider support is unknown. Pass this ref only when an explicit historical download attempt is required."
   });
-  assert.equal(versions[2]?.download_ready, false);
+  assert.equal(versions[0]?.download_support, "supported");
+  assert.equal(versions[1]?.download_support, "unknown");
+  assert.equal(versions[2]?.download_support, "unsupported");
   assert.equal(versions[2]?.ref, null);
   assert.deepEqual(versions[2]?.usage, {
     for_download: "unavailable",
-    note: "Historical version lacks a Provider version ID and cannot be selected safely."
+    note: "Historical version lacks the metadata or Provider version ID required for verified selection."
   });
   assert.deepEqual(result.structuredContent?.version_selection_rules, {
     current: "Omit the version parameter on yfy_download for the current version. Do not invent a version ref.",
@@ -1129,6 +1168,265 @@ test("yfy_download enforces workspace membership for a historical version", asyn
   }
 });
 
+test("yfy_download_batch packages current files and folders through Provider pack_download", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-batch-"));
+  const source = path.join(root, "batch.zip");
+  const body = storedZip();
+  await fs.writeFile(source, body);
+  const hashes = contentHashes(body);
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  let requestBody: unknown;
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false },
+    gateway: {
+      context: access,
+      postUser: async (_endpoint: string, _context: string, bodyValue: unknown) => {
+        requestBody = bodyValue;
+        return response("/v2/file/pack_download", { download_url: "https://download.example/batch" });
+      }
+    },
+    client: {
+      downloadFromUrlToTemp: async () => ({
+        contentType: "application/zip",
+        detectedContentType: "application/zip",
+        fileName: "batch.zip",
+        tempPath: source,
+        ...hashes,
+        meta: response("/download", {}).meta
+      })
+    },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_download_batch", { items: [FILE_10, FOLDER_10] });
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    assert.deepEqual(requestBody, { item_typed_ids: ["file_10", "folder_10"] });
+    assert.equal(result.structuredContent?.format, "zip");
+    assert.deepEqual(result.structuredContent?.verification, { scope: "zip_structure_and_archive_hashes", entry_count: 1, uncompressed_size_bytes: 7 });
+    const download = result.structuredContent?.download as Record<string, unknown>;
+    assert.equal(download.media_type, "application/zip");
+    assert.equal(download.media_type_source, "archive_validation");
+    assert.equal(typeof download.local_path, "string");
+    assert.equal(await downloads.release(String(download.download_id)), true);
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download_batch bounds workspace metadata concurrency", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-batch-workspace-concurrency-"));
+  const source = path.join(root, "batch.zip");
+  const body = storedZip();
+  await fs.writeFile(source, body);
+  const hashes = contentHashes(body);
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  const refs = Array.from({ length: 9 }, (_value, index) => formatItemRef("file", String(index + 10), "default", IDENTITY_REF));
+  let activeMetadata = 0;
+  let maxActiveMetadata = 0;
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false },
+    access: { resolveWorkspaceRef: scopedAccess },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => {
+        activeMetadata += 1;
+        maxActiveMetadata = Math.max(maxActiveMetadata, activeMetadata);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        activeMetadata -= 1;
+        return endpoint.includes("/folder/")
+          ? response(endpoint, { id: 501, name: "Root", type: "folder" })
+          : response(endpoint, { id: endpoint.match(/file\/(\d+)/)?.[1] ?? "10", name: "file.txt", type: "file", path: [{ id: 501, name: "Root", type: "folder" }] });
+      },
+      postUser: async () => response("/v2/file/pack_download", { download_url: "https://download.example/batch" })
+    },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "batch.zip", tempPath: source, ...hashes, meta: response("/download", {}).meta }) },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_download_batch", { items: refs, workspace: WORKSPACE_SCOPE });
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    assert.ok(maxActiveMetadata <= 4, `metadata concurrency was ${maxActiveMetadata}`);
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download_batch rejects duplicate and mixed-identity refs before Provider calls", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-batch-input-"));
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  let providerCalls = 0;
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false },
+    gateway: { context: access, postUser: async () => { providerCalls += 1; return response("/v2/file/pack_download", {}); } },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  const otherIdentity = formatItemRef("file", "11", "default", "b".repeat(24));
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    assert.equal(errorCode(await call(server, "yfy_download_batch", { items: [FILE_10, FILE_10] })), "YFY_INPUT_INVALID");
+    assert.equal(errorCode(await call(server, "yfy_download_batch", { items: [FILE_10, otherIdentity] })), "YFY_REF_CONTEXT_CONFLICT");
+    assert.equal(providerCalls, 0);
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download_batch rejects a truncated ZIP and removes the candidate", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-batch-invalid-"));
+  const source = path.join(root, "batch.zip");
+  const body = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from("truncated")]);
+  await fs.writeFile(source, body);
+  const hashes = contentHashes(body);
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false },
+    gateway: {
+      context: access,
+      postUser: async () => response("/v2/file/pack_download", { download_url: "https://download.example/batch" })
+    },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "batch.zip", tempPath: source, ...hashes, meta: response("/download", {}).meta }) },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    assert.equal(errorCode(await call(server, "yfy_download_batch", { items: [FILE_10] })), "YFY_PACK_DOWNLOAD_INVALID");
+    await assert.rejects(() => fs.access(source));
+    assert.equal(tempStorage.usage().used_bytes, 0);
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download_batch accepts a structurally valid empty ZIP", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-batch-empty-"));
+  const source = path.join(root, "batch.zip");
+  const body = emptyZip();
+  await fs.writeFile(source, body);
+  const hashes = contentHashes(body);
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false },
+    gateway: { context: access, postUser: async () => response("/v2/file/pack_download", { download_url: "https://download.example/batch" }) },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "batch.zip", tempPath: source, ...hashes, meta: response("/download", {}).meta }) },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_download_batch", { items: [FILE_10] });
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    assert.deepEqual(result.structuredContent?.verification, { scope: "zip_structure_and_archive_hashes", entry_count: 0, uncompressed_size_bytes: 0 });
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download_batch applies one wall deadline to the whole operation", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-batch-timeout-"));
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false, downloadWallTimeoutMs: 20 },
+    gateway: {
+      context: access,
+      postUser: async () => response("/v2/file/pack_download", { download_url: "https://download.example/batch" })
+    },
+    client: {
+      downloadFromUrlToTemp: async (_url: string, options: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
+        options.signal?.addEventListener("abort", () => reject(new YifangyunError("cancelled", { code: "YFY_REQUEST_CANCELLED" })), { once: true });
+      })
+    },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    assert.equal(errorCode(await call(server, "yfy_download_batch", { items: [FILE_10] })), "YFY_PROVIDER_TIMEOUT");
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download_batch rejects external enterprise contexts not declared by OpenAPI", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-batch-external-"));
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  let providerCalls = 0;
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false },
+    gateway: {
+      context: () => ({ context: { id: "default", userId: "530", externalEnterpriseId: "900" }, identityRef: IDENTITY_REF }),
+      postUser: async () => { providerCalls += 1; return response("/v2/file/pack_download", {}); }
+    },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    assert.equal(errorCode(await call(server, "yfy_download_batch", { items: [FILE_10] })), "YFY_PACK_DOWNLOAD_EXTERNAL_IDENTITY_UNSUPPORTED");
+    assert.equal(providerCalls, 0);
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download_batch does not double-release accounting after registry ownership starts", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-batch-register-failure-"));
+  const tempStorage = new TempStorageManager(root, 1_048_576, 60);
+  const namespace = await tempStorage.ensureArtifactNamespace(IDENTITY_REF);
+  const retainedBody = Buffer.from("retained");
+  const retainedPath = path.join(namespace, "retained.bin");
+  const retainedReservation = await tempStorage.reserve(retainedBody.length);
+  await fs.writeFile(retainedPath, retainedBody);
+  await retainedReservation.commit(retainedBody.length);
+  const body = storedZip();
+  const source = path.join(namespace, "batch.zip");
+  const sourceReservation = await tempStorage.reserve(body.length);
+  await fs.writeFile(source, body);
+  await sourceReservation.commit(body.length);
+  const hashes = contentHashes(body);
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false },
+    gateway: { context: access, postUser: async () => response("/v2/file/pack_download", { download_url: "https://download.example/batch" }) },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "batch.zip", tempPath: source, ...hashes, meta: response("/download", {}).meta }) },
+    downloads: {
+      register: async (input: { sizeBytes: number; sourcePath: string }) => {
+        await fs.rm(input.sourcePath, { force: true });
+        await tempStorage.releaseUsed(input.sizeBytes);
+        throw new YifangyunError("registry closed", { code: "YFY_DOWNLOAD_REGISTRY_CLOSED" });
+      }
+    },
+    tempStorage
+  } as unknown as AppRuntime;
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    assert.equal(errorCode(await call(server, "yfy_download_batch", { items: [FILE_10] })), "YFY_DOWNLOAD_REGISTRY_CLOSED");
+    assert.equal(tempStorage.usage().used_bytes, retainedBody.length);
+    assert.equal(await fs.readFile(retainedPath, "utf8"), "retained");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
 test("yfy_download preserves historical Provider version ids beyond MAX_SAFE_INTEGER", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-large-version-"));
   const body = "history";
@@ -1163,6 +1461,48 @@ test("yfy_download preserves historical Provider version ids beyond MAX_SAFE_INT
     const result = await call(server, "yfy_download", { workspace: WORKSPACE_SCOPE, file: FILE_10, version: versionRef });
     assert.notEqual(result.isError, true, JSON.stringify(result.content));
     assert.equal(requestedVersion, providerVersionId);
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download uses info_v2 instead of undeclared versions for current external content", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-external-current-"));
+  const body = "external-current";
+  const hashes = contentHashes(body);
+  const source = path.join(root, "external.txt");
+  await fs.writeFile(source, body);
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  let versionCalls = 0;
+  const externalAccess = { context: { id: "default", userId: "530", externalEnterpriseId: "900" }, identityRef: IDENTITY_REF };
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false },
+    gateway: {
+      context: () => externalAccess,
+      getUser: async (endpoint: string, _context: string, params: Record<string, unknown> = {}) => {
+        if (endpoint.endsWith("/versions")) {
+          versionCalls += 1;
+          return response(endpoint, {});
+        }
+        if (endpoint.endsWith("/download_v2")) {
+          assert.equal(params.external_enterprise_id, "900");
+          return response(endpoint, { download_url: "https://download.example/file" });
+        }
+        assert.equal(params.external_enterprise_id, "900");
+        return response(endpoint, { id: 10, name: "external.txt", type: "file", sha1: hashes.sha1, size: hashes.sizeBytes, modified_at: 1, file_version_key: "external-v1" });
+      }
+    },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "external.txt", tempPath: source, ...hashes, meta: response("/download", {}).meta }) },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_download", { file: FILE_10 });
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    assert.equal(versionCalls, 0);
   } finally {
     await downloads.close();
     await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
@@ -1339,6 +1679,43 @@ test("yfy_download reports an unavailable historical original without substituti
     const result = await call(server, "yfy_download", { workspace: WORKSPACE_SCOPE, file: FILE_10, version: VERSION_10_7 });
     assert.equal(result.isError, true);
     assert.equal(errorCode(result), "YFY_HISTORICAL_DOWNLOAD_UNAVAILABLE");
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download maps a Provider-rejected listed version to historical unavailable", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-provider-history-"));
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => {
+        if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [
+          { current: true, sha1: "a".repeat(40), size: 10 },
+          { id: 7, current: false, sha1: "b".repeat(40), size: 9 }
+        ] });
+        if (endpoint.endsWith("/download_v2")) {
+          throw new YifangyunError("version missing", {
+            code: "YFY_PROVIDER_HTTP_ERROR",
+            details: { api_code: "galaxy:file_version_not_found" },
+            statusCode: 400
+          });
+        }
+        return response(endpoint, { id: "10", name: "report.pdf", type: "file", size: 10 });
+      }
+    },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_download", { file: FILE_10, version: VERSION_10_7 });
+    assert.equal(errorCode(result), "YFY_HISTORICAL_DOWNLOAD_UNAVAILABLE");
+    assert.equal(errorCategory(result), "provider_contract");
   } finally {
     await downloads.close();
     await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });

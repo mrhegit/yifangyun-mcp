@@ -21,5 +21,6 @@ coverage/
 npm-debug.log*
 *.tgz
 .ace-tool/
+src/.generated/
 .DS_Store
 Thumbs.db

@@ -73,7 +73,7 @@ export function registerOrganizationTools(server: McpServer, runtime: AppRuntime
   });
 
   registerTool(server, "yfy_department_children", {
-    title: "List Yifangyun Child Departments", description: "List direct child departments with a stable server-side cursor.",
+    title: "List Yifangyun Child Departments", description: "List direct child departments with copyable place_ref values and a stable server-side cursor. Omit department_id to start from the organization root.",
     inputSchema: DepartmentChildrenInput.inputSchema, inputValidator: DepartmentChildrenInput.validator, outputSchema: { departments: z.array(DepartmentSchema), ...PageOutputShape, provenance: ProvenanceSchema }
   }, { readOnly: true }, async (args, extra) => {
     const pageArgs = resolvePaginationArgs(args, "department_children");

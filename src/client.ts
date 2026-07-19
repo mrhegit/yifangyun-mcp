@@ -8,6 +8,7 @@ import type { LookupFunction } from "node:net";
 import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { isSafeNumber, parse as parseLosslessJson } from "lossless-json";
 import { Agent, fetch as undiciFetch } from "undici";
 import type { RequestInit as UndiciRequestInit } from "undici";
 import type {
@@ -211,7 +212,10 @@ function normalizeProviderEndpoint(url: string): string {
 }
 
 function parseJson(text: string): unknown {
-  return text ? JSON.parse(text) : null;
+  return text ? parseLosslessJson(text, null, {
+    onDuplicateKey: ({ key }) => { throw new Error(`Duplicate JSON key: ${key}`); },
+    parseNumber: (value) => isSafeNumber(value) ? Number(value) : value
+  }) : null;
 }
 
 function summarizeText(text: string): string {
@@ -387,6 +391,7 @@ export function redactSensitiveText(text: string): string {
 
 export class YifangyunClient {
   private readonly cleanupTimer: NodeJS.Timeout;
+  private cleanupRunning = false;
   private readonly bucketSemaphores = new Map<string, Semaphore>();
   private readonly requestSemaphore: Semaphore;
   private readonly tempStorage: TempStorageManager;
@@ -404,7 +409,11 @@ export class YifangyunClient {
     this.transferDispatcher = new Agent({
       connect: { lookup: createTransferLookup(Boolean(config.allowPrivateTransferUrls)) }
     });
-    this.cleanupTimer = setInterval(() => void this.tempStorage.pruneArtifacts().catch(() => undefined), 60000);
+    this.cleanupTimer = setInterval(() => {
+      if (this.cleanupRunning) return;
+      this.cleanupRunning = true;
+      void this.tempStorage.pruneArtifacts().catch(() => undefined).finally(() => { this.cleanupRunning = false; });
+    }, 60000);
     this.cleanupTimer.unref();
   }
 
@@ -502,9 +511,8 @@ export class YifangyunClient {
 
   async downloadFromUrlToTemp(url: string, options: DownloadOptions): Promise<DownloadedFile> {
     const downloadStartedAt = Date.now();
-    await this.validateTransferUrl(url, options.signal);
     const result = await this.rawRequest(url, { method: "GET" }, {
-      bucketKey: `download:${options.namespace ?? "shared"}`,
+      bucketKey: `identity:${options.namespace ?? "shared"}`,
       retry: options.retry ?? true,
       signal: options.signal,
       timeoutMs: options.timeoutMs ?? this.config.downloadWallTimeoutMs ?? 300000,
@@ -632,6 +640,21 @@ export class YifangyunClient {
       }
       if (error instanceof YifangyunError) {
         throw error;
+      }
+      if (options.signal?.aborted) {
+        throw new YifangyunError("Yifangyun download was cancelled.", { code: "YFY_REQUEST_CANCELLED", phase: "download_stream" });
+      }
+      if (result.signal.aborted) {
+        throw new YifangyunError("Yifangyun download exceeded its transfer deadline.", { code: "YFY_PROVIDER_TIMEOUT", phase: "download_stream", retryable: true });
+      }
+      const localStorageCode = this.localStorageErrorCode(error);
+      if (localStorageCode) {
+        throw new YifangyunError("Local temporary storage could not accept downloaded bytes.", {
+          code: "YFY_LOCAL_STORAGE_WRITE_FAILED",
+          phase: "temp_storage_write",
+          agentDetails: { filesystem_code: localStorageCode },
+          suggestedAction: "Check YFY_TEMP_DIR existence, permissions and free space before retrying."
+        });
       }
       const message = error instanceof Error ? error.message : String(error);
       throw new YifangyunError(redactSensitiveText(`Failed to download file content: ${message}`), {
@@ -831,6 +854,9 @@ export class YifangyunClient {
         const data = asJsonValue(parsed);
         if (!result.response.ok) {
           throw this.httpError(result.response, data, url);
+        }
+        if (isJsonObject(data) && data.success === false) {
+          throw this.providerDeclaredFailure(result.response, data, url);
         }
 
         return {
@@ -1039,6 +1065,30 @@ export class YifangyunClient {
     });
   }
 
+  private providerDeclaredFailure(response: Response, responseBody: JsonObject, url: string): YifangyunError {
+    const details: JsonObject = {
+      endpoint: new URL(url).pathname,
+      response_shape: summarizeShape(responseBody),
+      status_code: response.status
+    };
+    const errors = responseBody.errors;
+    if (Array.isArray(errors) && errors.length > 0 && isJsonObject(errors[0])) {
+      const apiCode = getString(errors[0], "code");
+      const apiMessage = getString(errors[0], "msg") ?? getString(errors[0], "message");
+      if (apiCode) details.api_code = apiCode;
+      if (apiMessage) details.api_message = redactSensitiveText(apiMessage);
+    }
+    const requestId = getString(responseBody, "request_id");
+    if (requestId) details.request_id = requestId;
+    return new YifangyunError("Yifangyun reported that the request was not successful.", {
+      code: "YFY_PROVIDER_DECLARED_FAILURE",
+      details,
+      phase: "provider_response",
+      retryable: false,
+      statusCode: response.status
+    });
+  }
+
   private invalidJsonError(response: Response, text: string, url: string, error: unknown): YifangyunError {
     const endpoint = new URL(url).pathname;
     const reason = error instanceof Error ? error.message : String(error);
@@ -1150,6 +1200,17 @@ export class YifangyunClient {
     return false;
   }
 
+  private localStorageErrorCode(error: unknown): string | undefined {
+    const localCodes = new Set(["EACCES", "EBUSY", "EDQUOT", "EEXIST", "EIO", "EISDIR", "EMFILE", "ENAMETOOLONG", "ENFILE", "ENOENT", "ENOSPC", "ENOTDIR", "EPERM", "EROFS"]);
+    let current = error;
+    for (let depth = 0; depth < 5 && current && typeof current === "object"; depth += 1) {
+      const code = "code" in current && typeof current.code === "string" ? current.code : undefined;
+      if (code && localCodes.has(code)) return code;
+      current = "cause" in current ? current.cause : undefined;
+    }
+    return undefined;
+  }
+
   private requestBucket(init: RequestInit): string {
     const headers = new Headers(init.headers);
     const authorization = headers.get("authorization") ?? "anonymous";
@@ -1157,6 +1218,7 @@ export class YifangyunClient {
   }
 
   private requestIdentityBucket(subjectType: TokenSubjectType, subjectId: IdLike, externalEnterpriseId?: IdLike): string {
+    if (subjectType === "user") return `identity:${this.resolveAccessIdentityRef(subjectId, externalEnterpriseId)}`;
     return `api:${crypto.createHmac("sha256", this.config.clientSecret).update(`${subjectType}:${String(subjectId)}:${String(externalEnterpriseId ?? "")}`).digest("hex").slice(0, 16)}`;
   }
 }

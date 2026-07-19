@@ -181,7 +181,10 @@ export function projectDepartment(value: JsonValue | undefined): JsonObject {
   const output: JsonObject = {};
   const id = idValue(source.id);
   const parentId = idValue(source.parent_id);
-  if (id) output.id = id;
+  if (id) {
+    output.id = id;
+    output.place_ref = `department:${id}`;
+  }
   if (parentId) output.parent_id = parentId;
   if (typeof source.name === "string") output.name = source.name;
   if (typeof source.permission_type === "string") output.permission_type = source.permission_type;

@@ -13,6 +13,9 @@ jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
+    env:
+      YFY_BUILD_ID: npm-${{ github.ref_name }}
+      YFY_BUILD_COMMIT: ${{ github.sha }}
 
     steps:
       - name: Checkout repository
@@ -48,8 +51,20 @@ jobs:
       - name: Run snapshot performance test
         run: npm run test:perf
 
-      - name: Check package contents
-        run: npm pack --dry-run
+      - name: Pack release artifact
+        id: pack
+        shell: bash
+        run: |
+          npm pack --json --silent > npm-pack.json
+          PACKAGE_FILE="$(node -p "JSON.parse(require('fs').readFileSync('npm-pack.json', 'utf8'))[0].filename")"
+          echo "path=${PACKAGE_FILE}" >> "$GITHUB_OUTPUT"
+          tar -tf "$PACKAGE_FILE" | grep -q '^package/dist/.generated/buildInfo.js$'
+          tar -xOf "$PACKAGE_FILE" package/dist/.generated/buildInfo.js | grep -Fq "npm-${GITHUB_REF_NAME}"
+          tar -xOf "$PACKAGE_FILE" package/dist/.generated/buildInfo.js | grep -Fq "${GITHUB_SHA}"
+          if tar -tf "$PACKAGE_FILE" | grep -q 'evaluation-issues'; then
+            echo "Internal evaluation notes must not be published."
+            exit 1
+          fi
 
       - name: Generate release notes
         shell: bash
@@ -79,7 +94,7 @@ jobs:
             echo ""
             echo "- \`npm ci\`"
             echo "- \`npm run build\`"
-            echo "- \`npm pack --dry-run\`"
+            echo "- packed and inspected the exact npm release artifact"
           } > release-notes.md
 
       - name: Select npm dist-tag
@@ -94,7 +109,7 @@ jobs:
           fi
 
       - name: Publish to npm
-        run: npm publish --provenance --tag "${{ steps.dist-tag.outputs.name }}"
+        run: npm publish "${{ steps.pack.outputs.path }}" --provenance --tag "${{ steps.dist-tag.outputs.name }}"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 

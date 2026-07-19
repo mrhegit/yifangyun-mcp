@@ -1,6 +1,6 @@
 # yifangyun-mcp-server
 
-亿方云 OpenAPI 的 MCP Server。当前版本 `1.1.0-beta.1`。
+亿方云 OpenAPI 的 MCP Server。当前版本 `1.1.0-beta.2`。
 
 默认能力：网盘浏览、检索、元数据读取、受控下载。可选启用 **Workspace**（业务范围约束）和 **Inventory**（完整目录清单与缺失审计）。
 
@@ -25,6 +25,7 @@
 | `yfy_get` / `yfy_get_many` | 获取当前元数据 |
 | `yfy_versions` | 列出当前版与可复制的历史 `VersionRef` |
 | `yfy_download` | 下载当前版或历史版；返回 path/URL、哈希、大小、TTL |
+| `yfy_download_batch` | 将 1-20 个同身份的当前文件/文件夹打包为一个结构已校验的 ZIP |
 | `yfy_download_release` | 可选：提前释放临时下载（幂等） |
 | `yfy_workspace_validate` | 校验已配置的命名 Workspace |
 | `yfy_membership_check` | 判断文件是否在 Workspace 内 / 外 / 证据不足 |
@@ -66,6 +67,8 @@
 
 **历史版本：** 必须原样复制 `yfy_versions` 返回的 `VersionRef`。当前版请省略 `version`，不要自行构造“当前版”引用。
 
+**批量 ZIP：** `yfy_download_batch({ items, workspace?, expected? })` 接受 1-20 个同一非外协访问身份下的 FileRef/FolderRef。20 是本服务的请求放大保护上限，不是 Provider OpenAPI 上限。它只打包当前内容，不接受 VersionRef；服务校验 ZIP 中央目录、成员路径和本地文件头，并返回成员数、展开总大小及整个归档的哈希。该校验不证明 Provider 已包含每个文件夹的全部语义内容，调用方应避免同时传入文件夹及其子项。
+
 ## stdio 与 HTTP
 
 | 模式 | 默认交付 | 适用场景 |
@@ -83,6 +86,7 @@ GET /staged/v1/{download_id}/{optional_file_name}
 ```
 
 与 `/mcp` 共用 Bearer、Host、Origin 防护。URL 过期、显式 release、完整性校验失败，或抓取次数用尽后均不可用。
+每个 staged GET 还受 `YFY_DOWNLOAD_WALL_TIMEOUT_MS` 限制；慢客户端不能无限占用读租约或阻塞关闭。
 
 ## 最小配置
 
@@ -100,7 +104,7 @@ YFY_TRANSPORT=stdio
 ```env
 YFY_TOOLSETS=drive,workspace,inventory
 YFY_WORKFLOW_PROFILES=tender
-YFY_WORKSPACES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_context":"default","tags":["tender"]}]
+YFY_WORKSPACES_JSON=[{"id":"tender_public","root_folder_id":"501000000000","access_context":"default","tags":["tender"]}]
 ```
 
 远程 HTTP 示例：

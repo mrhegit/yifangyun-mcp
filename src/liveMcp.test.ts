@@ -40,22 +40,26 @@ test("live MCP protocol exposes and executes the current download workflow", { s
   process.env.YFY_WORKSPACES_JSON = JSON.stringify([{ id: "live_scope", root_folder_id: rootFolderId, access_context: "default", tags: ["live-test"] }]);
   const runtime = await AppRuntime.create(loadConfig());
   const server = new McpServer({ name: "live-yifangyun", version: SERVER_VERSION });
-  const client = new Client({ name: "live-regression", version: "1.1.0-beta.1" });
+  const client = new Client({ name: "live-regression", version: "1.1.0-beta.2" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   try {
     registerCatalog(server, runtime);
     await server.connect(serverTransport);
     await client.connect(clientTransport);
     const tools = await client.listTools();
-    for (const name of ["yfy_status", "yfy_browse", "yfy_download", "yfy_download_release"]) {
+    for (const name of ["yfy_status", "yfy_browse", "yfy_download", "yfy_download_batch", "yfy_download_release"]) {
       assert.ok(tools.tools.some((tool) => tool.name === name), `${name} should be exposed`);
     }
     const status = await client.callTool({ name: "yfy_status", arguments: {} });
-    assert.equal(((status.structuredContent as Record<string, unknown>).server as Record<string, unknown>).version, SERVER_VERSION);
+    const statusServer = (status.structuredContent as Record<string, unknown>).server as Record<string, unknown>;
+    assert.equal(statusServer.version, SERVER_VERSION);
+    assert.notEqual(statusServer.build_id, "development");
+    assert.notEqual(statusServer.build_commit, "unknown");
     const root = await client.callTool({ name: "yfy_browse", arguments: { at: "workspace:live_scope", limit: 5 } });
     assert.notEqual(root.isError, true, JSON.stringify(root.content));
     const access = runtime.access.resolveContext("default");
-    const locked = await client.callTool({ name: "yfy_download", arguments: { file: formatItemRef("file", fileId, access.context.id, access.identityRef), workspace: "workspace:live_scope" } });
+    const fileRef = formatItemRef("file", fileId, access.context.id, access.identityRef);
+    const locked = await client.callTool({ name: "yfy_download", arguments: { file: fileRef, workspace: "workspace:live_scope" } });
     assert.notEqual(locked.isError, true, JSON.stringify(locked.content));
     const download = (locked.structuredContent as Record<string, unknown>).download as Record<string, unknown>;
     assert.match(String(download.sha256), /^[a-f\d]{64}$/);
@@ -63,6 +67,18 @@ test("live MCP protocol exposes and executes the current download workflow", { s
     assert.match(downloadId, /^dl_[a-f0-9]{32}$/);
     const released = await client.callTool({ name: "yfy_download_release", arguments: { download_id: downloadId } });
     assert.equal((released.structuredContent as Record<string, unknown>).status, "released");
+    const packed = await client.callTool({ name: "yfy_download_batch", arguments: { items: [fileRef], workspace: "workspace:live_scope" } });
+    assert.notEqual(packed.isError, true, JSON.stringify(packed.content));
+    const verification = (packed.structuredContent as Record<string, unknown>).verification as Record<string, unknown>;
+    assert.equal(verification.scope, "zip_structure_and_archive_hashes");
+    assert.equal(typeof verification.entry_count, "number");
+    const archive = (packed.structuredContent as Record<string, unknown>).download as Record<string, unknown>;
+    assert.equal(archive.media_type, "application/zip");
+    assert.match(String(archive.sha256), /^[a-f\d]{64}$/);
+    const archiveId = String(archive.download_id);
+    assert.match(archiveId, /^dl_[a-f0-9]{32}$/);
+    const archiveReleased = await client.callTool({ name: "yfy_download_release", arguments: { download_id: archiveId } });
+    assert.equal((archiveReleased.structuredContent as Record<string, unknown>).status, "released");
   } finally {
     await client.close();
     await server.close();

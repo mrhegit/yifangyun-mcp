@@ -3,7 +3,7 @@
 ## 安装
 
 ```bash
-npm install -g yifangyun-mcp-server@1.1.0-beta.1
+npm install -g yifangyun-mcp-server@1.1.0-beta.2
 ```
 
 或由 Host 固定版本运行：
@@ -11,7 +11,7 @@ npm install -g yifangyun-mcp-server@1.1.0-beta.1
 ```json
 {
   "command": "npx",
-  "args": ["-y", "yifangyun-mcp-server@1.1.0-beta.1"],
+  "args": ["-y", "yifangyun-mcp-server@1.1.0-beta.2"],
   "env": {
     "YFY_CLIENT_ID": "...",
     "YFY_CLIENT_SECRET": "...",
@@ -136,6 +136,7 @@ HTTP staged 文件由 Node.js 流式输出，无需把整个文件载入容器�
 |---|---|
 | Provider 401 / 403 / 429 / 5xx | 上游鉴权与可用性 |
 | `YFY_LOCAL_STORAGE_INSUFFICIENT` | 临时盘配额不足 |
+| `YFY_LOCAL_STORAGE_WRITE_FAILED` | 临时目录权限或本地文件系统故障 |
 | `YFY_DOWNLOAD_CLEANUP_FAILED` | 删除失败（占用/权限） |
 | `YFY_DOWNLOAD_INTEGRITY_FAILED` | 完整性校验失败 |
 | staged 404 / 410、流中断 | 取文件链路问题 |
@@ -157,5 +158,7 @@ npm test
 npm run test:perf
 npm pack --dry-run
 ```
+
+`npm run build` 会把包版本、构建 ID 和 Git commit 固化到编译产物；本地脏工作区的自动 build ID 带 `.dirty` 后缀。发布 workflow 在 job 级注入 tag 与 commit，只生成一次真实 `.tgz`，检查其 build metadata 和文档 denylist，再发布同一个 tarball。运行时 `yfy_status` 不依赖部署目录存在 `.git`。
 
 发布前还应实际启动一次 HTTP transport，并对 staged 文件做真实 GET，不能只验证 URL 字符串是否生成。

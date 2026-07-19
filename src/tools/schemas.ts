@@ -25,7 +25,7 @@ export const ProvenanceSchema = z.object({
 export const PathEntrySchema = z.object({ id: z.string().optional(), name: z.string().optional(), type: z.string().optional() }).strict();
 export const UserSchema = z.object({ id: z.string().optional(), name: z.string().optional(), active: z.boolean().optional(), email: z.string().optional(), phone: z.string().optional() }).strict();
 export const DepartmentSchema = z.object({
-  id: z.string().optional(), parent_id: z.string().optional(), name: z.string().optional(), permission_type: z.string().optional(),
+  id: z.string().optional(), place_ref: z.string().regex(/^department:\d+$/).optional(), parent_id: z.string().optional(), name: z.string().optional(), permission_type: z.string().optional(),
   space_total: z.number().optional(), space_used: z.number().optional(), user_count: z.number().optional(), children_departments_count: z.number().optional(), direct_item_count: z.number().optional()
 }).strict();
 export const GroupSchema = z.object({ id: z.string().optional(), name: z.string().optional(), description: z.string().optional(), visible: z.boolean().optional() }).strict();
@@ -43,10 +43,10 @@ export const ItemSchema = z.object({
 export const FileVersionSchema = z.object({
   generation: z.number().int().min(0), provider_version_id: z.string().optional(), current: z.boolean(), name: z.string().optional(),
   sha1: z.string().regex(/^[a-f\d]{40}$/i).optional(), size_bytes: z.number().int().nonnegative().optional(), modified_at_unix: z.number().int().nonnegative().optional(),
-  modified_at_iso: z.string().optional(), remark: z.string().optional(), download_ready: z.boolean()
+  modified_at_iso: z.string().optional(), remark: z.string().optional(), metadata_complete: z.boolean(), download_support: z.enum(["supported", "unknown", "unsupported"])
 }).strict();
 export const DomainErrorSchema = z.object({
-  code: z.string(), category: z.enum(["invalid_input", "configuration", "authentication", "authorization", "not_found", "rate_limited", "timeout", "provider_unavailable", "provider_contract", "stale_state", "capacity_limit", "cancelled", "conflict", "internal"]),
+  code: z.string(), category: z.enum(["invalid_input", "configuration", "authentication", "authorization", "not_found", "rate_limited", "timeout", "provider_unavailable", "provider_contract", "stale_state", "capacity_limit", "local_storage", "cancelled", "conflict", "internal"]),
   message: z.string(), retryable: z.boolean(), phase: z.string().optional(), retry_after_ms: z.number().int().nonnegative().optional(), suggested_action: z.string().optional(),
   diagnostics: z.record(JsonValueSchema).optional(),
   provider: z.object({ status_code: z.number().int().optional(), code: z.string().optional(), request_id: z.string().optional() }).strict().optional()

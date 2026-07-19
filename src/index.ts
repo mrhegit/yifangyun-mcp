@@ -78,6 +78,7 @@ export async function runHttp(runtime: AppRuntime): Promise<RunningServer> {
   const sessions = new Map<string, HttpSession>();
   let acceptingRequests = true;
   let pendingSessions = 0;
+  const stagedShutdownController = new AbortController();
   const closeSession = async (id: string, session: HttpSession): Promise<void> => {
     if (sessions.get(id) !== session) return;
     sessions.delete(id);
@@ -185,6 +186,9 @@ export async function runHttp(runtime: AppRuntime): Promise<RunningServer> {
       }
       let lease: Awaited<ReturnType<AppRuntime["downloads"]["acquireForHttpFetch"]>> | undefined;
       const abortController = new AbortController();
+      const deadlineController = new AbortController();
+      const leaseTimeout = setTimeout(() => deadlineController.abort(new Error("Staged download lease timeout.")), config.downloadWallTimeoutMs ?? 300_000);
+      const leaseSignal = AbortSignal.any([abortController.signal, deadlineController.signal, stagedShutdownController.signal]);
       const abort = () => abortController.abort();
       const abortOnResponseClose = () => {
         if (!response.writableEnded) abort();
@@ -192,7 +196,7 @@ export async function runHttp(runtime: AppRuntime): Promise<RunningServer> {
       request.once("aborted", abort);
       response.once("close", abortOnResponseClose);
       try {
-        lease = await runtime.downloads.acquireForHttpFetch(downloadId, abortController.signal);
+        lease = await runtime.downloads.acquireForHttpFetch(downloadId, leaseSignal);
         const record = lease.record;
         response.status(200);
         response.setHeader("Content-Type", record.mediaType || "application/octet-stream");
@@ -200,7 +204,7 @@ export async function runHttp(runtime: AppRuntime): Promise<RunningServer> {
         response.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(record.fileName)}`);
         response.setHeader("Cache-Control", "no-store");
         response.setHeader("ETag", `"${record.sha256}"`);
-        await pipeline(lease.createReadStream(), response);
+        await pipeline(lease.createReadStream(), response, { signal: leaseSignal });
       } catch (error) {
         const code = error instanceof Error && "code" in error ? String((error as { code?: string }).code) : "";
         if (!response.headersSent && (code === "YFY_DOWNLOAD_NOT_FOUND" || code === "YFY_DOWNLOAD_FETCH_LIMIT")) {
@@ -216,13 +220,17 @@ export async function runHttp(runtime: AppRuntime): Promise<RunningServer> {
           response.status(503).json({ error: "Download capacity is busy." });
           return;
         }
-        if (code === "YFY_REQUEST_CANCELLED") return;
+        if (code === "YFY_REQUEST_CANCELLED" || leaseSignal.aborted) {
+          if (response.headersSent && !response.writableEnded) response.destroy();
+          return;
+        }
         logEvent("error", "staged_download_failed", { error: error instanceof Error ? error.message : String(error) });
         if (!response.headersSent) response.status(500).json({ error: "Internal server error." });
         else response.destroy();
       } finally {
         request.off("aborted", abort);
         response.off("close", abortOnResponseClose);
+        clearTimeout(leaseTimeout);
         await lease?.release().catch(() => undefined);
       }
     });
@@ -242,6 +250,7 @@ export async function runHttp(runtime: AppRuntime): Promise<RunningServer> {
     baseUrl: `http://${displayHost}:${actualPort}`,
     close: async () => {
       acceptingRequests = false;
+      stagedShutdownController.abort(new Error("HTTP server is shutting down."));
       clearInterval(sessionCleanupTimer);
       const closed = new Promise<void>((resolve, reject) => httpServer.close((error) => error ? reject(error) : resolve()));
       await Promise.allSettled([...sessions.values()].map(({ server }) => server.close()));

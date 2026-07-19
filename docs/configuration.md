@@ -29,7 +29,7 @@
 
 | Toolset | 启用后提供的能力 |
 |---|---|
-| `drive` | status、browse、search、resolve、get、versions、download、comments、shares |
+| `drive` | status、browse、search、resolve、get、versions、单文件/批量 ZIP download、comments、shares |
 | `workspace` | Workspace 校验、membership（归属）检查 |
 | `inventory` | 递归只读扫描、本地 SQLite 清单、完整性与缺失审计 |
 | `organization` | 部门 / 用户 / 群组只读 |
@@ -73,7 +73,7 @@ YFY_ACCESS_CONTEXTS_JSON=[{"id":"reviewer","user_id":"531","external_enterprise_
 Workspace 是**业务目录边界**，不授予新权限：
 
 ```env
-YFY_WORKSPACES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_context":"default","tags":["tender"]}]
+YFY_WORKSPACES_JSON=[{"id":"tender_public","root_folder_id":"501000000000","access_context":"default","tags":["tender"]}]
 ```
 
 - 工具入参使用完整 `workspace:<id>` 形式。
@@ -195,7 +195,7 @@ staged URL 中的文件名仅影响下载显示名；真正的授权句柄是不
 | `YFY_MAX_TEMP_BYTES` | `1073741824` | artifacts + downloads + 进行中预留 的共享总配额（1 GiB） |
 | `YFY_TEXT_PREVIEW_MAX_BYTES` | `32768` | 可选 UTF-8 文本预览上限；配置最大允许 `1048576` |
 | `YFY_DOWNLOAD_IDLE_TIMEOUT_MS` | `30000` | 下载无进度超时 |
-| `YFY_DOWNLOAD_WALL_TIMEOUT_MS` | `300000` | 单次 `yfy_download` 的 ticket + stream 总耗时上限（含一次可重试） |
+| `YFY_DOWNLOAD_WALL_TIMEOUT_MS` | `300000` | 单文件下载、批量前后校验 + ticket + ZIP 流，以及单次 staged HTTP 读租约的总耗时上限 |
 
 `YFY_TEMP_DIR` 下由服务独占：
 
@@ -227,6 +227,7 @@ downloads/   已校验下载、manifest、release 状态
 HTTP 抓取次数（fetch count）仅在进程内计数，**重启后重置**，避免每次 GET 重写 manifest。
 
 `YFY_TEMP_DIR`、`artifacts/`、`downloads/` 必须是服务账户控制的**普通目录**，不能是符号链接或 Windows junction。
+服务记录托管根目录的文件系统身份并在后续创建、配额扫描和清理前复验；替换整个托管根或子目录会使操作失败，而不是继续跟随新路径。
 `YFY_STATE_DB` 不能位于 `artifacts/` 或 `downloads/` 内。
 
 ### 文本预览

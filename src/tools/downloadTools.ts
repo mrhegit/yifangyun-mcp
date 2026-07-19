@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { openPromise as openZip } from "yauzl";
 import { z } from "zod";
 import { YifangyunError } from "../client.js";
 import { normalizeFileVersions, selectFileVersion, type DownloadStrategy, type FileVersion, type VersionSelector } from "../domain/fileVersions.js";
@@ -7,7 +8,7 @@ import { objectValue, projectItem } from "../domain/projectors.js";
 import { formatVersionRef, parseItemRef, parseVersionRef } from "../domain/refs.js";
 import type { AppRuntime } from "../runtime/runtime.js";
 import type { JsonObject } from "../types.js";
-import { FileRefSchema, FileVersionSchema, ItemSchema, VersionRefSchema, WorkspaceRefSchema } from "./schemas.js";
+import { FileRefSchema, FileVersionSchema, ItemRefSchema, ItemSchema, VersionRefSchema, WorkspaceRefSchema } from "./schemas.js";
 import { registerTool } from "./tooling.js";
 import { resolveMediaType, workspaceMembershipProof } from "./workspaceTools.js";
 
@@ -184,6 +185,16 @@ async function downloadSelectedVersion(runtime: AppRuntime, input: {
         } catch (error) {
           if (input.signal?.aborted) throw error;
           if (deadlineController.signal.aborted || Date.now() >= deadlineAt) throw downloadWallTimeoutError(wallTimeoutMs);
+          if (input.selector.kind === "historical" && isProviderVersionMissing(error)) {
+            const providerError = error as YifangyunError;
+            throw new YifangyunError("The Provider rejected the historical version ID returned by its version listing.", {
+              code: "YFY_HISTORICAL_DOWNLOAD_UNAVAILABLE",
+              details: providerError.details,
+              phase: "historical_download_ticket",
+              agentDetails: { provider_version_id: input.selected.provider_version_id ?? null },
+              suggestedAction: "Treat historical download support as unavailable for this Provider deployment; current-version download remains supported."
+            });
+          }
           const retryStream = error instanceof YifangyunError && error.code === "YFY_DOWNLOAD_STREAM_FAILED" && error.retryable;
           if (!retryStream || attempt === 1) throw error;
         }
@@ -222,6 +233,12 @@ async function downloadSelectedVersion(runtime: AppRuntime, input: {
   } finally {
     clearTimeout(deadlineTimer);
   }
+}
+
+function isProviderVersionMissing(error: unknown): boolean {
+  return error instanceof YifangyunError
+    && typeof error.details?.api_code === "string"
+    && error.details.api_code.toLowerCase().includes("file_version_not_found");
 }
 
 function downloadWallTimeoutError(wallTimeoutMs: number): YifangyunError {
@@ -267,6 +284,63 @@ function agentHint(hasPath: boolean, hasUrl: boolean): string {
   return "GET download.fetch_url to retrieve bytes (same auth as MCP HTTP if configured). Parse with host tools. Optional yfy_download_release frees disk sooner; TTL also cleans up.";
 }
 
+function batchAgentHint(hasPath: boolean, hasUrl: boolean): string {
+  const safeguard = "Review verification.uncompressed_size_bytes and available Host disk before extraction.";
+  if (hasPath && hasUrl) return `Prefer download.local_path when co-located; otherwise GET download.fetch_url. ${safeguard} Extract the ZIP before parsing its files, then call yfy_download_release.`;
+  if (hasPath) return `${safeguard} Extract the ZIP at download.local_path before parsing its files, then call yfy_download_release.`;
+  return `GET download.fetch_url. ${safeguard} Extract the ZIP before parsing its files, then call yfy_download_release.`;
+}
+
+async function validateZipArchive(filePath: string, signal?: AbortSignal): Promise<{ entryCount: number; uncompressedSizeBytes: number }> {
+  let archive: Awaited<ReturnType<typeof openZip>> | undefined;
+  try {
+    archive = await openZip(filePath, { autoClose: true, lazyEntries: true, strictFileNames: true, validateEntrySizes: true });
+    let entryCount = 0;
+    let uncompressedSizeBytes = 0;
+    for await (const entry of archive.eachEntry()) {
+      if (signal?.aborted) throw new YifangyunError("ZIP validation was cancelled.", { code: "YFY_REQUEST_CANCELLED", phase: "batch_download_validation" });
+      entryCount += 1;
+      if (entryCount > 100_000) throw new Error("ZIP entry limit exceeded.");
+      if (entry.isEncrypted()) throw new Error("Encrypted ZIP entries are not supported.");
+      const segments = entry.fileName.split("/").filter(Boolean);
+      if (entry.fileName.includes("\0") || entry.fileName.startsWith("/") || /^[a-zA-Z]:/.test(entry.fileName) || segments.includes("..")) {
+        throw new Error("ZIP entry path is unsafe.");
+      }
+      if (!Number.isSafeInteger(entry.uncompressedSize) || entry.uncompressedSize < 0) throw new Error("ZIP entry size is unsafe.");
+      uncompressedSizeBytes += entry.uncompressedSize;
+      if (!Number.isSafeInteger(uncompressedSizeBytes)) throw new Error("ZIP expanded size is unsafe.");
+      await archive.readLocalFileHeaderPromise(entry, { minimal: true });
+    }
+    if (entryCount !== archive.entryCount) throw new Error("ZIP central directory entry count is inconsistent.");
+    return { entryCount, uncompressedSizeBytes };
+  } catch (error) {
+    if (error instanceof YifangyunError) throw error;
+    throw new YifangyunError("Provider batch download did not produce a structurally valid ZIP archive.", {
+      code: "YFY_PACK_DOWNLOAD_INVALID",
+      phase: "batch_download_validation",
+      suggestedAction: "Retry once; if the Provider repeats this response, report pack_download as unavailable."
+    });
+  } finally {
+    if (archive?.isOpen) archive.close();
+  }
+}
+
+function batchDeadline(parentSignal: AbortSignal, timeoutMs: number) {
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error("Batch download wall timeout exceeded."));
+  }, timeoutMs);
+  return {
+    dispose: () => clearTimeout(timer),
+    remainingMs: () => Math.max(1, timeoutMs - Math.max(0, Date.now() - startedAt)),
+    signal: AbortSignal.any([parentSignal, controller.signal]),
+    timedOut: () => timedOut
+  };
+}
+
 function selectorFor(fileRef: string, versionRef: unknown): VersionSelector {
   if (versionRef === undefined) return { kind: "current" };
   const version = parseVersionRef(String(versionRef), fileRef);
@@ -279,21 +353,36 @@ const HttpUrlSchema = z.string().url().refine((value) => {
   return protocol === "http:" || protocol === "https:";
 }, "fetch_url must use HTTP or HTTPS");
 
+const ExpectedDownloadSchema = z.object({
+  sha1: z.string().trim().regex(/^[a-f\d]{40}$/i).optional().describe("Optional expected SHA-1 assertion."),
+  sha256: z.string().trim().regex(/^[a-f\d]{64}$/i).optional().describe("Optional expected SHA-256 assertion."),
+  size_bytes: z.number().int().nonnegative().optional().describe("Optional expected byte-size assertion.")
+}).strict();
+
+const StagedDownloadSchema = z.object({
+  download_id: DownloadIdSchema,
+  local_path: z.string().min(1).nullable().describe("Absolute server path for co-located stdio Hosts; null for remote HTTP by default."),
+  fetch_url: HttpUrlSchema.nullable().describe("Authenticated staged HTTP URL for remote Hosts; null in stdio mode."),
+  media_type: z.string(),
+  media_type_source: z.enum(["content_type", "magic_sniff", "file_extension", "octet_stream", "archive_validation"]),
+  sha256: z.string().regex(/^[a-f\d]{64}$/i),
+  sha1: z.string().regex(/^[a-f\d]{40}$/i),
+  size_bytes: z.number().int().nonnegative(),
+  expires_at: z.string().datetime()
+}).strict();
+
+const DownloadCleanupSchema = z.object({
+  mode: z.literal("ttl"),
+  ttl_seconds: z.number().int().positive(),
+  release_tool: z.literal("yfy_download_release"),
+  release_args: z.object({ download_id: DownloadIdSchema }).strict()
+}).strict();
+
 const DownloadResultSchema = z.object({
   status: z.literal("ready"),
   file: ItemSchema.extend({ ref: FileRefSchema }),
   version: FileVersionSchema.extend({ ref: VersionRefSchema.optional() }),
-  download: z.object({
-    download_id: DownloadIdSchema,
-    local_path: z.string().min(1).nullable().describe("Absolute server path for co-located stdio Hosts; null for remote HTTP by default."),
-    fetch_url: HttpUrlSchema.nullable().describe("Authenticated staged HTTP URL for remote Hosts; null in stdio mode."),
-    media_type: z.string(),
-    media_type_source: z.enum(["content_type", "magic_sniff", "file_extension", "octet_stream"]),
-    sha256: z.string().regex(/^[a-f\d]{64}$/i),
-    sha1: z.string().regex(/^[a-f\d]{40}$/i),
-    size_bytes: z.number().int().nonnegative(),
-    expires_at: z.string().datetime()
-  }).strict(),
+  download: StagedDownloadSchema,
   preview: z.union([
     z.null(),
     z.object({
@@ -308,14 +397,106 @@ const DownloadResultSchema = z.object({
     ref: WorkspaceRefSchema,
     membership: z.literal("inside")
   }).strict().nullable(),
-  cleanup: z.object({
-    mode: z.literal("ttl"),
-    ttl_seconds: z.number().int().positive(),
-    release_tool: z.literal("yfy_download_release"),
-    release_args: z.object({ download_id: DownloadIdSchema }).strict()
-  }).strict(),
+  cleanup: DownloadCleanupSchema,
   agent_hint: z.string()
 }).strict();
+
+const BatchDownloadResultSchema = z.object({
+  status: z.literal("ready"),
+  format: z.literal("zip"),
+  items: z.array(z.object({ ref: ItemRefSchema, id: z.string(), type: z.enum(["file", "folder"]) }).strict()).min(1).max(20),
+  verification: z.object({
+    scope: z.literal("zip_structure_and_archive_hashes"),
+    entry_count: z.number().int().nonnegative().max(100_000),
+    uncompressed_size_bytes: z.number().int().nonnegative()
+  }).strict(),
+  download: StagedDownloadSchema,
+  workspace: z.object({ ref: WorkspaceRefSchema, membership: z.literal("inside") }).strict().nullable(),
+  cleanup: DownloadCleanupSchema,
+  agent_hint: z.string()
+}).strict();
+
+function expectedMismatches(expected: unknown, actual: { sha1: string; sha256: string; sizeBytes: number }): string[] {
+  const value = expected && typeof expected === "object" ? expected as Record<string, unknown> : {};
+  const mismatches: string[] = [];
+  if (typeof value.sha1 === "string" && actual.sha1.toLowerCase() !== value.sha1.toLowerCase()) mismatches.push("sha1");
+  if (typeof value.sha256 === "string" && actual.sha256.toLowerCase() !== value.sha256.toLowerCase()) mismatches.push("sha256");
+  if (typeof value.size_bytes === "number" && actual.sizeBytes !== value.size_bytes) mismatches.push("size_bytes");
+  return mismatches;
+}
+
+function currentVersionFromFile(file: JsonObject): FileVersion {
+  const sha1 = typeof file.sha1 === "string" && /^[a-f\d]{40}$/i.test(file.sha1) ? file.sha1.toLowerCase() : undefined;
+  const size = typeof file.size_bytes === "number" && Number.isSafeInteger(file.size_bytes) && file.size_bytes >= 0 ? file.size_bytes : undefined;
+  const modifiedAt = typeof file.modified_at_unix === "number" && Number.isSafeInteger(file.modified_at_unix) && file.modified_at_unix >= 0 ? file.modified_at_unix : undefined;
+  const metadataComplete = sha1 !== undefined && size !== undefined;
+  return {
+    current: true,
+    download_support: metadataComplete ? "supported" : "unsupported",
+    generation: 0,
+    metadata_complete: metadataComplete,
+    ...(typeof file.name === "string" ? { name: file.name } : {}),
+    ...(sha1 ? { sha1 } : {}),
+    ...(size !== undefined ? { size_bytes: size } : {}),
+    ...(modifiedAt !== undefined ? { modified_at_unix: modifiedAt, modified_at_iso: new Date(modifiedAt * 1000).toISOString() } : {})
+  };
+}
+
+function currentFileFingerprint(file: JsonObject): string {
+  return JSON.stringify({
+    file_version_key: file.file_version_key ?? null,
+    modified_at_unix: file.modified_at_unix ?? null,
+    sha1: file.sha1 ?? null,
+    size_bytes: file.size_bytes ?? null
+  });
+}
+
+async function assertBatchWorkspaceMembership(runtime: AppRuntime, refs: string[], workspaceRef: string, signal?: AbortSignal): Promise<void> {
+  const scope = runtime.access.resolveWorkspaceRef(workspaceRef);
+  const parsed = refs.map((ref) => ({ ref, item: parseItemRef(ref) }));
+  for (const entry of parsed) {
+    if (entry.item.accessContextId !== scope.context.id || entry.item.identityRef !== scope.identityRef) {
+      throw new YifangyunError("Batch item and workspace refs belong to different access identities.", {
+        code: "YFY_REF_CONTEXT_CONFLICT",
+        phase: "batch_workspace_membership",
+        suggestedAction: "Use only item refs discovered from the selected workspace."
+      });
+    }
+  }
+  const rootResponse = await runtime.gateway.getUser(`/v2/folder/${encodeURIComponent(scope.scope.rootFolderId)}/info`, scope.context.id, {}, signal);
+  const rootFolder = projectItem(rootResponse.data, "verification");
+  const siblingController = new AbortController();
+  const operationSignal = signal ? AbortSignal.any([signal, siblingController.signal]) : siblingController.signal;
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < parsed.length) {
+      const { ref, item } = parsed[nextIndex++]!;
+      if (item.type === "folder" && item.id === scope.scope.rootFolderId) continue;
+      const endpoint = item.type === "file"
+        ? `/v2/file/${encodeURIComponent(item.id)}/info_v2`
+        : `/v2/folder/${encodeURIComponent(item.id)}/info`;
+      const params = item.type === "file" && scope.context.externalEnterpriseId
+        ? { external_enterprise_id: scope.context.externalEnterpriseId }
+        : {};
+      const response = await runtime.gateway.getUser(endpoint, scope.context.id, params, operationSignal);
+      const membership = workspaceMembershipProof(projectItem(response.data, "verification"), rootFolder, scope.scope.rootFolderId);
+      if (membership.status !== "inside") {
+        throw new YifangyunError(membership.status === "outside" ? "A batch item is outside the configured workspace." : "Batch item workspace membership could not be proven.", {
+          code: membership.status === "outside" ? "YFY_WORKSPACE_MEMBERSHIP_FAILED" : "YFY_WORKSPACE_MEMBERSHIP_UNAVAILABLE",
+          phase: "batch_workspace_membership",
+          agentDetails: { item_ref: ref, membership: membership.status },
+          suggestedAction: membership.agent_interpretation.next_steps[0]
+        });
+      }
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: Math.min(4, parsed.length) }, () => worker()));
+  } catch (error) {
+    siblingController.abort(error);
+    throw error;
+  }
+}
 
 export function registerDownloadTools(server: McpServer, runtime: AppRuntime): void {
   if (!runtime.config.toolsets.includes("drive")) return;
@@ -328,11 +509,7 @@ export function registerDownloadTools(server: McpServer, runtime: AppRuntime): v
       version: VersionRefSchema.optional(),
       workspace: WorkspaceRefSchema.optional(),
       include_text_preview: z.boolean().default(false).describe("Opt in to a complete UTF-8 preview only when the file is text-like and within YFY_TEXT_PREVIEW_MAX_BYTES."),
-      expected: z.object({
-        sha1: z.string().trim().regex(/^[a-f\d]{40}$/i).optional().describe("Optional expected SHA-1 assertion."),
-        sha256: z.string().trim().regex(/^[a-f\d]{64}$/i).optional().describe("Optional expected SHA-256 assertion."),
-        size_bytes: z.number().int().nonnegative().optional().describe("Optional expected byte-size assertion.")
-      }).strict().optional()
+      expected: ExpectedDownloadSchema.optional()
     },
     outputSchema: DownloadResultSchema
   }, {
@@ -378,10 +555,25 @@ export function registerDownloadTools(server: McpServer, runtime: AppRuntime): v
       extra.signal
     );
     const before = scopedBefore?.file ?? projectItem(beforeResponse.data, "verification");
-    const versionsResponse = await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(item.id)}/versions`, access.context.id, {}, extra.signal);
-    const versionsBefore = normalizeFileVersions(versionsResponse.data);
     const selector = selectorFor(fileRef, version);
-    const selected = selectFileVersion(versionsBefore.versions, selector);
+    let selected: FileVersion;
+    let versionsBeforeFingerprint: string;
+    if (access.context.externalEnterpriseId) {
+      if (selector.kind === "historical") {
+        throw new YifangyunError("Provider OpenAPI does not declare historical versions for external enterprise contexts.", {
+          code: "YFY_FILE_VERSIONS_EXTERNAL_IDENTITY_UNSUPPORTED",
+          phase: "version_selection",
+          suggestedAction: "Omit version to download the current external-enterprise file content."
+        });
+      }
+      selected = selectFileVersion([currentVersionFromFile(before)], selector);
+      versionsBeforeFingerprint = currentFileFingerprint(before);
+    } else {
+      const versionsResponse = await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(item.id)}/versions`, access.context.id, {}, extra.signal);
+      const versionsBefore = normalizeFileVersions(versionsResponse.data);
+      selected = selectFileVersion(versionsBefore.versions, selector);
+      versionsBeforeFingerprint = versionsBefore.fingerprint;
+    }
 
     const downloaded = await downloadSelectedVersion(runtime, {
       accessContext: access.context.id,
@@ -397,12 +589,18 @@ export function registerDownloadTools(server: McpServer, runtime: AppRuntime): v
     });
 
     let registeredDownloadId: string | undefined;
+    let registrationAttempted = false;
     try {
-      // Light drift check: version history fingerprint must stay stable during download.
-      const versionsAfterResponse = await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(item.id)}/versions`, access.context.id, {}, extra.signal);
-      const versionsAfter = normalizeFileVersions(versionsAfterResponse.data);
-      if (versionsBefore.fingerprint !== versionsAfter.fingerprint) {
-        throw new YifangyunError("File version history changed while content was being downloaded.", {
+      const versionsAfterFingerprint = access.context.externalEnterpriseId
+        ? currentFileFingerprint(projectItem((await runtime.gateway.getUser(
+          `/v2/file/${encodeURIComponent(item.id)}/info_v2`,
+          access.context.id,
+          { external_enterprise_id: access.context.externalEnterpriseId },
+          extra.signal
+        )).data, "verification"))
+        : normalizeFileVersions((await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(item.id)}/versions`, access.context.id, {}, extra.signal)).data).fingerprint;
+      if (versionsBeforeFingerprint !== versionsAfterFingerprint) {
+        throw new YifangyunError("File version identity changed while content was being downloaded.", {
           code: "YFY_DOWNLOAD_DRIFT",
           phase: "version_recheck",
           retryable: true,
@@ -420,11 +618,11 @@ export function registerDownloadTools(server: McpServer, runtime: AppRuntime): v
         }
       }
 
-      const expectedObj = expected && typeof expected === "object" ? expected as Record<string, unknown> : {};
-      const mismatches: string[] = [];
-      if (typeof expectedObj.sha1 === "string" && String(downloaded.artifact.sha1).toLowerCase() !== expectedObj.sha1.toLowerCase()) mismatches.push("sha1");
-      if (typeof expectedObj.sha256 === "string" && String(downloaded.artifact.sha256).toLowerCase() !== expectedObj.sha256.toLowerCase()) mismatches.push("sha256");
-      if (typeof expectedObj.size_bytes === "number" && Number(downloaded.artifact.size_bytes) !== expectedObj.size_bytes) mismatches.push("size_bytes");
+      const mismatches = expectedMismatches(expected, {
+        sha1: String(downloaded.artifact.sha1),
+        sha256: String(downloaded.artifact.sha256),
+        sizeBytes: Number(downloaded.artifact.size_bytes)
+      });
       if (mismatches.length > 0) {
         throw new YifangyunError("Downloaded content does not match the requested expectations.", {
           code: "YFY_EXPECTATION_MISMATCH",
@@ -435,6 +633,7 @@ export function registerDownloadTools(server: McpServer, runtime: AppRuntime): v
       }
 
       const media = resolveMediaType(downloaded.artifact.content_type, downloaded.artifact.detected_content_type, downloaded.artifact.file_name);
+      registrationAttempted = true;
       const record = await runtime.downloads.register({
         fileName: String(downloaded.artifact.file_name),
         identityRef: access.identityRef,
@@ -485,8 +684,145 @@ export function registerDownloadTools(server: McpServer, runtime: AppRuntime): v
       };
     } catch (error) {
       if (registeredDownloadId) await runtime.downloads.release(registeredDownloadId).catch(() => undefined);
-      else if (typeof downloaded.artifact.temp_path === "string") await removeTemp(runtime, downloaded.artifact.temp_path, Number(downloaded.artifact.size_bytes));
+      else if (!registrationAttempted && typeof downloaded.artifact.temp_path === "string") await removeTemp(runtime, downloaded.artifact.temp_path, Number(downloaded.artifact.size_bytes));
       throw error;
+    }
+  });
+
+  registerTool(server, "yfy_download_batch", {
+    title: "Download Yifangyun Items as ZIP",
+    description: "Package 1-20 current files or folders through Provider /v2/file/pack_download and stage one structurally validated ZIP. All refs must belong to the same non-external access identity. Historical versions are not supported. Pass workspace to verify every item before and after packaging.",
+    inputSchema: {
+      items: z.array(ItemRefSchema).min(1).max(20).describe("Context-bound file/folder refs to package. Duplicates and mixed identities are rejected."),
+      workspace: WorkspaceRefSchema.optional(),
+      expected: ExpectedDownloadSchema.optional()
+    },
+    outputSchema: BatchDownloadResultSchema
+  }, {
+    readOnly: false,
+    idempotent: false,
+    onInvalidOutput: async (result) => {
+      const download = result.download && typeof result.download === "object" && !Array.isArray(result.download) ? result.download as Record<string, unknown> : undefined;
+      if (typeof download?.download_id === "string") await runtime.downloads.release(download.download_id);
+    }
+  }, async ({ items, workspace, expected }, extra) => {
+    const exposePath = shouldExposeLocalPath(runtime);
+    const exposeUrl = shouldExposeFetchUrl(runtime);
+    if (!exposePath && !exposeUrl) {
+      throw new YifangyunError("No download delivery channel is enabled (local_path and fetch_url both disabled).", {
+        code: "YFY_DOWNLOAD_DELIVERY_CHANNEL_UNAVAILABLE",
+        phase: "batch_download_delivery",
+        suggestedAction: "Enable YFY_DOWNLOAD_EXPOSE_LOCAL_PATH or YFY_DOWNLOAD_STAGED_HTTP."
+      });
+    }
+    const refs = (items as string[]).map(String);
+    if (new Set(refs).size !== refs.length) {
+      throw new YifangyunError("Batch download items must be unique.", { code: "YFY_INPUT_INVALID", phase: "batch_download_input" });
+    }
+    const parsed = refs.map((ref) => ({ ref, item: parseItemRef(ref) }));
+    const first = parsed[0]!.item;
+    const access = runtime.gateway.context(first.accessContextId);
+    if (access.identityRef !== first.identityRef) {
+      throw new YifangyunError("Batch item reference belongs to a stale access identity.", { code: "YFY_REF_IDENTITY_MISMATCH", phase: "batch_download" });
+    }
+    for (const entry of parsed) {
+      if (entry.item.accessContextId !== first.accessContextId || entry.item.identityRef !== first.identityRef) {
+        throw new YifangyunError("All batch items must belong to the same access identity.", {
+          code: "YFY_REF_CONTEXT_CONFLICT",
+          phase: "batch_download_input",
+          suggestedAction: "Split items by access context and call yfy_download_batch once per identity."
+        });
+      }
+    }
+    const workspaceRef = workspace === undefined ? undefined : String(workspace);
+    if (access.context.externalEnterpriseId) {
+      throw new YifangyunError("Provider pack_download does not declare external enterprise support.", {
+        code: "YFY_PACK_DOWNLOAD_EXTERNAL_IDENTITY_UNSUPPORTED",
+        phase: "batch_download_input",
+        suggestedAction: "Use a non-external access context, or download the files individually through yfy_download."
+      });
+    }
+    const wallTimeoutMs = runtime.config.downloadWallTimeoutMs ?? 300_000;
+    const deadline = batchDeadline(extra.signal, wallTimeoutMs);
+    let downloaded: Awaited<ReturnType<AppRuntime["client"]["downloadFromUrlToTemp"]>> | undefined;
+    let registeredDownloadId: string | undefined;
+    let registrationAttempted = false;
+    try {
+      if (workspaceRef) await assertBatchWorkspaceMembership(runtime, refs, workspaceRef, deadline.signal);
+      const typedIds = parsed.map(({ item }) => `${item.type}_${item.id}`);
+      const ticket = await runtime.gateway.postUser("/v2/file/pack_download", access.context.id, { item_typed_ids: typedIds }, {}, deadline.signal);
+      const ticketData = objectValue(ticket.data);
+      if (!ticketData || typeof ticketData.download_url !== "string") {
+        throw new YifangyunError("Batch download API did not return a transfer URL.", { code: "YFY_DOWNLOAD_TICKET_INVALID", phase: "batch_download_ticket" });
+      }
+      downloaded = await runtime.client.downloadFromUrlToTemp(ticketData.download_url, {
+        fileNameHint: "yifangyun-batch.zip",
+        namespace: access.identityRef,
+        onProgress: progressReporter(extra),
+        retry: true,
+        signal: deadline.signal,
+        timeoutMs: deadline.remainingMs()
+      });
+      const zipVerification = await validateZipArchive(downloaded.tempPath, deadline.signal);
+      if (workspaceRef) await assertBatchWorkspaceMembership(runtime, refs, workspaceRef, deadline.signal);
+      const mismatches = expectedMismatches(expected, downloaded);
+      if (mismatches.length > 0) {
+        throw new YifangyunError("Batch archive does not match the requested expectations.", {
+          code: "YFY_EXPECTATION_MISMATCH",
+          phase: "batch_expectation_validation",
+          agentDetails: { mismatches, actual: { sha1: downloaded.sha1, sha256: downloaded.sha256, size_bytes: downloaded.sizeBytes } },
+          suggestedAction: "Review the expected archive hash and retry. No archive was retained."
+        });
+      }
+      registrationAttempted = true;
+      const record = await runtime.downloads.register({
+        fileName: downloaded.fileName.toLowerCase().endsWith(".zip") ? downloaded.fileName : `${downloaded.fileName}.zip`,
+        identityRef: access.identityRef,
+        mediaType: "application/zip",
+        sha1: downloaded.sha1,
+        sha256: downloaded.sha256,
+        sizeBytes: downloaded.sizeBytes,
+        sourcePath: downloaded.tempPath
+      });
+      registeredDownloadId = record.downloadId;
+      const localPath = exposePath ? record.localPath : null;
+      const fetchUrl = exposeUrl ? buildFetchUrl(runtime, record.downloadId, record.fileName) : null;
+      return {
+        status: "ready" as const,
+        format: "zip" as const,
+        items: parsed.map(({ ref, item }) => ({ ref, id: item.id, type: item.type })),
+        verification: {
+          scope: "zip_structure_and_archive_hashes" as const,
+          entry_count: zipVerification.entryCount,
+          uncompressed_size_bytes: zipVerification.uncompressedSizeBytes
+        },
+        download: {
+          download_id: record.downloadId,
+          local_path: localPath,
+          fetch_url: fetchUrl,
+          media_type: record.mediaType,
+          media_type_source: "archive_validation" as const,
+          sha256: record.sha256,
+          sha1: record.sha1,
+          size_bytes: record.sizeBytes,
+          expires_at: new Date(record.expiresAtMs).toISOString()
+        },
+        workspace: workspaceRef ? { ref: workspaceRef, membership: "inside" as const } : null,
+        cleanup: {
+          mode: "ttl" as const,
+          ttl_seconds: runtime.config.tempFileTtlSeconds,
+          release_tool: "yfy_download_release" as const,
+          release_args: { download_id: record.downloadId }
+        },
+        agent_hint: batchAgentHint(Boolean(localPath), Boolean(fetchUrl))
+      };
+    } catch (error) {
+      if (registeredDownloadId) await runtime.downloads.release(registeredDownloadId).catch(() => undefined);
+      else if (downloaded && !registrationAttempted) await removeTemp(runtime, downloaded.tempPath, downloaded.sizeBytes);
+      if (deadline.timedOut() && !extra.signal.aborted) throw downloadWallTimeoutError(wallTimeoutMs);
+      throw error;
+    } finally {
+      deadline.dispose();
     }
   });
 

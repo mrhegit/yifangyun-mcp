@@ -18,7 +18,7 @@
 {
   "error": {
     "code": "YFY_...",
-    "category": "invalid_input|configuration|authentication|authorization|not_found|rate_limited|timeout|provider_unavailable|provider_contract|stale_state|capacity_limit|cancelled|conflict|internal",
+    "category": "invalid_input|configuration|authentication|authorization|not_found|rate_limited|timeout|provider_unavailable|provider_contract|stale_state|capacity_limit|local_storage|cancelled|conflict|internal",
     "message": "...",
     "retryable": false,
     "phase": "...",
@@ -111,7 +111,9 @@ Provider **索引候选**发现，不是完整目录扫描。
 | 当前版 | `null` | 省略 `version` 参数 |
 | 历史版 | `VersionRef` | 原样传入 `version` |
 
-`download_ready=true` 表示该版本具备校验下载所需的 SHA-1 与大小元数据。
+`metadata_complete=true` 仅表示具备 SHA-1 与大小元数据。`download_support` 的语义：当前版为 `supported`；历史版通常为 `unknown`；缺少必要元数据或 Provider 版本 ID 时为 `unsupported`。
+服务按 `current=true` 识别当前版，不依赖 Provider 数组顺序；输出会把当前版规范化到 `generation=0`。Provider `int64` ID 使用无损 JSON 解析并保持十进制字符串，不经过 JavaScript 不安全整数舍入。
+Provider OpenAPI 未给 `/versions` 声明 `external_enterprise_id`，因此外协身份不提供 `yfy_versions` 或历史版本下载；当前内容仍可由 `info_v2 + download_v2` 完整校验后下载。
 
 ---
 
@@ -149,7 +151,7 @@ Provider **索引候选**发现，不是完整目录扫描。
 {
   "status": "ready",
   "file": {"ref": "file:..."},
-  "version": {"current": true, "download_ready": true},
+  "version": {"current": true, "metadata_complete": true, "download_support": "supported"},
   "download": {
     "download_id": "dl_...",
     "local_path": "C:\\...\\file.xlsx",
@@ -183,7 +185,7 @@ Provider **索引候选**发现，不是完整目录扫描。
 
 ### 服务侧校验（摘要）
 
-- 版本存在且顺序明确；含 SHA-1 / size
+- 版本历史恰有一个 `current=true`；所选版本含 SHA-1 / size
 - Provider 下载结果与所选版本一致
 - 下载前后版本 fingerprint 未漂移
 - 可选 Workspace membership 前后均为 inside
@@ -204,8 +206,43 @@ Provider **索引候选**发现，不是完整目录扫描。
 | `YFY_DOWNLOAD_DRIFT` | 下载期间版本或 Workspace 状态变化 |
 | `YFY_EXPECTATION_MISMATCH` | 调用方断言不匹配；文件不会保留 |
 | `YFY_LOCAL_STORAGE_INSUFFICIENT` | 共享临时配额不足 |
+| `YFY_LOCAL_STORAGE_WRITE_FAILED` | 本地临时目录不可写或文件系统操作失败 |
 | `YFY_DOWNLOAD_CLEANUP_FAILED` | 删除失败（占用/权限等） |
 | `YFY_PROVIDER_TIMEOUT` | ticket + stream 耗尽总 wall timeout |
+
+---
+
+## yfy_download_batch
+
+通过 Provider `/v2/file/pack_download` 将 1-20 个当前文件或文件夹打包为一个 ZIP，并使用与 `yfy_download` 相同的临时存储、哈希、TTL、stdio path 和 HTTP staged URL 交付体系。该工具只支持 OpenAPI 明确覆盖的非外协用户身份。
+
+```json
+{
+  "items": [
+    "file:502@default.<identity>",
+    "folder:503@default.<identity>"
+  ],
+  "workspace": "workspace:tender_public",
+  "expected": {
+    "sha256": "可选的整个 ZIP 哈希",
+    "size_bytes": 1234
+  }
+}
+```
+
+- `items` 必须唯一，且全部绑定同一访问身份；混合身份须拆成多次调用。
+- 20 项是 MCP Server 的请求放大保护上限；Provider OpenAPI 本身未声明最大项数。
+- 仅打包当前内容，不支持历史 VersionRef。
+- 传入 `workspace` 时，每个 item 在打包前后都必须确认位于该 Workspace 内；元数据检查最多 4 路并发，首个确定失败会取消同轮兄弟请求。
+- 服务解析 ZIP 中央目录、逐项检查本地文件头，拒绝加密成员、路径穿越、绝对路径、超过 100,000 个成员和不安全大小。
+- 成功结果包含 `verification.scope=zip_structure_and_archive_hashes`、`entry_count`、`uncompressed_size_bytes`；这不证明 Provider 已包含每个文件夹的全部语义内容或验证成员文件 CRC。
+- Host 解压前必须比较 `verification.uncompressed_size_bytes` 与自身可用磁盘；MCP Server 不替 Host 执行解压。
+- 不要同时传入文件夹及其子项；服务只拒绝完全重复的 Ref，不推断语义重叠。
+- 前检、ticket、流、ZIP 检查和后检共享一个 `YFY_DOWNLOAD_WALL_TIMEOUT_MS` deadline。
+- `expected` 针对最终 ZIP 归档，而非归档内的单个文件。
+- 成功结果的 `download` 和 `cleanup` 字段与 `yfy_download` 相同；解析完成后可调用 `yfy_download_release`。
+
+常见错误：`YFY_INPUT_INVALID`（重复或数量不合法）、`YFY_REF_CONTEXT_CONFLICT`（混合身份）、`YFY_PACK_DOWNLOAD_EXTERNAL_IDENTITY_UNSUPPORTED`（OpenAPI 未声明外协批量打包）、`YFY_PACK_DOWNLOAD_INVALID`（Provider 未返回结构有效的 ZIP）、`YFY_EXPECTATION_MISMATCH`（归档断言不匹配）。
 
 ---
 
@@ -288,6 +325,14 @@ MCP annotations：
 
 相关工具：`yfy_inventory_create` / `get` / `search` / `cancel` / `release`。
 `yfy_inventory_release` 会删除本地清单并使其 ref、cursor、manifest、receipt 一并失效。
+
+---
+
+## Organization
+
+`yfy_department_children` 省略 `department_id` 时从组织根开始；返回的每个部门都包含可直接传给 `yfy_browse` 的 `place_ref=department:<id>`，无需 Agent 自行拼接。
+
+管理员工具集中的 `yfy_admin_user_read` 同时包含普通用户读取和短期登录材料动作，因此整体保守标记为 `readOnlyHint=false`。`login_url` / `login_params` 仅在用户明确要求认证材料时调用，结果视为敏感数据，不应写日志或转发给无关方。
 
 ---
 

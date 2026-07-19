@@ -148,6 +148,53 @@ test("artifact pruning does not double-count an active reservation", async () =>
   }
 });
 
+test("artifact namespaces are recreated after pruning removes an empty directory", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-storage-pruned-namespace-"));
+  const storage = new TempStorageManager(root, 1_048_576, 60);
+  try {
+    const namespace = await storage.ensureArtifactNamespace("default_test");
+    await storage.pruneArtifacts();
+    await assert.rejects(() => fs.access(namespace));
+    assert.equal(await storage.ensureArtifactNamespace("default_test"), namespace);
+    await fs.access(namespace);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cached managed directories are revalidated after link replacement", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-storage-revalidate-"));
+  const target = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-storage-revalidate-target-"));
+  const storage = new TempStorageManager(root, 1_048_576, 60);
+  try {
+    const namespace = await storage.ensureArtifactNamespace("default_test");
+    await fs.rmdir(namespace);
+    await fs.symlink(target, namespace, process.platform === "win32" ? "junction" : "dir");
+    await assert.rejects(() => storage.ensureArtifactNamespace("default_test"), (error: unknown) => error instanceof YifangyunError && error.code === "YFY_TEMP_STORAGE_CONFIG_UNSAFE");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(target, { recursive: true, force: true });
+  }
+});
+
+test("managed roots are revalidated after initialization", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-storage-root-revalidate-"));
+  const target = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-storage-root-target-"));
+  const storage = new TempStorageManager(root, 1_048_576, 60);
+  const artifactsRoot = storage.artifactsRoot();
+  try {
+    await storage.initialize();
+    await fs.rm(artifactsRoot, { recursive: true, force: true });
+    await fs.symlink(target, artifactsRoot, process.platform === "win32" ? "junction" : "dir");
+    await assert.rejects(() => storage.ensureArtifactNamespace("default_test"), (error: unknown) => error instanceof YifangyunError && error.code === "YFY_TEMP_STORAGE_CONFIG_UNSAFE");
+    assert.deepEqual(await fs.readdir(target), []);
+  } finally {
+    await fs.unlink(artifactsRoot).catch(() => undefined);
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(target, { recursive: true, force: true });
+  }
+});
+
 test("managed download roots reject directory links without touching their targets", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-storage-link-"));
   const target = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-storage-target-"));
@@ -217,6 +264,56 @@ test("concurrent registration respects the entry limit", async () => {
     assert.equal(failure.reason.code, "YFY_LOCAL_STORAGE_INSUFFICIENT");
   } finally {
     await downloads.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("failed registration releases one managed artifact without debiting unrelated usage", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-register-accounting-"));
+  const { downloads, storage } = registry(root);
+  const namespace = await storage.ensureArtifactNamespace("accounting");
+  const retained = path.join(namespace, "retained.bin");
+  const source = path.join(namespace, "source.bin");
+  const retainedBody = Buffer.from("retained");
+  const sourceBody = Buffer.from("source");
+  const retainedReservation = await storage.reserve(retainedBody.length);
+  await fs.writeFile(retained, retainedBody);
+  await retainedReservation.commit(retainedBody.length);
+  const sourceReservation = await storage.reserve(sourceBody.length);
+  await fs.writeFile(source, sourceBody);
+  await sourceReservation.commit(sourceBody.length);
+  const originalCreate = storage.createDownloadDirectory.bind(storage);
+  let enteredResolve!: () => void;
+  let continueResolve!: () => void;
+  const entered = new Promise<void>((resolve) => { enteredResolve = resolve; });
+  const proceed = new Promise<void>((resolve) => { continueResolve = resolve; });
+  storage.createDownloadDirectory = async (identity, downloadId) => {
+    const directory = await originalCreate(identity, downloadId);
+    enteredResolve();
+    await proceed;
+    return directory;
+  };
+  const registration = downloads.register({
+    fileName: "source.bin",
+    identityRef: "default.test",
+    mediaType: "application/octet-stream",
+    sha1: crypto.createHash("sha1").update(sourceBody).digest("hex"),
+    sha256: crypto.createHash("sha256").update(sourceBody).digest("hex"),
+    sizeBytes: sourceBody.length,
+    sourcePath: source
+  });
+  try {
+    await entered;
+    const closing = downloads.close();
+    continueResolve();
+    await assert.rejects(() => registration, (error: unknown) => error instanceof YifangyunError && error.code === "YFY_DOWNLOAD_REGISTRY_CLOSED");
+    await closing;
+    assert.equal(storage.usage().used_bytes, retainedBody.length);
+    assert.equal(await fs.readFile(retained, "utf8"), "retained");
+    await assert.rejects(() => fs.access(source));
+  } finally {
+    continueResolve();
+    await downloads.close().catch(() => undefined);
     await fs.rm(root, { recursive: true, force: true });
   }
 });

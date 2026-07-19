@@ -54,9 +54,31 @@ function protocolJsonSchema(schema: z.ZodTypeAny, requireObjectType: boolean): R
     strictUnions: true,
     target: "jsonSchema7"
   }) as Record<string, unknown>;
-  delete generated.$schema;
   return requireObjectType ? { type: "object", ...generated } : generated;
 }
+
+const ERROR_CATEGORY_BY_CODE: Readonly<Record<string, string>> = {
+  YFY_DOWNLOAD_CLEANUP_FAILED: "local_storage",
+  YFY_DOWNLOAD_READ_CAPACITY: "capacity_limit",
+  YFY_FILE_VERSIONS_EXTERNAL_IDENTITY_UNSUPPORTED: "provider_contract",
+  YFY_LOCAL_STORAGE_INSUFFICIENT: "capacity_limit",
+  YFY_LOCAL_STORAGE_WRITE_FAILED: "local_storage",
+  YFY_LOCAL_UPLOAD_DISABLED: "configuration",
+  YFY_PACK_DOWNLOAD_INVALID: "provider_contract",
+  YFY_PACK_DOWNLOAD_EXTERNAL_IDENTITY_UNSUPPORTED: "provider_contract",
+  YFY_PROVIDER_DECLARED_FAILURE: "provider_contract",
+  YFY_TEMP_STORAGE_CONFIG_UNSAFE: "configuration",
+  YFY_TRANSFER_REDIRECT_INVALID: "provider_contract",
+  YFY_TRANSFER_REDIRECT_LIMIT: "provider_contract",
+  YFY_TRANSFER_REDIRECT_REJECTED: "provider_contract",
+  YFY_TRANSFER_URL_INVALID: "provider_contract",
+  YFY_TRANSFER_URL_PRIVATE_ADDRESS: "provider_contract",
+  YFY_TRANSFER_URL_REJECTED: "provider_contract",
+  YFY_UPLOAD_SOURCE_CHANGED: "stale_state",
+  YFY_UPLOAD_SOURCE_INVALID: "invalid_input",
+  YFY_UPLOAD_SOURCE_OUT_OF_SCOPE: "authorization",
+  YFY_UPLOAD_TICKET_INVALID: "provider_contract"
+};
 
 export function installToolListHandler(server: McpServer): void {
   const protocol = (server as unknown as { server?: McpServer["server"] }).server;
@@ -68,6 +90,7 @@ export function installToolListHandler(server: McpServer): void {
 }
 
 function normalizedErrorCode(error: YifangyunError, providerCode?: string): string {
+  if (error.code === "YFY_HISTORICAL_DOWNLOAD_UNAVAILABLE") return error.code;
   const code = providerCode?.toLowerCase() ?? "";
   if (code.includes("file_version_not_found")) return "YFY_VERSION_NOT_FOUND";
   if (code.includes("folder_not_found")) return "YFY_FOLDER_NOT_FOUND";
@@ -78,6 +101,8 @@ function normalizedErrorCode(error: YifangyunError, providerCode?: string): stri
 }
 
 function errorCategory(error: YifangyunError, normalizedCode: string): string {
+  const explicit = ERROR_CATEGORY_BY_CODE[normalizedCode];
+  if (explicit) return explicit;
   if (normalizedCode.endsWith("_CURSOR_INVALID") || normalizedCode === "YFY_INVENTORY_QUERY_EMPTY") return "invalid_input";
   if (["YFY_INVENTORY_QUERY_TOO_SHORT", "YFY_INVENTORY_QUERY_TOO_BROAD"].includes(normalizedCode)) return "capacity_limit";
   if (normalizedCode.includes("CANCEL")) return "cancelled";
@@ -95,6 +120,7 @@ function errorCategory(error: YifangyunError, normalizedCode: string): string {
   if (normalizedCode.includes("REF_IDENTITY_MISMATCH")) return "stale_state";
   if (normalizedCode.endsWith("_CURSOR_STALE") || normalizedCode.includes("STALE") || normalizedCode.includes("REVISION_CONFLICT")) return "stale_state";
   if (normalizedCode.includes("TOO_LARGE") || normalizedCode.includes("QUOTA") || normalizedCode.includes("CAPACITY") || normalizedCode.includes("STORAGE_INSUFFICIENT")) return "capacity_limit";
+  if (normalizedCode.includes("LOCAL_STORAGE") || normalizedCode.includes("TEMP_STORAGE")) return "local_storage";
   if (normalizedCode.includes("CONTENT_MISMATCH") || normalizedCode.includes("HISTORICAL_DOWNLOAD")) return "provider_contract";
   if (normalizedCode.includes("CONFLICT") || normalizedCode.includes("DRIFT") || normalizedCode.includes("CONTENT_MISMATCH") || normalizedCode.includes("EXPECTATION_MISMATCH") || normalizedCode.includes("INTEGRITY_FAILED") || normalizedCode.includes("IDENTITY_AMBIGUOUS")) return "conflict";
   if (normalizedCode.includes("PROVIDER") || normalizedCode.includes("VERSION_ORDER") || normalizedCode.includes("METADATA_INCOMPLETE") || normalizedCode.includes("UNAVAILABLE")) return "provider_contract";
@@ -142,6 +168,7 @@ export function registerTool(
   handler: ToolHandler
 ): void {
   const inputSchema = z.object(definition.inputSchema).strict();
+  const inputValidator = definition.inputValidator ?? inputSchema;
   const outputValidator = definition.outputSchema instanceof z.ZodObject
     ? definition.outputSchema.strict()
     : z.object(definition.outputSchema).strict();
@@ -156,6 +183,9 @@ export function registerTool(
     openWorldHint: options.openWorld ?? true,
     readOnlyHint: options.readOnly
   };
+  const sdkInputSchema = (server as unknown as { server?: unknown }).server
+    ? z.object({}).passthrough()
+    : inputSchema;
   let registry = listedTools.get(server);
   if (!registry) {
     registry = new Map();
@@ -164,18 +194,17 @@ export function registerTool(
   registry.set(name, {
     annotations,
     description: definition.description,
-    inputSchema: protocolJsonSchema(definition.inputValidator ?? inputSchema, true),
+    inputSchema: protocolJsonSchema(inputValidator, true),
     name,
     outputSchema: protocolJsonSchema(outputValidator, true),
     title: definition.title
   });
-  // tools/list uses inputValidator when present (strict first-page | cursor union).
-  // SDK registration keeps a discoverable flat shape for hosts that only surface property names;
-  // runtime always re-validates with inputValidator so list contract and execution stay aligned.
+  // tools/list exposes the strict public contract. The SDK receives an object-only schema so
+  // execution errors can use the same actionable YFY envelope instead of JSON-RPC InvalidParams.
   sdkRegisterTool(name, {
     title: definition.title,
     description: definition.description,
-    inputSchema,
+    inputSchema: sdkInputSchema,
     outputSchema: definition.outputSchema,
     annotations
   }, async (args, extra) => {
@@ -183,8 +212,8 @@ export function registerTool(
     let cleanupRequired = false;
     try {
       let validatedArgs = args;
-      if (definition.inputValidator) {
-        const parsed = definition.inputValidator.safeParse(args);
+      {
+        const parsed = inputValidator.safeParse(args);
         if (!parsed.success) {
           const hasCursor = typeof (args as { cursor?: unknown }).cursor === "string" && String((args as { cursor?: unknown }).cursor).trim().length > 0;
           const continuationFixedKeys = new Set(definition.continuationFixedKeys ?? []);

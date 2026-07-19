@@ -340,10 +340,10 @@ function registerGroupTools(server: McpServer, runtime: AppRuntime): void {
 function registerUserTools(server: McpServer, runtime: AppRuntime): void {
   registerTool(server, "yfy_admin_user_read", {
     title: "Read Yifangyun Admin User",
-    description: "Get a user, lookup an external identity, or request short-lived login material.",
+    description: "Get a user, lookup an external identity, or request short-lived login material. Call login_url/login_params only when the user explicitly asks for authentication material.",
     inputSchema: { action: z.enum(["get", "lookup", "login_url", "login_params"]), user_id: IdSchema.optional(), identifier: z.string().min(1).optional(), identifier_type: z.enum(["simple_phone_or_email", "user_ticket"]).optional(), platform_id: IdSchema.optional(), include_contact: z.boolean().default(false) },
     outputSchema: { user: UserSchema.optional(), auth_material: z.unknown().optional(), sensitive: z.boolean().optional(), provenance: ProvenanceSchema }
-  }, { readOnly: true }, async (args, extra) => {
+  }, { readOnly: false, destructive: false, idempotent: false }, async (args, extra) => {
     if (args.action === "get") requireFields(args, ["user_id"], "admin_user_read");
     if (args.action !== "get") requireFields(args, ["identifier", "identifier_type", "platform_id"], "admin_user_read");
     const endpoint = args.action === "get" ? `/v2/admin/user/${encodeURIComponent(String(args.user_id))}/info`

@@ -1,6 +1,6 @@
 # OpenAPI 覆盖矩阵
 
-版本 `1.1.0-beta.1` **不是**“一个 HTTP endpoint 对应一个 MCP 工具”，而是把 Provider 差异收敛到 Drive、Workspace、Inventory、Download、Organization 等模块中。
+版本 `1.1.0-beta.2` **不是**“一个 HTTP endpoint 对应一个 MCP 工具”，而是把 Provider 差异收敛到 Drive、Workspace、Inventory、Download、Organization 等模块中。
 
 共性约定：
 
@@ -18,8 +18,9 @@
 | 文件夹 / 文件信息 | `yfy_get`、`yfy_get_many` | 已覆盖 |
 | 索引搜索 | `yfy_search` | 已覆盖；**非穷尽**；返回字段级匹配依据 |
 | 精确路径遍历 | `yfy_resolve` | 组合覆盖；同名返回 ambiguous |
-| 版本列表 | `yfy_versions` | 已覆盖；VersionRef 绑定完整 FileRef |
-| 当前 / 历史下载 | `yfy_download` | 落盘校验；stdio → `local_path`，HTTP → `fetch_url` |
+| 版本列表 | `yfy_versions` | 非外协身份已覆盖；VersionRef 绑定完整 FileRef；OpenAPI 未声明外协 query |
+| 当前 / 历史下载 | `yfy_download` | 非外协支持当前/历史；外协按 OpenAPI 支持当前内容；stdio → `local_path`，HTTP → `fetch_url` |
+| 当前文件 / 文件夹批量打包 | `yfy_download_batch` | 1-20 个同身份非外协 Ref；结构化验证 ZIP 并接入统一下载生命周期 |
 | 评论 / 分享列表 | `yfy_comments`、`yfy_shares` | 已覆盖；分享敏感字段脱敏 |
 
 ---
@@ -32,6 +33,7 @@
 | 文件是否在业务范围内 | `yfy_membership_check` | 组合覆盖；inside / outside / unavailable |
 | 递归完整观测 | `yfy_inventory_*` | Worker 线程 + SQLite 后台扫描；区分 Workspace 根与 scan 根；支持 refresh、查询绑定固定 commit_watermark、显式 release |
 | 校验后的当前 / 历史字节 | `yfy_download` | 可选 `workspace`；小文本 preview；大文件整文件落盘 |
+| 结构已校验的批量 ZIP | `yfy_download_batch` | 可选 `workspace` 前后逐项校验；仅当前内容；OpenAPI 未声明外协 query、最大项数或归档语义完整性 |
 | 期望元数据 / 内容断言 | `yfy_download.expected` | 不匹配则报错并删除 temp |
 | 下载生命周期 | `yfy_download_release` + TTL | 可显式释放；主清理路径为 TTL |
 | 清单生命周期 | `yfy_inventory_release` | Inventory、cursor、manifest、receipt 一并失效 |
@@ -59,7 +61,6 @@
 - 收藏 / 最近项
 - 回收站批量操作
 - 文件版本 promote / delete
-- 打包下载
 - 分享链接创建 / 更新 / 关闭
 - 评论创建 / 删除
 - 审批、知识库、设备同步

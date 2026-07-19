@@ -75,6 +75,42 @@ test("safe GET requests retry transient provider failures", async () => {
   }
 });
 
+test("Provider int64 JSON values are preserved without numeric rounding", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => String(input).includes("/oauth/token")
+    ? new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), { status: 200 })
+    : new Response('{"id":90071992547409931234,"size":42}', { status: 200, headers: { "Content-Type": "application/json" } });
+  const client = new YifangyunClient(makeConfig());
+  try {
+    const result = await client.getAsUser("/v2/file/90071992547409931234/info_v2");
+    assert.equal((result.data as { id: string }).id, "90071992547409931234");
+    assert.equal((result.data as { size: number }).size, 42);
+  } finally {
+    await client.close();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("HTTP 200 success false is reported as a Provider-declared failure", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => String(input).includes("/oauth/token")
+    ? new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), { status: 200 })
+    : new Response(JSON.stringify({ success: false, request_id: "req-1", errors: [{ code: "file_not_found", msg: "missing" }] }), { status: 200 });
+  const client = new YifangyunClient(makeConfig());
+  try {
+    await assert.rejects(() => client.getAsUser("/v2/file/1/info_v2"), (error: unknown) => {
+      assert.ok(error instanceof YifangyunError);
+      assert.equal(error.code, "YFY_PROVIDER_DECLARED_FAILURE");
+      assert.equal(error.details?.api_code, "file_not_found");
+      assert.equal(error.details?.request_id, "req-1");
+      return true;
+    });
+  } finally {
+    await client.close();
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("Provider retry backoff stops promptly when the request is cancelled", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input) => String(input).includes("/oauth/token")
@@ -361,6 +397,52 @@ test("Provider API concurrency is shared across resource paths for one identity"
   } finally {
     await client.close();
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("Provider API and transfer share the same user identity concurrency bucket", async () => {
+  const originalFetch = globalThis.fetch;
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-mixed-identity-bucket-"));
+  let apiCalls = 0;
+  let transferCalls = 0;
+  let apiController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/oauth/token")) return new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), { status: 200 });
+    if (url.startsWith("https://127.0.0.1")) {
+      transferCalls += 1;
+      return new Response(new Uint8Array([1]), { status: 200, headers: { "content-length": "1" } });
+    }
+    apiCalls += 1;
+    return new Response(new ReadableStream<Uint8Array>({ start(controller) { apiController = controller; } }), { status: 200 });
+  };
+  const client = new YifangyunClient({
+    ...makeConfig(),
+    allowPrivateTransferUrls: true,
+    maxConcurrentProviderRequests: 2,
+    maxConcurrentRequestsPerIdentity: 1,
+    maxTempBytes: 1024,
+    tempDir: dir
+  }, (url, init) => globalThis.fetch(url, init));
+  try {
+    await client.getUserToken("530");
+    const metadata = client.getAsUser("/v2/file/1/info_v2", "530");
+    for (let attempt = 0; attempt < 50 && apiCalls < 1; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    const transfer = client.downloadFromUrlToTemp("https://127.0.0.1/file", {
+      fileNameHint: "file.bin",
+      namespace: client.resolveAccessIdentityRef("530")
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(transferCalls, 0);
+    apiController!.enqueue(new TextEncoder().encode(JSON.stringify({ id: 1 })));
+    apiController!.close();
+    await metadata;
+    await transfer;
+    assert.equal(transferCalls, 1);
+  } finally {
+    await client.close();
+    globalThis.fetch = originalFetch;
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }
 });
 

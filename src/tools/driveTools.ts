@@ -297,11 +297,16 @@ function recommendedWorkflows(runtime: AppRuntime): JsonObject[] {
     : runtime.config.downloadExposeLocalPath
       ? "open download.local_path with a host parser"
       : "GET download.fetch_url with MCP HTTP authorization";
+  const receiveArchive = runtime.config.downloadExposeLocalPath && runtime.config.downloadStagedHttpEnabled
+    ? "use download.local_path when co-located; otherwise GET download.fetch_url"
+    : runtime.config.downloadExposeLocalPath
+      ? "use download.local_path"
+      : "GET download.fetch_url with MCP HTTP authorization";
   return [
     {
-      id: "read_small_text",
+      id: "download_for_host_parsing",
       when: "Exact path or known file ref; download for host parsing",
-      steps: ["yfy_status", "yfy_resolve or yfy_get", "yfy_download", consume, "optional yfy_download_release"],
+      steps: ["yfy_resolve or yfy_get", "yfy_download (set include_text_preview=true only for bounded UTF-8 text)", consume, "optional yfy_download_release"],
       enabled: drive
     },
     {
@@ -311,9 +316,15 @@ function recommendedWorkflows(runtime: AppRuntime): JsonObject[] {
       enabled: workspaceDownload
     },
     {
+      id: "batch_zip_download",
+      when: "Package 1-20 current file/folder refs from one non-external identity",
+      steps: ["confirm refs are unique and non-overlapping", "optional yfy_download_batch with workspace", "review verification.uncompressed_size_bytes", receiveArchive, "extract on the Host", "yfy_download_release"],
+      enabled: drive
+    },
+    {
       id: "absence_audit",
       when: "Prove presence/absence of material categories",
-      steps: ["yfy_workspace_validate", "yfy_inventory_create with root_folder + limits", "follow next_action until terminal", "yfy_inventory_search per category", "claim absence only if may_claim_absence=true"],
+      steps: ["yfy_workspace_validate", "yfy_inventory_create with limits (root_folder is optional for a verified subtree)", "follow next_action until terminal", "yfy_inventory_search per category", "claim absence only if may_claim_absence=true"],
       enabled: inventory
     },
     {
@@ -356,7 +367,7 @@ export function registerStatusTool(server: McpServer, runtime: AppRuntime): void
       runtime: z.record(z.union([z.string(), z.number(), z.boolean(), z.array(z.string())])),
       provenance: z.array(ProvenanceSchema)
     }
-  }, { readOnly: true, openWorld: false }, async (_args, extra) => {
+  }, { readOnly: true, openWorld: true }, async (_args, extra) => {
     const access = runtime.gateway.context();
     const local = {
       server: { name: SERVER_NAME, version: SERVER_VERSION, contract_version: CONTRACT_VERSION, build_id: BUILD_ID, build_commit: BUILD_COMMIT, instance_id: runtime.instanceId, started_at: runtime.startedAtIso, config_fingerprint: runtime.configFingerprint },
@@ -651,7 +662,10 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
   }, { readOnly: true }, async ({ ref, detail }, extra) => {
     const resolved = resolveItemRef(runtime, String(ref));
     const endpoint = resolved.item.type === "file" ? `/v2/file/${encodeURIComponent(resolved.item.id)}/info_v2` : `/v2/folder/${encodeURIComponent(resolved.item.id)}/info`;
-    const response = await runtime.gateway.getUser(endpoint, resolved.access.context.id, {}, extra.signal);
+    const params = resolved.item.type === "file" && resolved.access.context.externalEnterpriseId
+      ? { external_enterprise_id: resolved.access.context.externalEnterpriseId }
+      : {};
+    const response = await runtime.gateway.getUser(endpoint, resolved.access.context.id, params, extra.signal);
     return { item: driveItem(response.data, resolved.access, detail as Detail), provenance: provenance(response.meta, undefined, "item_metadata") };
   });
 
@@ -664,7 +678,10 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
       try {
         const resolved = resolveItemRef(runtime, ref);
         const endpoint = resolved.item.type === "file" ? `/v2/file/${encodeURIComponent(resolved.item.id)}/info_v2` : `/v2/folder/${encodeURIComponent(resolved.item.id)}/info`;
-        const response = await runtime.gateway.getUser(endpoint, resolved.access.context.id, {}, extra.signal);
+        const params = resolved.item.type === "file" && resolved.access.context.externalEnterpriseId
+          ? { external_enterprise_id: resolved.access.context.externalEnterpriseId }
+          : {};
+        const response = await runtime.gateway.getUser(endpoint, resolved.access.context.id, params, extra.signal);
         return { index, ref, status: "success" as const, item: driveItem(response.data, resolved.access, detail as Detail), provenance: provenance(response.meta, undefined, "item_metadata") };
       } catch (error) { return { index, ref, status: "error" as const, error: serializeError(error) }; }
     }));
@@ -674,7 +691,7 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
 
   registerTool(server, "yfy_versions", {
     title: "List Yifangyun File Versions",
-    description: "List file versions for one context-bound file ref. Current versions use ref=null (omit version on yfy_download); selectable historical versions return a copyable version ref, while entries without a Provider version ID are marked unavailable.",
+    description: "List file versions for one context-bound file ref. Current versions use ref=null. Historical versions with complete metadata return a VersionRef but download_support remains unknown until the Provider accepts a download.",
     inputSchema: VersionsInputSchema.inputSchema,
     inputValidator: VersionsInputSchema.validator,
     outputSchema: {
@@ -698,6 +715,13 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
     const cursor = pageArgs.kind === "continuation" ? decodeCursor(runtime.config.clientSecret, runtime.configFingerprint, "drive_versions", pageArgs.cursor, VersionsCursorSchema) : undefined;
     const file = cursor?.file ?? first?.file ?? "";
     const resolved = resolveItemRef(runtime, file, "file");
+    if (resolved.access.context.externalEnterpriseId) {
+      throw new YifangyunError("Provider OpenAPI does not declare file version listing for external enterprise contexts.", {
+        code: "YFY_FILE_VERSIONS_EXTERNAL_IDENTITY_UNSUPPORTED",
+        phase: "drive_versions",
+        suggestedAction: "Use yfy_get or yfy_download without a version parameter for current file content."
+      });
+    }
     const offset = cursor?.offset ?? 0;
     const limit = cursor?.limit ?? first?.limit ?? DEFAULT_DRIVE_PAGE_SIZE;
     const response = await runtime.gateway.getUser(`/v2/file/${encodeURIComponent(resolved.item.id)}/versions`, resolved.access.context.id, {}, extra.signal);
@@ -715,14 +739,14 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
           }
         };
       }
-      if (!version.provider_version_id) {
+      if (!version.provider_version_id || version.download_support === "unsupported") {
         return {
           ...version,
           file,
           ref: null,
           usage: {
             for_download: "unavailable" as const,
-            note: "Historical version lacks a Provider version ID and cannot be selected safely."
+            note: "Historical version lacks the metadata or Provider version ID required for verified selection."
           }
         };
       }
@@ -732,7 +756,7 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
         ref: formatVersionRef(file, version.provider_version_id!),
         usage: {
           for_download: "pass_version_ref" as const,
-          note: "Historical version: pass this ref as the version parameter on yfy_download."
+          note: "Historical Provider support is unknown. Pass this ref only when an explicit historical download attempt is required."
         }
       };
     });
