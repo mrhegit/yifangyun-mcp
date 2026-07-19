@@ -1,245 +1,288 @@
 # 配置指南
 
-`1.0.0` 默认只启用轻量 Drive 平面。Workspace、Inventory、Capture、Organization 和写入能力都必须显式开启。`transfer` 不进 Tender 默认矩阵。
+服务**只读进程环境变量**，不会自动加载 `.env`。
+本地可用 Node.js `--env-file`；容器与生产应由部署系统注入配置。
 
-服务只读取当前进程环境变量，不会自动加载项目目录中的 `.env`。本地运行可使用 `node --env-file=.env dist/index.js`；MCP Host、容器和进程管理器应通过各自的 env 配置注入。运行后以 `yfy_status.runtime` 和 `capabilities` 为实际生效值。
+## 必需配置
 
-## 配置层次
+| 变量 | 说明 |
+|---|---|
+| `YFY_CLIENT_ID` | 亿方云应用 Client ID |
+| `YFY_CLIENT_SECRET` | 亿方云应用 Client Secret；同时用于签名本地 Ref / Cursor |
+| `YFY_ENTERPRISE_ID` | 企业 ID（仅数字） |
+| `YFY_DEFAULT_USER_ID` | 默认用户 ID（仅数字） |
 
-| 层次 | 配置 | 作用 |
-|---|---|---|
-| Toolset | `YFY_TOOLSETS` | 决定注册哪些工具 |
-| Access Context | `YFY_ACCESS_CONTEXTS_JSON` | 定义可选择的 Provider 用户身份 |
-| Workspace | `YFY_WORKSPACES_JSON` | 将命名业务目录绑定到身份 |
-| Workflow Profile | `YFY_WORKFLOW_PROFILES` | 注册 Tender Guidance 和 Prompt，不授予权限 |
+默认 Provider 地址：
 
-普通 Drive 权限是 Provider 权限与已启用 toolset 的交集。Workspace-bound 能力还要求文件位于配置目录内。
+| 变量 | 默认值 |
+|---|---|
+| `YFY_API_BASE_URL` | `https://open.fangcloud.com/api` |
+| `YFY_OAUTH_BASE_URL` | `https://open.fangcloud.com` |
 
-## 必填变量
+自定义非 localhost 地址必须使用 HTTPS，且 URL 不得含 userinfo（用户名密码）。
 
-| 变量 | 作用 | 格式与约束 |
-|---|---|---|
-| `YFY_CLIENT_ID` | 亿方云 OAuth 应用 ID，用于企业和用户 token 交换 | 非空字符串；必须与 secret、企业和回调配置属于同一应用 |
-| `YFY_CLIENT_SECRET` | OAuth 应用密钥；同时用于 cursor、Inventory ref 和配置指纹签名 | 非空敏感值；不得写入日志、Prompt 或仓库；轮换后旧 cursor/ref 立即失效 |
-| `YFY_ENTERPRISE_ID` | 默认企业 ID | 纯数字字符串 |
-| `YFY_DEFAULT_USER_ID` | 自动创建的 `default` Access Context 所使用的用户 ID | 纯数字字符串；该用户的 Provider ACL 决定默认 Drive 可见范围 |
+---
 
-缺少任一必填变量时服务拒绝启动。ID 不应转为 JavaScript number 后再写入配置，以免大整数精度丢失。
+## Toolset（能力开关）
 
-## Toolsets
+`YFY_TOOLSETS` 为逗号分隔列表，默认 `drive`。
+
+| Toolset | 启用后提供的能力 |
+|---|---|
+| `drive` | status、browse、search、resolve、get、versions、download、comments、shares |
+| `workspace` | Workspace 校验、membership（归属）检查 |
+| `inventory` | 递归只读扫描、本地 SQLite 清单、完整性与缺失审计 |
+| `organization` | 部门 / 用户 / 群组只读 |
+| `collaboration` | 协作关系读写 |
+| `mutation` | 文件夹、文件、回收站、上传等写操作 |
+| `admin` | 管理员操作 |
+| `transfer` | 短时 Provider 直链（特殊集成；非普通读路径） |
+
+未知 toolset 名会导致**启动失败**。建议从最小集合开始：
 
 ```env
 YFY_TOOLSETS=drive
 ```
 
-| 值 | 云端行为 | 本地行为 | 主要能力 |
-|---|---|---|---|
-| `drive` | 只读和下载 | 临时 Resource | status、browse、search、resolve、get、versions、open、comments、shares、Resource release |
-| `workspace` | 只读 | 无 | Workspace 校验和成员关系 |
-| `inventory` | 递归只读扫描 | SQLite | refresh、完整性、固定水位搜索、取消和释放 |
-| `evidence` | 下载 | 临时 Resource | Workspace-bound Capture 和共享 Resource release |
-| `organization` | 只读 | 无 | department、user、group 明确工具 |
-| `collaboration` | 读写 | 无 | 协作读取和变更 |
-| `mutation` | 写入 | 可读取上传目录 | 创建、移动、删除、恢复、上传 |
-| `admin` | 读写 | 无 | 企业管理和日志 |
-| `transfer` | 读取短时 URL | 无 | 敏感 Provider 下载 ticket（**永不进入投标默认**） |
-
-`YFY_TOOLSETS` 是逗号分隔列表，重复值会去重，未知值会导致启动失败。建议从最小集合开始：
-
-- `drive` 是普通浏览、搜索、元数据和 `yfy_open` 的基础平面。
-- `workspace` 只提供范围校验，不自动限制普通 Drive 工具。
-- `inventory` 会产生 Provider 递归读取和本地 SQLite 写入，但不修改云端。
-- `evidence` 会下载并暂存原件，但不修改云端。
-- `collaboration`、`mutation`、`admin` 含云端写操作，应只在明确需要时启用。
-- `transfer` 直接返回短时 Provider URL，敏感度高于普通 `yfy_open`；**投标与只读审计流不要启用**。
-
-### Tender Profile 工具矩阵
-
-| 场景 | `YFY_TOOLSETS` | 说明 |
-|---|---|---|
-| 仅浏览 | `drive` | 默认 |
-| **投标完整工作流** | **`drive,workspace,inventory,evidence`** | Profile `tender` 强制要求；`transfer` / `organization` / 写工具均不在默认矩阵 |
-| 投标 + 组织通讯录 | `drive,workspace,inventory,evidence,organization` | 可选扩展，非 Profile 强制 |
-| 显式下载 ticket | 在矩阵上**额外**追加 `,transfer` | 仅在明确需要短时 Provider URL 时；永不默认 |
+Tender（招投标）Profile 要求 `drive,workspace,inventory`，且至少配置一个 Workspace：
 
 ```env
-YFY_TOOLSETS=drive,workspace,inventory,evidence
+YFY_TOOLSETS=drive,workspace,inventory
 YFY_WORKFLOW_PROFILES=tender
 ```
 
-`YFY_WORKFLOW_PROFILES` 是逗号分隔列表。当前仅支持 `tender`；它注册 Guidance 和 Prompt，不授予额外权限。启用 `tender` 时必须同时启用 `drive,workspace,inventory,evidence`，并至少配置一个 Workspace，否则服务拒绝启动。**`transfer` 永不作为 tender 默认或强制依赖。**
+`transfer`、写工具与组织工具**不会**因 Tender Profile 自动启用。
 
-## Access Context
+---
 
-服务自动创建 `default` Context。附加身份：
+## 身份与 Workspace
+
+默认访问身份 id 为 `default`。附加身份用 JSON 配置：
 
 ```env
-YFY_ACCESS_CONTEXTS_JSON=[{"id":"reviewer","user_id":"531","external_enterprise_id":"9"}]
 YFY_DEFAULT_ACCESS_CONTEXT=default
+YFY_ACCESS_CONTEXTS_JSON=[{"id":"reviewer","user_id":"531","external_enterprise_id":"9"}]
 ```
 
-| 配置/字段 | 必填 | 作用与约束 |
+| 字段 | 必需 | 说明 |
 |---|---|---|
-| `YFY_DEFAULT_ACCESS_CONTEXT` | 否 | 未显式传 `access_context` 时使用的 Context；默认 `default`，必须引用已存在 Context |
-| `YFY_ACCESS_CONTEXTS_JSON` | 否 | 附加身份数组；默认 `[]` |
-| `id` | 是 | Context 稳定名称，只能包含字母、数字、`_`、`-`；不能重复，也不能再次定义 `default` |
-| `user_id` | 是 | 该 Context 代表的 Provider 用户，纯数字字符串 |
-| `external_enterprise_id` | 否 | 跨企业/外部企业场景需要的 Provider 企业 ID，纯数字字符串；普通单企业部署省略 |
+| `id` | 是 | 本地稳定名称；仅字母、数字、下划线、连字符 |
+| `user_id` | 是 | Provider 用户 ID |
+| `external_enterprise_id` | 否 | 外部企业上下文 |
 
-每个 Context 独立参与 token、请求并发桶和 Workspace 绑定。增加 Context 不会扩大 Provider ACL，只是允许工具显式选择另一个已授权用户身份。
-
-## Workspace
+Workspace 是**业务目录边界**，不授予新权限：
 
 ```env
 YFY_WORKSPACES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_context":"default","tags":["tender"]}]
 ```
 
-| 字段 | 必填 | 说明 |
-|---|---|---|
-| `id` | 是 | Agent 使用的稳定 Workspace 名称 |
-| `root_folder_id` | 是 | 业务目录根文件夹 ID |
-| `access_context` | 否 | 默认 `default` |
-| `tags` | 否 | 说明性标签，不改变权限 |
+- 工具入参使用完整 `workspace:<id>` 形式。
+- 传给 `yfy_download` 时，会在下载前后校验文件是否仍在配置根目录子树内。
 
-Workspace 不会授予 Provider 权限。启动后使用 `yfy_workspace_validate` 验证目录、业务路径和身份可达性。
+---
 
-普通位置引用为 `workspace:<id>`。Workspace、Inventory 和 Capture 工具也只接受该完整 Ref，不接受裸 `id`。Drive 工具可从该位置开始，但只有 Workspace/Inventory/Capture 工具提供范围保证。
+## 传输模式（Transport）
 
-Workspace 的 `root_folder_id`、`access_context` 或身份配置变化后，旧 ItemRef、Inventory Ref 和 Inventory cursor 不应继续使用。Inventory 会持久化创建时的配置 Workspace 根和实际 scan root；当前配置根不匹配时返回 `YFY_INVENTORY_STALE`，不会动态重解释旧扫描。`inventory` 为稳定 MAC 句柄（`inventory:<uuid>@<access_context>.<mac24>`），MAC 绑定 `YFY_CLIENT_SECRET`、Inventory ID 和 Access Context，状态访问时再复核 workspace fingerprint；同一 inventory 多次返回相同字符串。更换 secret 后必须重新创建 Inventory 以取得新 Ref。调用 `yfy_status` 获取新的 PlaceRef，并从 Browse、Resolve、Search 或 Inventory 结果重新发现项目。
+### stdio（同机）
 
-## Inventory
-
-| 变量 | 默认值 | 作用 | 约束与调优建议 |
-|---|---:|---|---|
-| `YFY_STATE_DB` | `<YFY_TEMP_DIR>/state.sqlite` | Inventory 状态、frontier、item 索引和 receipt 的 SQLite 文件 | 使用绝对或可解析路径；不能位于 `<YFY_TEMP_DIR>/artifacts`；同一文件只允许一个服务进程持有锁 |
-| `YFY_INVENTORY_CONCURRENCY` | `2` | 单个 Inventory worker 同时读取的 Provider 页面数 | 允许 1-8；提高会加快宽目录扫描，也会增加 429、Provider 延迟和前台请求竞争 |
-| `YFY_INVENTORY_TTL_SECONDS` | `604800` | Inventory 本地状态的失效/保留时间 | 正整数；运行任务会刷新活动 TTL，终态超过 TTL 后清理；不等同于 freshness |
-| `YFY_MAX_STATE_BYTES` | `2147483648` | SQLite 主文件、WAL 和索引增长的物理配额 | 正整数；达到上限时任务失败为 `YFY_INVENTORY_STORAGE_INSUFFICIENT`，不会静默丢项 |
-
-保留期决定本地状态何时可清理；`yfy_inventory_create.refresh.max_age_seconds` 决定本次调用是否接受复用。两者是独立概念：TTL 长并不表示观察仍足够新，freshness 短也不会立即删除旧状态。
-
-`1.0.0` 重新建立内部状态和签名格式。`0.4.0` 的 `YFY_SCAN_DIR` 文件状态不兼容，不会自动迁移、覆盖或删除；升级时必须停止旧进程并配置新的空 `YFY_STATE_DB`。
-
-`yfy_inventory_create` 不提供隐藏的 limits 默认值，每次调用必须显式传。可选 `root_folder` 将扫描限制在 Workspace 内已验证的子树（适合大资料库）：
-
-```json
-{
-  "workspace":"workspace:tender_public",
-  "root_folder":"folder:502@default.aaaaaaaaaaaaaaaaaaaaaaaa",
-  "refresh":{"mode":"reuse_if_fresh","max_age_seconds":300},
-  "limits":{"max_item_depth":8,"max_items":10000}
-}
+```env
+YFY_TRANSPORT=stdio
+YFY_DOWNLOAD_EXPOSE_LOCAL_PATH=enabled
+YFY_DOWNLOAD_STAGED_HTTP=disabled
 ```
 
-`max_item_depth` 允许 1-100，`max_items` 允许 1-1,000,000。达到任一边界会使 Inventory 不完整，因此 limits 是业务证明边界，不只是性能配置。`reuse_if_fresh.max_age_seconds` 允许 0-604800，省略时为 300；`force_refresh` 不接收 max age，并始终创建新任务。缺失结论仅在 `safe_to_claim_absence=true` / `agent_guidance.may_claim_absence=true` 时成立。
+stdio **不**启动 HTTP Server，因此：
 
-`yfy_inventory_search` 的首次调用默认 `limit=25`，最大 100；默认搜索 name 和 path，大小写不敏感。cursor 固定首次查询的 commit watermark，后台扫描新增提交不会改变已有分页视图。
+- 必须启用 `YFY_DOWNLOAD_EXPOSE_LOCAL_PATH`
+- 必须禁用 `YFY_DOWNLOAD_STAGED_HTTP`
+- 结果返回服务器上的绝对路径 `local_path`
+- 仅适用于 Host 与 Server 同机（或共享同一文件系统）
 
-物理配额以 `retention.storage.database_bytes`、`logical_bytes` 和 `wal_bytes` 观察。`database_bytes` 代表 SQLite 活动文件占用，WAL 单独报告；达到 `YFY_MAX_STATE_BYTES` 时任务显式失败，不会通过丢弃 item 或 receipt 继续。
+非法组合在**启动期失败**，而不是返回不可达 URL。
 
-## Content Resource
-
-| 变量 | 默认值 | 作用 | 约束与调优建议 |
-|---|---:|---|---|
-| `YFY_TEMP_DIR` | `<OS temp>/yifangyun-mcp` | 下载临时文件、Evidence artifacts 和默认 SQLite 的父目录 | 运行用户必须可写；生产环境应使用持久、受限权限、容量可监控的目录 |
-| `YFY_TEMP_FILE_TTL_SECONDS` | `86400` | 注册 Resource 和遗留临时文件的最长本地生存期 | 正整数；到期读取失败并删除内容；正常消费后仍应立即调用 `yfy_resource_release` |
-| `YFY_MAX_DOWNLOAD_BYTES` | `268435456` | 单次下载或上传 safeguard 的最大字节数 | 正整数；有无 Content-Length 都执行；超过时中止，不保留部分内容 |
-| `YFY_MAX_EVIDENCE_RESOURCE_BYTES` | `16777216` | 单个 MCP Resource/part 的最大字节数 | 必须小于等于 `YFY_MAX_DOWNLOAD_BYTES`；大文件改为 multipart，不改变原件总大小 |
-| `YFY_MAX_TEMP_BYTES` | `1073741824` | 当前进程所有并发临时下载的共享预留配额 | 正整数；无 Content-Length 时按单次最大下载量预留，防止并发耗尽磁盘 |
-| `YFY_DOWNLOAD_IDLE_TIMEOUT_MS` | `30000` | 下载流连续无进展的超时 | 正整数；慢但持续传输不会触发，网络挂起会中止 |
-| `YFY_DOWNLOAD_WALL_TIMEOUT_MS` | `300000` | 单次下载从开始到结束的总时限 | 正整数；应大于 idle timeout，超大文件或低带宽部署可谨慎提高 |
-| `YFY_ALLOW_PRIVATE_TRANSFER_URLS` | `disabled` | 是否允许下载/上传 ticket 解析到私网、回环或保留地址 | 接受 `enabled/disabled`、`true/false`、`1/0`、`yes/no`；仅可信私有部署可开启，开启会扩大 SSRF 风险面 |
-| `YFY_UPLOAD_ROOT_DIR` | 未配置 | 本地上传源文件允许目录 | 仅 `mutation` 上传工具使用；未配置时拒绝本地上传；路径解析、打开文件句柄和后续上传绑定同一已验证文件 |
-
-单个 Resource 超过 `YFY_MAX_EVIDENCE_RESOURCE_BYTES` 时返回 multipart manifest，每个 part 不超过该上限。该上限不能大于 `YFY_MAX_DOWNLOAD_BYTES`。
-
-任何 Agent-facing 结果都不返回服务器本地路径。Open/Capture 的 `include_text_preview` 默认 true：不超过 32 KiB 的可预览 UTF-8 内容在 Registry 复核大小和 SHA-256 后，以 MCP embedded resource 和 `structuredContent.resource.preview_text` 返回；compact text 不重复正文。设为 false 时只返回 resource link。Resource 到期、释放或完整性失败后会删除临时内容。
-
-## Provider 与重试
-
-| 变量 | 默认值 | 作用 | 约束与调优建议 |
-|---|---:|---|---|
-| `YFY_API_BASE_URL` | `https://open.fangcloud.com/api` | 亿方云 OpenAPI 根地址 | 自动移除末尾 `/`；非 localhost 必须 HTTPS；禁止 URL userinfo；私有部署才需要覆盖 |
-| `YFY_OAUTH_BASE_URL` | `https://open.fangcloud.com` | 企业和用户 OAuth token 根地址 | URL 约束同上；通常与 API base 属于同一部署 |
-| `YFY_REQUEST_TIMEOUT_MS` | `30000` | 每次 Provider HTTP 尝试的 wall timeout | 正整数；从一次尝试开始计时，包含身份/全局并发排队和实际请求，不替代下载专用 timeout |
-| `YFY_TOKEN_REFRESH_SKEW_SECONDS` | `300` | token 到期前提前刷新的安全窗口 | 正整数；过小可能在请求途中到期，过大会增加 token 交换频率 |
-| `YFY_MAX_PAGE_CAPACITY` | `500` | 发给 Provider 的单页容量硬上限，也是 Inventory page capacity | 正整数；工具的 Agent-facing limit 可以更小；提高会增加单响应内存和输出投影成本 |
-| `YFY_RETRY_MAX_ATTEMPTS` | `3` | 幂等安全请求面对 429、5xx 或网络错误时的总尝试次数 | 正整数，包含首次请求；非幂等 POST 默认不自动重试 |
-| `YFY_RETRY_BASE_DELAY_MS` | `500` | 指数退避的基础延迟 | 正整数；过小会放大 Provider 压力，过大会延长恢复时间 |
-| `YFY_MAX_RETRY_DELAY_MS` | `30000` | 单次重试等待上限 | 正整数；Provider `Retry-After` 和退避结果都会受该上限约束 |
-| `YFY_MAX_CONCURRENT_PROVIDER_REQUESTS` | `4` | 当前进程所有 Provider 请求的全局并发上限 | 正整数；保护租户和本机资源；应不小于单身份上限，通常不宜大幅提高 |
-| `YFY_MAX_CONCURRENT_REQUESTS_PER_IDENTITY` | `2` | 每个 Access Context/请求桶的并发上限 | 正整数；防止单一身份占满全局容量；多个 Context 可共享全局上限 |
-
-非 localhost URL 必须使用 HTTPS，不能含 userinfo 凭据。
-
-重试等待和并发排队都响应 MCP 取消信号。增大 timeout 或 retry 次数不会削弱客户端取消；但会提高无人取消时的最坏完成时间，应结合 Provider SLA 计算。
-
-## HTTP
+### HTTP（本机开发）
 
 ```env
 YFY_TRANSPORT=http
 YFY_HTTP_HOST=127.0.0.1
 YFY_HTTP_PORT=3000
-YFY_HTTP_BEARER_TOKEN=
-YFY_HTTP_ALLOWED_HOSTS=
-YFY_HTTP_ALLOWED_ORIGINS=
 ```
 
-| 变量 | 默认值 | 作用 | 约束与调优建议 |
-|---|---:|---|---|
-| `YFY_TRANSPORT` | `stdio` | MCP 传输模式 | 仅允许 `stdio` 或 `http`；stdio 不监听网络端口 |
-| `YFY_HTTP_HOST` | `127.0.0.1` | HTTP 监听地址 | 非 `127.0.0.1/localhost/::1` 时必须同时配置 Bearer、Host 和 Origin 白名单 |
-| `YFY_HTTP_PORT` | `3000` | HTTP 监听端口 | 正整数；端口占用会导致启动失败 |
-| `YFY_HTTP_MAX_SESSIONS` | `100` | 同时保留的 stateful MCP session 上限 | 正整数；达到上限时优先关闭最老且无活动请求的 session，否则返回容量错误 |
-| `YFY_HTTP_SESSION_IDLE_SECONDS` | `1800` | 无活动请求 session 的空闲回收时间 | 正整数；清理周期不超过 60 秒；过小会导致长间隔客户端频繁重连 |
-| `YFY_HTTP_BEARER_TOKEN` | 未配置 | HTTP Authorization Bearer | 非回环监听必填；只要配置，所有 HTTP 请求都必须携带；使用 timing-safe compare；应为高熵随机值并通过 secret 管理器注入 |
-| `YFY_HTTP_ALLOWED_HOSTS` | 未配置 | 逗号分隔的 Host 白名单 | 非回环监听必填；传给 MCP Express Host 校验，填写客户端实际访问 Host |
-| `YFY_HTTP_ALLOWED_ORIGINS` | 未配置 | 逗号分隔的 Origin 精确白名单 | 非回环监听必填；请求带 Origin 且不在列表时返回 403；值应包含 scheme 和端口 |
+HTTP 默认：
 
-HTTP 端点为 `POST/GET/DELETE /mcp`、`GET /health` 和 `GET /metrics`。Bearer/Origin middleware 对 HTTP 应用生效；生产环境仍应在反向代理配置 TLS、请求体限制、连接限制和速率限制。
+- `YFY_DOWNLOAD_EXPOSE_LOCAL_PATH=disabled`
+- `YFY_DOWNLOAD_STAGED_HTTP=enabled`
+- `yfy_download` 返回 `fetch_url`
 
-## 日志
+localhost 可不配 Bearer，但仅建议用于可信本机开发。
 
-| 变量 | 默认值 | 作用与约束 |
+### 远程 HTTP
+
+```env
+YFY_TRANSPORT=http
+YFY_HTTP_HOST=0.0.0.0
+YFY_HTTP_PORT=3000
+YFY_HTTP_BEARER_TOKEN=replace-with-a-long-random-token
+YFY_HTTP_ALLOWED_HOSTS=mcp.example.com
+YFY_HTTP_ALLOWED_ORIGINS=https://agent.example.com
+YFY_DOWNLOAD_EXPOSE_LOCAL_PATH=disabled
+YFY_DOWNLOAD_STAGED_HTTP=enabled
+YFY_DOWNLOAD_STAGED_PUBLIC_BASE_URL=https://mcp.example.com
+```
+
+以下任一成立即视为**远程交付**（需完整安全配置）：
+
+- HTTP 绑定非回环地址
+- staged 对外 base URL 指向非回环主机
+
+远程交付必须同时配置：Bearer、Host 白名单、Origin 白名单。
+Bearer 同时保护 `/mcp` 与 `/staged/v1/...`。
+
+### 下载交付相关变量
+
+| 变量 | 默认 | 约束 |
 |---|---:|---|
-| `YFY_LOG_LEVEL` | `info` | 结构化 stderr 日志最低级别；仅允许 `debug`、`info`、`warn`、`error` |
+| `YFY_DOWNLOAD_EXPOSE_LOCAL_PATH` | stdio 开 / HTTP 关 | 远程部署通常保持关闭 |
+| `YFY_DOWNLOAD_STAGED_HTTP` | stdio 关 / HTTP 开 | 仅 HTTP transport 可启用 |
+| `YFY_DOWNLOAD_STAGED_MAX_FETCHES` | `10` | 正整数；按 HTTP 获取**尝试**扣减 |
+| `YFY_DOWNLOAD_STAGED_MAX_CONCURRENT_READS` | `20` | 同时进行的 staged 流上限，最大 `40` |
+| `YFY_DOWNLOAD_STAGED_PUBLIC_BASE_URL` | localhost 可自动生成 | 远程或通配监听必须显式配置 |
 
-日志和 provenance 会脱敏 Bearer、签名 URL、下载 pathname 和 access context。生产环境不应通过 `debug` 长期采集高体积日志；任何级别都不应依赖日志保存原件内容或凭据。
+Public base 规则：
 
-## 通用校验规则
+- 仅 HTTP/HTTPS
+- 非 localhost 必须 HTTPS
+- 禁止 userinfo、query、fragment
+- 可带反向代理路径前缀，例如 `https://example.com/mcp-files`
+- 配置后须确保代理把该前缀下的 `/staged/v1/...` 转到本服务
 
-- 所有整数型变量解析后必须是大于 0 的整数；当前只有 `YFY_INVENTORY_CONCURRENCY` 额外限制为 1-8。ID 字段则严格要求纯数字字符串。
-- CSV 变量按逗号拆分并去除空白；空字符串等同未配置。
-- JSON 变量必须是合法 JSON 数组，字段名和类型严格按本页 schema；重复 Context/Workspace ID 会导致启动失败。
-- 路径会通过 `path.resolve` 规范化。生产环境应显式配置绝对路径，避免工作目录变化导致状态或临时文件落到不同位置。
-- 配置修改只在新进程启动时生效，不支持热重载。重启后旧 Resource token 不可用；`YFY_CLIENT_SECRET` 变化会使旧普通 cursor、Inventory ref 和 Inventory cursor 失效。
-- `yfy_status.server.config_fingerprint` 可用于判断影响 Agent 契约的配置是否变化。它不包含 secret 明文，但不应被解释为 Provider 内容版本。
-- Context-bound ItemRef 中的身份指纹必须与当前 Access Context 匹配；身份配置变化后调用方应重新发现 Ref，而不是修改 Ref 字符串。
+`0.0.0.0` 与 `::` 是监听地址，**不是**可对外广告的主机名，不能用于自动生成远程 URL。
 
-## 示例
+---
 
-只浏览：
+## HTTP Server
 
-```env
-YFY_TOOLSETS=drive
-YFY_WORKSPACES_JSON=[]
-YFY_WORKFLOW_PROFILES=
+| 变量 | 默认 | 说明 |
+|---|---:|---|
+| `YFY_HTTP_HOST` | `127.0.0.1` | 监听地址 |
+| `YFY_HTTP_PORT` | `3000` | 监听端口 |
+| `YFY_HTTP_MAX_SESSIONS` | `100` | 最大 MCP session 数 |
+| `YFY_HTTP_SESSION_IDLE_SECONDS` | `1800` | 空闲 session 回收（秒） |
+| `YFY_HTTP_BEARER_TOKEN` | 空 | Bearer Token |
+| `YFY_HTTP_ALLOWED_HOSTS` | 空 | 逗号分隔 Host 白名单 |
+| `YFY_HTTP_ALLOWED_ORIGINS` | 空 | 逗号分隔 Origin 白名单 |
+
+端点：
+
+```text
+POST/GET/DELETE /mcp
+GET /staged/v1/{download_id}/{optional_file_name}
+GET /health
+GET /metrics
 ```
 
-完整投标工作流（**默认矩阵，不含 transfer**）：
+staged URL 中的文件名仅影响下载显示名；真正的授权句柄是不可猜测的 `download_id`。
 
-```env
-YFY_TOOLSETS=drive,workspace,inventory,evidence
-YFY_WORKFLOW_PROFILES=tender
-YFY_WORKSPACES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_context":"default","tags":["tender"]}]
+---
+
+## 下载与临时存储
+
+| 变量 | 默认 | 说明 |
+|---|---:|---|
+| `YFY_TEMP_DIR` | `<OS temp>/yifangyun-mcp` | 受管理的临时根目录 |
+| `YFY_TEMP_FILE_TTL_SECONDS` | `86400` | 已登记下载与未完成 artifact 的保留时间 |
+| `YFY_MAX_DOWNLOAD_BYTES` | `268435456` | 单个下载/上传最大字节（256 MiB） |
+| `YFY_MAX_TEMP_BYTES` | `1073741824` | artifacts + downloads + 进行中预留 的共享总配额（1 GiB） |
+| `YFY_TEXT_PREVIEW_MAX_BYTES` | `32768` | 可选 UTF-8 文本预览上限；配置最大允许 `1048576` |
+| `YFY_DOWNLOAD_IDLE_TIMEOUT_MS` | `30000` | 下载无进度超时 |
+| `YFY_DOWNLOAD_WALL_TIMEOUT_MS` | `300000` | 单次 `yfy_download` 的 ticket + stream 总耗时上限（含一次可重试） |
+
+`YFY_TEMP_DIR` 下由服务独占：
+
+```text
+artifacts/   下载进行中的候选文件
+downloads/   已校验下载、manifest、release 状态
 ```
 
-投标 + 组织查询（可选扩展，仍不含 transfer）：
+### 配额行为（与代码一致）
 
-```env
-YFY_TOOLSETS=drive,workspace,inventory,evidence,organization
-YFY_WORKFLOW_PROFILES=tender
-YFY_WORKSPACES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_context":"default","tags":["tender"]}]
+1. Provider 响应有 `Content-Length` 时，按该长度**预留**空间；无长度时按 `YFY_MAX_DOWNLOAD_BYTES` 预留。
+2. 已登记 downloads 与进行中 artifacts 共用同一配额。
+3. 配额不足时**只拒绝新请求**，不删除仍在 TTL 内的旧下载。
+4. `release` 仅在物理删除成功后才扣减已用空间。
+5. 启动恢复：先删除已过期或无效的合法 `download_id` 目录，再对剩余有效文件做配额断言。
+
+### 启动恢复与 manifest
+
+每个下载目录含随机 `download_id`、文件与原子写入的 `manifest.json`（含到期时间、文件名、哈希、大小、mtime、ctime 等）。
+
+恢复阶段：
+
+- 只校验 manifest、普通文件类型与元数据，**不**整文件重读内容
+- 过期或已确定损坏的合法 download 目录会被删除
+- 暂时性 I/O / 权限错误会中止启动并保留文件
+- 未知根级条目不会自动删除，但仍计入配额
+- 降低 `YFY_MAX_TEMP_BYTES` 不会驱逐仍在 TTL 内的有效下载；过期清理后的配额自愈不阻止启动
+
+HTTP 抓取次数（fetch count）仅在进程内计数，**重启后重置**，避免每次 GET 重写 manifest。
+
+`YFY_TEMP_DIR`、`artifacts/`、`downloads/` 必须是服务账户控制的**普通目录**，不能是符号链接或 Windows junction。
+`YFY_STATE_DB` 不能位于 `artifacts/` 或 `downloads/` 内。
+
+### 文本预览
+
+默认关闭。调用方需显式传入：
+
+```json
+{"file":"file:...","include_text_preview":true}
 ```
 
-启用 Toolset 只注册能力，不绕过 Provider ACL。`inventory` 和内容工具不修改云端，但会写本地 SQLite 或临时 Resource。`transfer` 仅在明确需要短时 Provider URL 时单独追加。
+仅当完整文件为受支持文本类型、大小不超过上限、且 UTF-8 严格解码成功时返回 preview。
+
+---
+
+## Inventory（目录清单）
+
+| 变量 | 默认 | 说明 |
+|---|---:|---|
+| `YFY_STATE_DB` | `<YFY_TEMP_DIR>/state.sqlite` | Inventory SQLite 路径 |
+| `YFY_INVENTORY_CONCURRENCY` | `2` | 递归读取并发，范围 1–8 |
+| `YFY_INVENTORY_TTL_SECONDS` | `604800` | 清单保留时间（7 天） |
+| `YFY_MAX_STATE_BYTES` | `2147483648` | SQLite + WAL + 逻辑状态上限（2 GiB） |
+
+- 同一 `YFY_STATE_DB` **只允许一个进程**打开。
+- 完整性结论仅在终态清单明确返回 `safe_to_claim_absence=true`（以及对应 `agent_guidance.may_claim_absence=true`）时成立。
+- 查询分页绑定 `commit_watermark`（已提交的扫描进度标记），不会读到尚未写入本地库的观测结果。
+
+---
+
+## Provider 请求
+
+| 变量 | 默认 |
+|---|---:|
+| `YFY_REQUEST_TIMEOUT_MS` | `30000` |
+| `YFY_TOKEN_REFRESH_SKEW_SECONDS` | `300` |
+| `YFY_MAX_PAGE_CAPACITY` | `500` |
+| `YFY_RETRY_MAX_ATTEMPTS` | `3` |
+| `YFY_RETRY_BASE_DELAY_MS` | `500` |
+| `YFY_MAX_RETRY_DELAY_MS` | `30000` |
+| `YFY_MAX_CONCURRENT_PROVIDER_REQUESTS` | `40` |
+| `YFY_MAX_CONCURRENT_REQUESTS_PER_IDENTITY` | `20` |
+
+- 两项并发硬上限均为 `40`；per-identity 不能高于全局。
+- 访问身份由用户、Enterprise、external enterprise 共同界定；预签名文件下载按完整 access identity 单独分桶。
+- **仅安全只读**请求自动重试；非幂等写请求不会自动重放。
+- 收到响应头后的 transfer stream 若发生可重试中断，`yfy_download` 会**再获取一次 ticket**；第二次尝试只用 `YFY_DOWNLOAD_WALL_TIMEOUT_MS` 的**剩余**时间，不会重置完整超时。调用方取消后不重试。
+
+`YFY_ALLOW_PRIVATE_TRANSFER_URLS` 默认 `disabled`。仅可信私有部署可启用：会放宽下载/上传 ticket 的 SSRF 地址限制。
+
+---
+
+## 其他
+
+| 变量 | 默认 | 说明 |
+|---|---:|---|
+| `YFY_UPLOAD_ROOT_DIR` | 空 | mutation 本地上传白名单根目录 |
+| `YFY_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+
+`yfy_status` 返回非敏感配置摘要、下载交付方式、临时存储用量与 workflow readiness；**不**返回密钥、Bearer 或临时根路径。

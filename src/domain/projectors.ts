@@ -27,7 +27,7 @@ export function projectPath(value: JsonValue | undefined): JsonObject[] {
   });
 }
 
-export function projectItem(value: JsonValue | undefined, view: "summary" | "evidence" | "full" = "summary"): JsonObject {
+export function projectItem(value: JsonValue | undefined, view: "summary" | "verification" | "full" = "summary"): JsonObject {
   const source = objectValue(value);
   if (!source) {
     return {};
@@ -142,7 +142,7 @@ export function projectPage(value: JsonValue | undefined, fallback: { fileCount?
   };
 }
 
-export function projectItemPage(value: JsonValue | undefined, view: "summary" | "evidence" | "full" = "summary", fallback: { filteredCount?: number; pageCapacity: number; pageId: number; providerCount?: number; requestedPageCapacity?: number } = { pageCapacity: 50, pageId: 0 }): JsonObject {
+export function projectItemPage(value: JsonValue | undefined, view: "summary" | "verification" | "full" = "summary", fallback: { filteredCount?: number; pageCapacity: number; pageId: number; providerCount?: number; requestedPageCapacity?: number } = { pageCapacity: 50, pageId: 0 }): JsonObject {
   const source = objectValue(value) ?? {};
   const rawFiles = arrayValue(source.files);
   const rawFolders = arrayValue(source.folders);

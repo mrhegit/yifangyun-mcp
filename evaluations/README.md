@@ -1,7 +1,21 @@
-# Agent Evaluations
+# Agent 评测说明
 
-`general_workflows.xml` 覆盖 Drive、Workspace、Inventory、Capture、Resource 和写入工具选择，重点检查普通任务是否避免过度调用 Inventory/Capture。
+## 用例文件
 
-`authority_readonly.xml` 绑定固定 Workspace root `501000715605`，用于验证业务路径和完整性场景。运行前将该目录配置为命名 Workspace，并调用 `yfy_workspace_validate`。
+| 文件 | 用途 |
+|---|---|
+| `general_workflows.xml` | Drive / Workspace / Inventory / Download / 写工具的选择路径；重点：普通读文件应选 `yfy_download`；范围审计仅在需要完整性时才用 Inventory |
+| `authority_readonly.xml` | 绑定固定 Workspace 根 `501000715605`，验证业务路径与完整性场景 |
 
-除工具选择准确率外，应记录完整工具 trace、参数、输出字节数、平均调用数、错误分类、cursor 可执行性，以及是否在 `safe_to_claim_absence=false` 时错误声明不存在。
+运行 `authority_readonly` 前：将该目录配置为命名 Workspace，并先调用 `yfy_workspace_validate`。
+
+## 建议记录指标
+
+除工具选择准确率外，建议记录：
+
+- 完整工具调用 trace
+- 参数与输出字节数
+- 平均调用次数
+- 错误分类
+- cursor / `next_action` 是否可执行
+- 是否在 `safe_to_claim_absence=false` 时错误声明“不存在”

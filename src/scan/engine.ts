@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import type { IdLike, JsonObject, JsonValue } from "../types.js";
 import { YifangyunError } from "../client.js";
 import { metrics } from "../observability.js";
-import { projectInventoryPolicy, projectInventoryReceipt } from "./projectors.js";
+import { projectInventoryPolicy } from "./projectors.js";
 import type { ScopeItemCursor, ScopeItemPage, ScopePageArtifact, ScopeScanFrontier, ScopeScanPolicy, ScopeScanProvider, ScopeScanRepository, ScopeScanState, ScopeSeenItem } from "./types.js";
 
 function digest(value: unknown): string {
@@ -68,7 +68,7 @@ export class ScopeScanEngine {
       if (reusable) {
         return { reuseReason: reusable.status === "complete" ? "fresh_complete" : "running_join", reused: true, state: reusable };
       }
-      const observed = await this.provider.getRoot(input.rootFolderId, input.userId, input.signal);
+      const observed = await this.provider.getRoot(input.rootFolderId, input.userId, input.signal, input.externalEnterpriseId);
       const now = new Date().toISOString();
       const scanId = crypto.randomUUID();
       const rootName = asText(observed.folder.name) ?? rootFolderId;
@@ -162,7 +162,7 @@ export class ScopeScanEngine {
         }
         const fetched = await Promise.allSettled(cursors.map(async (cursor) => {
           const requestStartedAt = Date.now();
-          const page = await this.provider.listChildren(cursor.folderId, input.userId, cursor.pageId, state.policy.pageCapacity, requestSignal);
+          const page = await this.provider.listChildren(cursor.folderId, input.userId, cursor.pageId, state.policy.pageCapacity, requestSignal, state.externalEnterpriseId);
           return { cursor, latencyMs: Date.now() - requestStartedAt, page };
         }));
 
@@ -369,7 +369,7 @@ export class ScopeScanEngine {
         const finalSignal = input.signal ? AbortSignal.any([input.signal, finalDeadline]) : finalDeadline;
         let finalRoot: Awaited<ReturnType<ScopeScanProvider["getRoot"]>>;
         try {
-          finalRoot = await this.provider.getRoot(state.rootFolderId, input.userId, finalSignal);
+          finalRoot = await this.provider.getRoot(state.rootFolderId, input.userId, finalSignal, state.externalEnterpriseId);
         } catch (error) {
           const yfyError = error instanceof YifangyunError ? error : undefined;
           state.status = input.signal?.aborted ? "retry_wait" : yfyError?.code === "YFY_PERMISSION_DENIED" ? "partial" : yfyError?.retryable !== false || finalDeadline.aborted ? "retry_wait" : "failed";

@@ -133,7 +133,7 @@ export class SnapshotService {
     return this.repository.release(scanId);
   }
 
-  storageStats() {
+  async storageStats() {
     return this.repository.storageStats();
   }
 
@@ -143,7 +143,7 @@ export class SnapshotService {
       controller.abort("server closing");
     }
     await Promise.allSettled(this.workers.values());
-    this.repository.close();
+    await this.repository.close();
   }
 
   async waitForIdle(scanId: string): Promise<void> {

@@ -14,7 +14,7 @@ export function registerTransferTools(server: McpServer, runtime: AppRuntime): v
   }
   registerTool(server, "yfy_transfer_ticket_get", {
     title: "Get Current Transfer Ticket",
-    description: "Special-integration only (usage_policy=special_integration_only, not_for_evidence). Return a short-lived Provider transfer URL for the current version only. Do not use this for ordinary agent reads or as the tender evidence path—prefer yfy_open for bytes and yfy_capture for workspace-bound evidence. The URL is sensitive (do_not_echo_url): never log, store, or echo it. This result has no content-integrity guarantee. Historical transfer tickets are intentionally unsupported.",
+    description: "Special-integration only (usage_policy=special_integration_only, not_for_verified_download). Return a short-lived Provider transfer URL for the current version only. Do not use this for ordinary agent reads—prefer yfy_download. The URL is sensitive (do_not_echo_url): never log, store, or echo it. This result has no content-integrity guarantee. Historical transfer tickets are intentionally unsupported.",
     inputSchema: { file: FileRefSchema },
     outputSchema: {
       download_url: z.string().url(),
@@ -22,9 +22,9 @@ export function registerTransferTools(server: McpServer, runtime: AppRuntime): v
       sensitive: z.literal(true),
       expires_quickly: z.literal(true),
       usage_policy: z.literal("special_integration_only"),
-      not_for_evidence: z.literal(true),
+      not_for_verified_download: z.literal(true),
       do_not_echo_url: z.literal(true),
-      preferred_alternatives: z.object({ ordinary_read: z.literal("yfy_open"), workspace_evidence: z.literal("yfy_capture") }).strict(),
+      preferred_alternatives: z.object({ ordinary_read: z.literal("yfy_download"), workspace_bound: z.literal("yfy_download") }).strict(),
       provenance: z.array(ProvenanceSchema)
     }
   }, { readOnly: true }, async ({ file }, extra) => {
@@ -47,9 +47,9 @@ export function registerTransferTools(server: McpServer, runtime: AppRuntime): v
       sensitive: true,
       expires_quickly: true,
       usage_policy: "special_integration_only",
-      not_for_evidence: true,
+      not_for_verified_download: true,
       do_not_echo_url: true,
-      preferred_alternatives: { ordinary_read: "yfy_open", workspace_evidence: "yfy_capture" },
+      preferred_alternatives: { ordinary_read: "yfy_download", workspace_bound: "yfy_download" },
       provenance: [provenance(versionsResponse.meta, resolved.context.id), provenance(response.meta, resolved.context.id)]
     };
   });

@@ -34,7 +34,7 @@ function resolveBoundRef(runtime: AppRuntime, value: unknown, expectedType?: "fi
 }
 
 function boundItem(value: JsonValue | undefined, access: ReturnType<AppRuntime["gateway"]["context"]>): JsonObject {
-  const item = projectItem(value, "evidence");
+  const item = projectItem(value, "verification");
   return typeof item.id === "string" && (item.type === "file" || item.type === "folder")
     ? { ...item, ref: formatItemRef(item.type, item.id, access.context.id, access.identityRef) }
     : item;

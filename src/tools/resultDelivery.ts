@@ -19,13 +19,12 @@ const EXACT_CONTROL_KEYS = new Set([
   "next_action",
   "inventory",
   "inventory_id",
-  "must_release",
   "suggested_wait_ms",
   "empty_result_meaning",
   "empty_result_code",
   "selection_policy",
   "usage_policy",
-  "not_for_evidence",
+  "not_for_verified_download",
   "do_not_echo_url",
   "manifest_uri",
   "receipts_uri_template",
@@ -33,12 +32,12 @@ const EXACT_CONTROL_KEYS = new Set([
   "status",
   "verdict",
   "safe_to_claim_absence",
-  "claim_allowed"
+  "claim_allowed",
+  "agent_hint"
 ]);
 
 /** Decision fields are compacted but kept ahead of ordinary result samples. */
 const PRIORITY_CONTROL_KEYS = new Set([
-  "content_delivery",
   "completeness",
   "agent_guidance",
   "agent_warnings",
@@ -46,7 +45,8 @@ const PRIORITY_CONTROL_KEYS = new Set([
   "content_search_policy",
   "recommended_actions",
   "planning",
-  "lifecycle",
+  "cleanup",
+  "download",
   "preferred_alternatives",
   "coverage",
   "workspace",
@@ -57,16 +57,15 @@ const PRIORITY_CONTROL_KEYS = new Set([
   "recommended_workflows"
 ]);
 
-const RESOURCE_CONTROL_KEYS = new Set([
-  "resource_uri",
-  "delivery",
-  "expires_at",
-  "file_name",
+const DOWNLOAD_CONTROL_KEYS = new Set([
+  "download_id",
+  "local_path",
+  "fetch_url",
   "media_type",
+  "sha256",
+  "sha1",
   "size_bytes",
-  "must_release",
-  "part_count",
-  "part_size_bytes"
+  "expires_at"
 ]);
 
 /** Sample-plane keys that may still hold full-fidelity refs when previewed. */
@@ -75,11 +74,13 @@ const NEVER_TRUNCATE_STRING_KEYS = new Set([
   "cursor",
   "ref",
   "inventory",
-  "resource_uri",
   "manifest_uri",
   "receipts_uri_template",
   "file",
-  "item"
+  "item",
+  "local_path",
+  "download_id",
+  "fetch_url"
 ]);
 
 const SAMPLE_BULK_KEYS = new Set([
@@ -170,16 +171,6 @@ function previewSample(value: unknown, options: PreviewOptions, depth = 0, paren
   ));
 }
 
-function projectResourceControl(value: unknown): Record<string, unknown> | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const resource = value as Record<string, unknown>;
-  const projected: Record<string, unknown> = {};
-  for (const key of RESOURCE_CONTROL_KEYS) {
-    if (resource[key] !== undefined) projected[key] = deepCloneJson(resource[key]);
-  }
-  return Object.keys(projected).length > 0 ? projected : undefined;
-}
-
 export function extractControlPlane(output: Record<string, unknown>, options: PreviewOptions = PREVIEW_OPTIONS[0]!): Record<string, unknown> {
   const control: Record<string, unknown> = {};
   for (const key of EXACT_CONTROL_KEYS) {
@@ -188,15 +179,31 @@ export function extractControlPlane(output: Record<string, unknown>, options: Pr
   for (const key of PRIORITY_CONTROL_KEYS) {
     if (output[key] !== undefined) control[key] = previewSample(output[key], options, 0, key);
   }
-  const resource = projectResourceControl(output.resource);
-  if (resource) control.resource = resource;
+  if (output.download && typeof output.download === "object" && !Array.isArray(output.download)) {
+    const download = output.download as Record<string, unknown>;
+    const projected: Record<string, unknown> = {};
+    for (const key of DOWNLOAD_CONTROL_KEYS) {
+      if (download[key] !== undefined) projected[key] = deepCloneJson(download[key]);
+    }
+    if (Object.keys(projected).length > 0) control.download = projected;
+  }
   return control;
 }
 
 function extractSamplePlane(output: Record<string, unknown>): Record<string, unknown> {
   const sample: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(output)) {
-    if (EXACT_CONTROL_KEYS.has(key) || PRIORITY_CONTROL_KEYS.has(key) || key === "resource") continue;
+    if (EXACT_CONTROL_KEYS.has(key) || PRIORITY_CONTROL_KEYS.has(key) || key === "download") continue;
+    // Never copy full text preview into compact envelopes (body lives in structuredContent).
+    if (key === "preview" && value && typeof value === "object" && !Array.isArray(value)) {
+      const preview = value as Record<string, unknown>;
+      sample[key] = {
+        kind: preview.kind,
+        ...(typeof preview.bytes === "number" ? { bytes: preview.bytes } : {}),
+        text_omitted: true
+      };
+      continue;
+    }
     sample[key] = value;
   }
   return sample;

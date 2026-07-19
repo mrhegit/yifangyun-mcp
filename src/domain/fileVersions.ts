@@ -1,11 +1,11 @@
 import crypto from "node:crypto";
 import { YifangyunError } from "../client.js";
-import type { JsonObject, JsonValue } from "../types.js";
+import type { JsonValue } from "../types.js";
 import { arrayValue, idValue, objectValue } from "./projectors.js";
 
 export interface FileVersion {
   current: boolean;
-  evidence_ready: boolean;
+  download_ready: boolean;
   generation: number;
   modified_at_iso?: string;
   modified_at_unix?: number;
@@ -15,14 +15,12 @@ export interface FileVersion {
   sha1?: string;
   size_bytes?: number;
 }
-
 export type VersionSelector = { kind: "current" } | { kind: "historical"; version_id: string };
-export type EvidenceDownloadStrategy = "current_ordinal" | "historical_reverse_ordinal" | "historical_ordinal" | "historical_version_id";
+export type DownloadStrategy = "current" | "historical_version_id";
 
 export function normalizeFileVersions(value: JsonValue | undefined): { fingerprint: string; versions: FileVersion[] } {
   const source = objectValue(value) ?? {};
-  const preferred = arrayValue(source.file_versions);
-  const rawVersions = preferred.length > 0 ? preferred : arrayValue(source.versions);
+  const rawVersions = arrayValue(source.file_versions);
   const versions = rawVersions.map((entry, index): FileVersion => {
     const item = objectValue(entry);
     if (!item) {
@@ -35,11 +33,13 @@ export function normalizeFileVersions(value: JsonValue | undefined): { fingerpri
     const modifiedAt = typeof item.modified_at === "number" && Number.isSafeInteger(item.modified_at) && item.modified_at >= 0 ? item.modified_at : undefined;
     const size = typeof item.size === "number" && Number.isSafeInteger(item.size) && item.size >= 0 ? item.size : undefined;
     const sha1 = typeof item.sha1 === "string" && /^[a-f\d]{40}$/i.test(item.sha1) ? item.sha1.toLowerCase() : undefined;
+    const current = item.current === true;
+    const providerVersionId = idValue(item.id);
     return {
       generation: index,
-      current: item.current === true,
-      evidence_ready: sha1 !== undefined && size !== undefined,
-      ...(idValue(item.id) ? { provider_version_id: idValue(item.id)! } : {}),
+      current,
+      download_ready: sha1 !== undefined && size !== undefined && (current || providerVersionId !== undefined),
+      ...(providerVersionId ? { provider_version_id: providerVersionId } : {}),
       ...(typeof item.name === "string" ? { name: item.name } : {}),
       ...(sha1 ? { sha1 } : {}),
       ...(size !== undefined ? { size_bytes: size } : {}),
@@ -102,23 +102,13 @@ export function selectFileVersion(versions: FileVersion[], selector: VersionSele
       details: { selected_current: selected.current, selected_generation: selected.generation }
     });
   }
-  if (!selected.evidence_ready) {
-    throw new YifangyunError("The requested file version lacks the SHA-1 or size metadata required for verified capture.", {
+  if (!selected.download_ready) {
+    throw new YifangyunError("The requested file version lacks the SHA-1 or size metadata required for verified download.", {
       code: "YFY_VERSION_METADATA_INCOMPLETE",
       phase: "version_selection",
       agentDetails: { generation: selected.generation, provider_version_id: selected.provider_version_id ?? null },
-      suggestedAction: "Capture only versions that report evidence_ready=true."
+      suggestedAction: "Download only versions that report download_ready=true."
     });
   }
   return selected;
-}
-
-export function versionSelectionProof(version: FileVersion, selector: VersionSelector, downloadStrategy: EvidenceDownloadStrategy): JsonObject {
-  return {
-    kind: selector.kind,
-    generation: version.generation,
-    ...(version.provider_version_id ? { provider_version_id: version.provider_version_id } : {}),
-    download_strategy: downloadStrategy,
-    validation_level: "content_and_metadata"
-  };
 }

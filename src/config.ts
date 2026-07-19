@@ -6,7 +6,7 @@ import type { AccessContext, AppConfig, AuthorityScope, Toolset, WorkflowProfile
 
 const PUBLIC_BASE_URL = "https://open.fangcloud.com";
 const PUBLIC_API_BASE_URL = `${PUBLIC_BASE_URL}/api`;
-const ToolsetSchema = z.enum(["drive", "workspace", "inventory", "evidence", "organization", "collaboration", "mutation", "admin", "transfer"]);
+const ToolsetSchema = z.enum(["drive", "workspace", "inventory", "organization", "collaboration", "mutation", "admin", "transfer"]);
 const WorkflowProfileSchema = z.enum(["tender"]);
 const AccessContextSchema = z.object({
   id: z.string().trim().min(1).regex(/^[a-zA-Z0-9_-]+$/),
@@ -83,11 +83,32 @@ function validateUrl(name: string, value: string): string {
   } catch {
     throw new Error(`${name} must be a valid URL.`);
   }
-  if (parsed.protocol !== "https:" && !["localhost", "127.0.0.1"].includes(parsed.hostname)) {
+  if (parsed.protocol !== "https:" && !isLoopbackHostname(parsed.hostname)) {
     throw new Error(`${name} must use HTTPS unless it points to localhost.`);
   }
   if (parsed.username || parsed.password) {
     throw new Error(`${name} must not contain URL userinfo credentials.`);
+  }
+  return parsed.toString().replace(/\/$/, "");
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
+}
+
+function validateStagedPublicBase(value: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("YFY_DOWNLOAD_STAGED_PUBLIC_BASE_URL must be a valid URL.");
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error("YFY_DOWNLOAD_STAGED_PUBLIC_BASE_URL must use HTTP or HTTPS.");
+  if (parsed.username || parsed.password) throw new Error("YFY_DOWNLOAD_STAGED_PUBLIC_BASE_URL must not contain URL userinfo credentials.");
+  if (parsed.search || parsed.hash) throw new Error("YFY_DOWNLOAD_STAGED_PUBLIC_BASE_URL must not contain a query string or fragment.");
+  if (["0.0.0.0", "::", "[::]"].includes(parsed.hostname)) throw new Error("YFY_DOWNLOAD_STAGED_PUBLIC_BASE_URL must not use a wildcard address.");
+  if (parsed.protocol !== "https:" && !isLoopbackHostname(parsed.hostname)) {
+    throw new Error("YFY_DOWNLOAD_STAGED_PUBLIC_BASE_URL must use HTTPS unless it points to localhost.");
   }
   return parsed.toString().replace(/\/$/, "");
 }
@@ -150,9 +171,12 @@ export function loadConfig(): AppConfig {
   const tempDir = path.resolve(optionalEnv("YFY_TEMP_DIR") ?? path.join(os.tmpdir(), "yifangyun-mcp"));
   const stateDatabasePath = path.resolve(optionalEnv("YFY_STATE_DB") ?? path.join(tempDir, "state.sqlite"));
   const artifactRoot = path.resolve(tempDir, "artifacts");
-  const stateRelativeToArtifacts = path.relative(artifactRoot, stateDatabasePath);
-  if (stateRelativeToArtifacts === "" || (!stateRelativeToArtifacts.startsWith("..") && !path.isAbsolute(stateRelativeToArtifacts))) {
-    throw new Error("YFY_STATE_DB must not be located inside YFY_TEMP_DIR/artifacts.");
+  const downloadRoot = path.resolve(tempDir, "downloads");
+  for (const managedRoot of [artifactRoot, downloadRoot]) {
+    const relative = path.relative(managedRoot, stateDatabasePath);
+    if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+      throw new Error("YFY_STATE_DB must not be located inside YFY_TEMP_DIR/artifacts or YFY_TEMP_DIR/downloads.");
+    }
   }
   const transport = optionalEnv("YFY_TRANSPORT") ?? "stdio";
   if (transport !== "stdio" && transport !== "http") {
@@ -167,11 +191,28 @@ export function loadConfig(): AppConfig {
     throw new Error("YFY_INVENTORY_CONCURRENCY must be between 1 and 8.");
   }
   const maxDownloadBytes = parsePositiveInt("YFY_MAX_DOWNLOAD_BYTES", 268435456);
-  const maxEvidenceResourceBytes = parsePositiveInt("YFY_MAX_EVIDENCE_RESOURCE_BYTES", 16777216);
-  if (maxEvidenceResourceBytes > maxDownloadBytes) {
-    throw new Error("YFY_MAX_EVIDENCE_RESOURCE_BYTES must not exceed YFY_MAX_DOWNLOAD_BYTES.");
-  }
   const logLevel = z.enum(["debug", "info", "warn", "error"]).parse(optionalEnv("YFY_LOG_LEVEL") ?? "info");
+  const downloadExposeLocalPath = parseEnabled("YFY_DOWNLOAD_EXPOSE_LOCAL_PATH", transport === "stdio");
+  const downloadStagedHttpEnabled = parseEnabled("YFY_DOWNLOAD_STAGED_HTTP", transport === "http");
+  const stagedPublicBaseRaw = optionalEnv("YFY_DOWNLOAD_STAGED_PUBLIC_BASE_URL");
+  if (transport === "stdio" && downloadStagedHttpEnabled) throw new Error("YFY_DOWNLOAD_STAGED_HTTP is only supported with YFY_TRANSPORT=http.");
+  if (transport === "stdio" && !downloadExposeLocalPath) throw new Error("stdio download delivery requires YFY_DOWNLOAD_EXPOSE_LOCAL_PATH=enabled.");
+  if (transport === "http" && !downloadExposeLocalPath && !downloadStagedHttpEnabled) throw new Error("HTTP download delivery requires local_path or staged HTTP to be enabled.");
+  if (stagedPublicBaseRaw && (transport !== "http" || !downloadStagedHttpEnabled)) {
+    throw new Error("YFY_DOWNLOAD_STAGED_PUBLIC_BASE_URL requires HTTP transport with staged downloads enabled.");
+  }
+  const httpHost = optionalEnv("YFY_HTTP_HOST") ?? "127.0.0.1";
+  if (transport === "http" && downloadStagedHttpEnabled && !stagedPublicBaseRaw && !isLoopbackHostname(httpHost)) {
+    throw new Error("YFY_DOWNLOAD_STAGED_PUBLIC_BASE_URL is required when HTTP staged downloads bind to a non-loopback address.");
+  }
+  const textPreviewMaxBytes = parsePositiveInt("YFY_TEXT_PREVIEW_MAX_BYTES", 32768);
+  if (textPreviewMaxBytes > 1_048_576) throw new Error("YFY_TEXT_PREVIEW_MAX_BYTES must not exceed 1048576.");
+  const maxConcurrentProviderRequests = parsePositiveInt("YFY_MAX_CONCURRENT_PROVIDER_REQUESTS", 40);
+  const maxConcurrentRequestsPerIdentity = parsePositiveInt("YFY_MAX_CONCURRENT_REQUESTS_PER_IDENTITY", 20);
+  if (maxConcurrentProviderRequests > 40 || maxConcurrentRequestsPerIdentity > 40) throw new Error("Provider request concurrency must not exceed 40.");
+  if (maxConcurrentRequestsPerIdentity > maxConcurrentProviderRequests) throw new Error("YFY_MAX_CONCURRENT_REQUESTS_PER_IDENTITY must not exceed YFY_MAX_CONCURRENT_PROVIDER_REQUESTS.");
+  const downloadStagedMaxConcurrentReads = parsePositiveInt("YFY_DOWNLOAD_STAGED_MAX_CONCURRENT_READS", 20);
+  if (downloadStagedMaxConcurrentReads > 40) throw new Error("YFY_DOWNLOAD_STAGED_MAX_CONCURRENT_READS must not exceed 40.");
 
   const workflowProfiles = (parseCsv("YFY_WORKFLOW_PROFILES") ?? []).map((value) => WorkflowProfileSchema.parse(value)) as WorkflowProfile[];
   const config: AppConfig = {
@@ -191,14 +232,13 @@ export function loadConfig(): AppConfig {
     httpAllowedHosts: parseCsv("YFY_HTTP_ALLOWED_HOSTS"),
     httpAllowedOrigins: parseCsv("YFY_HTTP_ALLOWED_ORIGINS"),
     httpBearerToken: optionalEnv("YFY_HTTP_BEARER_TOKEN"),
-    httpHost: optionalEnv("YFY_HTTP_HOST") ?? "127.0.0.1",
+    httpHost,
     httpMaxSessions: parsePositiveInt("YFY_HTTP_MAX_SESSIONS", 100),
     httpPort: parsePositiveInt("YFY_HTTP_PORT", 3000),
     httpSessionIdleSeconds: parsePositiveInt("YFY_HTTP_SESSION_IDLE_SECONDS", 1800),
-    maxConcurrentProviderRequests: parsePositiveInt("YFY_MAX_CONCURRENT_PROVIDER_REQUESTS", 4),
-    maxConcurrentRequestsPerIdentity: parsePositiveInt("YFY_MAX_CONCURRENT_REQUESTS_PER_IDENTITY", 2),
+    maxConcurrentProviderRequests,
+    maxConcurrentRequestsPerIdentity,
     maxDownloadBytes,
-    maxEvidenceResourceBytes,
     maxPageCapacity: parsePositiveInt("YFY_MAX_PAGE_CAPACITY", 500),
     maxRetryDelayMs: parsePositiveInt("YFY_MAX_RETRY_DELAY_MS", 30000),
     maxStateBytes: parsePositiveInt("YFY_MAX_STATE_BYTES", 2147483648),
@@ -211,6 +251,14 @@ export function loadConfig(): AppConfig {
     stateDatabasePath,
     tempDir,
     tempFileTtlSeconds: parsePositiveInt("YFY_TEMP_FILE_TTL_SECONDS", 86400),
+    textPreviewMaxBytes,
+    downloadExposeLocalPath,
+    downloadStagedHttpEnabled,
+    downloadStagedMaxConcurrentReads,
+    downloadStagedMaxFetches: parsePositiveInt("YFY_DOWNLOAD_STAGED_MAX_FETCHES", 10),
+    ...(stagedPublicBaseRaw
+      ? { downloadStagedPublicBaseUrl: validateStagedPublicBase(stagedPublicBaseRaw) }
+      : {}),
     tokenRefreshSkewSeconds: parsePositiveInt("YFY_TOKEN_REFRESH_SKEW_SECONDS", 300),
     toolsets: [...new Set(toolsets)],
     transport,
@@ -221,10 +269,6 @@ export function loadConfig(): AppConfig {
   return config;
 }
 
-export function hasToolset(config: AppConfig, toolset: Toolset): boolean {
-  return config.toolsets.includes(toolset);
-}
-
 export function getConfigSummary(config: AppConfig): Record<string, string | number | boolean | string[]> {
   return {
     configuration_source: "process_environment",
@@ -233,12 +277,19 @@ export function getConfigSummary(config: AppConfig): Record<string, string | num
     workspaces: config.authorityScopes.map((scope) => scope.id),
     default_access_context: config.defaultAccessContext,
     max_download_bytes: config.maxDownloadBytes,
-    max_evidence_resource_bytes: config.maxEvidenceResourceBytes ?? 16777216,
+    download_local_path_enabled: config.downloadExposeLocalPath ?? false,
+    download_staged_http_enabled: config.downloadStagedHttpEnabled ?? false,
+    download_staged_max_concurrent_reads: config.downloadStagedMaxConcurrentReads ?? 20,
+    download_staged_max_fetches: config.downloadStagedMaxFetches ?? 10,
+    download_staged_public_base_configured: Boolean(config.downloadStagedPublicBaseUrl),
+    download_ttl_seconds: config.tempFileTtlSeconds,
     max_page_capacity: config.maxPageCapacity,
     max_state_bytes: config.maxStateBytes ?? 2147483648,
+    max_temp_bytes: config.maxTempBytes ?? 1073741824,
     oauth_base_url: config.oauthBaseUrl,
     inventory_ttl_seconds: config.snapshotTtlSeconds ?? 604800,
     inventory_concurrency: config.snapshotConcurrency ?? 2,
+    text_preview_max_bytes: config.textPreviewMaxBytes ?? 32768,
     toolsets: config.toolsets,
     transport: config.transport ?? "stdio",
     workflow_profiles: config.workflowProfiles

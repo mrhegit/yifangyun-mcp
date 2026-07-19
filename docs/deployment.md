@@ -1,119 +1,161 @@
-﻿# 部署指南
+# 部署指南
 
-## 要求
-
-- Node.js `>=24`
-- 可写的 SQLite 和临时文件目录
-- 亿方云 OAuth Client 凭据
-- 至少一个可用 user ID
-
-## 本地 stdio
+## 安装
 
 ```bash
-npm ci
-npm run build
-node --env-file=.env dist/index.js
+npm install -g yifangyun-mcp-server@1.1.0-beta.1
 ```
 
-`npm start` 不会自动加载 `.env`，只继承调用进程已有的环境变量。生产部署应由 MCP 客户端、容器或进程管理器注入配置。全部变量和模式选择见 [配置指南](configuration.md)。
-
-MCP 客户端配置示例：
+或由 Host 固定版本运行：
 
 ```json
 {
-  "mcpServers": {
-    "yifangyun": {
-      "command": "npx",
-      "args": ["-y", "yifangyun-mcp-server@1.0.0"],
-      "env": {
-        "YFY_CLIENT_ID": "...",
-        "YFY_CLIENT_SECRET": "...",
-        "YFY_ENTERPRISE_ID": "115",
-        "YFY_DEFAULT_USER_ID": "530",
-        "YFY_TOOLSETS": "drive",
-        "YFY_WORKFLOW_PROFILES": "",
-        "YFY_WORKSPACES_JSON": "[]"
-      }
-    }
+  "command": "npx",
+  "args": ["-y", "yifangyun-mcp-server@1.1.0-beta.1"],
+  "env": {
+    "YFY_CLIENT_ID": "...",
+    "YFY_CLIENT_SECRET": "...",
+    "YFY_ENTERPRISE_ID": "115",
+    "YFY_DEFAULT_USER_ID": "530",
+    "YFY_TOOLSETS": "drive",
+    "YFY_TRANSPORT": "stdio"
   }
 }
 ```
 
-此示例是普通 Drive 模式。要使用 Workspace、Inventory 或 Capture，需要增加对应 toolset 和 `YFY_WORKSPACES_JSON`；Tender Prompt 还要求 `YFY_WORKFLOW_PROFILES=tender`。
+---
 
-`yfy_status.runtime.configuration_source=process_environment` 表示当前进程环境是唯一生效配置。项目目录中的 `.env` 只有在启动命令或 MCP Host 显式加载时才有效；排查 capability 漂移时以 `yfy_status` 为准。
+## stdio（同机）
 
-## HTTP
+适合 Desktop / CLI Agent，Host 与 Server 同机：
+
+```env
+YFY_TRANSPORT=stdio
+YFY_DOWNLOAD_EXPOSE_LOCAL_PATH=enabled
+YFY_DOWNLOAD_STAGED_HTTP=disabled
+```
+
+Host 必须能访问 Server 返回的绝对路径。
+容器化 stdio 时，Host 与 Server 需共享同一文件系统命名空间或 volume。
+
+---
+
+## 远程 HTTP
+
+推荐架构：
+
+```text
+Remote MCP Host
+  -> HTTPS reverse proxy
+  -> yifangyun-mcp-server 127.0.0.1:3000
+  -> Yifangyun OpenAPI
+```
+
+Server 配置示例：
 
 ```env
 YFY_TRANSPORT=http
 YFY_HTTP_HOST=127.0.0.1
 YFY_HTTP_PORT=3000
-YFY_HTTP_BEARER_TOKEN=long-random-token
-```
-
-反向代理或非回环监听必须配置：
-
-```env
+YFY_HTTP_BEARER_TOKEN=replace-with-a-long-random-token
 YFY_HTTP_ALLOWED_HOSTS=mcp.example.com
 YFY_HTTP_ALLOWED_ORIGINS=https://agent.example.com
+YFY_DOWNLOAD_EXPOSE_LOCAL_PATH=disabled
+YFY_DOWNLOAD_STAGED_HTTP=enabled
+YFY_DOWNLOAD_STAGED_PUBLIC_BASE_URL=https://mcp.example.com
 ```
 
-建议反向代理限制请求体大小、连接数和请求速率。
+反向代理须转发：
 
-## 持久化
+```text
+POST/GET/DELETE /mcp
+GET /staged/v1/*
+GET /health
+GET /metrics
+```
 
-设置固定路径：
+注意：
+
+- **不要**重写 `Authorization`
+- staged GET 与 MCP 使用相同 Bearer
+- 代理超时应大于最大预期文件传输时间
+- 若 public base 含前缀（如 `https://example.com/yfy-mcp`），须把 `/yfy-mcp/staged/v1/*` 映射到 Server 的 `/staged/v1/*`
+
+---
+
+## 临时目录与状态库
+
+生产环境建议显式设置：
 
 ```env
-YFY_STATE_DB=/var/lib/yifangyun-mcp/state.sqlite
 YFY_TEMP_DIR=/var/lib/yifangyun-mcp/temp
-YFY_INVENTORY_CONCURRENCY=2
+YFY_STATE_DB=/var/lib/yifangyun-mcp/state/state.sqlite
+YFY_MAX_TEMP_BYTES=1073741824
+YFY_TEMP_FILE_TTL_SECONDS=86400
 ```
 
-备份 SQLite 时同时考虑 WAL 文件，推荐使用 SQLite backup API 或在服务停止后复制。
-同一个 `YFY_STATE_DB` 只允许一个 MCP 进程打开；需要水平扩展时必须使用独立数据库 adapter，不能让多个实例共享该 SQLite 文件。
-不要把 `YFY_STATE_DB` 放在 `YFY_TEMP_DIR/artifacts` 下，该目录属于 Evidence TTL 和配额清理范围。
+要求：
 
-`1.0.0` 重新建立内部状态和签名格式。`0.4.0` 的 `YFY_SCAN_DIR` 文件状态、cursor 和 Ref 均不兼容；升级时先停止旧进程，为 `YFY_STATE_DB` 配置新的空文件，并刷新 MCP Host 的工具目录。Tender 矩阵为 `drive,workspace,inventory,evidence`，**不要**默认加入 `transfer`。完整步骤见 `docs/migration-v1.md`。
+| 要求 | 说明 |
+|---|---|
+| 目录归属 | 运行用户独占 `YFY_TEMP_DIR/artifacts` 与 `downloads` |
+| 状态库位置 | `YFY_STATE_DB` 不在上述两个目录内 |
+| 文件系统 | 支持原子 rename |
+| 监控 | 磁盘、inode、删除失败日志 |
+| 多实例 | **不要**让多个实例共享同一 `YFY_TEMP_DIR` 或同一 SQLite |
 
-大型目录可逐步提高 `YFY_INVENTORY_CONCURRENCY`。默认 2 路适合多数租户；提高到 4-8 前应观察 429、Provider 延迟和前台 Drive/Capture 请求等待时间。
+正常关闭会释放当前下载；异常退出由下次启动根据 manifest 恢复或清理。
 
-## 权限
+### Inventory SQLite
 
-运行用户只需要：
+- 放在持久 volume
+- 备份使用 SQLite backup API，或停服后同时处理数据库与 WAL
+- 同一数据库只允许一个进程打开；水平扩展需独立状态后端，**不能**多实例直接共享该文件
+- SQLite 由专用 Worker 线程持有；Worker 异常退出会使 Inventory RPC 立即失败——应视为实例故障并重启
 
-- 读取配置和凭据
-- 读写 SQLite 目录
-- 读写 temp 目录
-- 访问配置的 Provider HTTPS 地址
+---
 
-不要使用管理员 OS 账户运行。
+## 容器建议
 
-## 健康与指标
+- 非 root 用户
+- 只读根文件系统
+- temp / state 使用独立可写 volume
+- 明确 memory、CPU、磁盘与进程限制
+- Client Secret 不写入镜像
+- 健康检查：`GET /health`
 
-- `/health`：进程和版本
-- `/metrics`：进程内计数和延迟聚合
+HTTP staged 文件由 Node.js 流式输出，无需把整个文件载入容器内存。
 
-生产环境应采集结构化 stderr 日志，并对 Provider 失败、inventory incomplete 和 capture drift 设置告警。
+---
 
-## 发布包验证
+## 监控
+
+至少关注：
+
+| 信号 | 说明 |
+|---|---|
+| Provider 401 / 403 / 429 / 5xx | 上游鉴权与可用性 |
+| `YFY_LOCAL_STORAGE_INSUFFICIENT` | 临时盘配额不足 |
+| `YFY_DOWNLOAD_CLEANUP_FAILED` | 删除失败（占用/权限） |
+| `YFY_DOWNLOAD_INTEGRITY_FAILED` | 完整性校验失败 |
+| staged 404 / 410、流中断 | 取文件链路问题 |
+| Inventory partial / failed | 清单不完整 |
+| Inventory Worker exit / error | 进程内 SQLite Worker 故障 |
+| SQLite / WAL 体积 | 状态库膨胀 |
+| `YFY_TEMP_DIR` 已用空间 | 磁盘压力 |
+
+`yfy_status.temp_storage` 便于 Agent 侧排障；系统级磁盘指标仍应由宿主监控采集。
+
+---
+
+## 发布验证
 
 ```bash
-npm run check
+npm ci
+npm run build
+npm test
+npm run test:perf
 npm pack --dry-run
 ```
 
-生产包只包含 `dist`、README、LICENSE、docs 和 `.env.example`；内部 evaluations 不进入 npm 包。
-
-## 发布流程
-
-仓库的 `.github/workflows/publish.yml` 只在推送 `v*` tag 时运行。发布前要求工作区干净，并确保 tag 去掉前缀 `v` 后与 `package.json.version` 完全一致：
-
-```bash
-git tag -a v1.0.0 -m "发布 1.0.0"
-git push origin HEAD
-git push origin v1.0.0
-```
-
-Action 会依次执行 `npm ci`、build、单元/集成测试、Inventory 性能测试和 `npm pack --dry-run`。预发布版本以 npm dist-tag `next` 发布，并创建 GitHub prerelease；正式版本使用 `latest`。npm publish 使用仓库配置的 granular `NPM_TOKEN`，并通过 GitHub OIDC 生成 provenance；本地不直接运行 `npm publish`。
+发布前还应实际启动一次 HTTP transport，并对 staged 文件做真实 GET，不能只验证 URL 字符串是否生成。

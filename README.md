@@ -1,131 +1,88 @@
 # yifangyun-mcp-server
 
-亿方云 OpenAPI 的通用 MCP Server。默认提供轻量 Drive 平面；需要范围证明、完整性判断或原件固化时，可启用 Workspace、Inventory 和 Evidence 平面。
+亿方云 OpenAPI 的 MCP Server。当前版本 `1.1.0-beta.1`。
 
-当前稳定版本：`1.0.0`。当前契约包含稳定 MAC Inventory Ref、严格首次页/续页输入、可执行分页诊断、结构化结果校验和证据释放流程。`0.4.0` 的破坏性迁移见 `docs/migration-v1.md`。
+默认能力：网盘浏览、检索、元数据读取、受控下载。可选启用 **Workspace**（业务范围约束）和 **Inventory**（完整目录清单与缺失审计）。
 
-## 能力边界
+## 能力边界（必读）
 
-- **支持**：浏览/搜索/路径解析、元数据、下载与哈希校验（`yfy_open` / `yfy_capture`）、Workspace 范围与 Inventory 完备性、小文本 UTF-8 内嵌预览。
-- **当前服务不提供**：PDF/Office 正文解析或 OCR。Provider 的知识库训练与召回属于独立授权和状态工作流，不在当前工具集内。`binary_no_preview` / `agent_readable=false` 表示模型未获得正文，不是故障。
-- **搜索不证明缺失**；缺失结论仅当 Inventory 终态且 `may_claim_absence=true`。
-- **`transfer` 不进 Tender 默认矩阵**；仅特殊集成显式启用，不可当证据或普通读路径。
+| 要点 | 说明 |
+|---|---|
+| `yfy_download` 做什么 | 下载、版本校验、哈希、临时落盘，并返回交付句柄 |
+| 文件怎么拿到 | **stdio**：返回本机绝对路径 `local_path`；**HTTP**：返回需认证的 `fetch_url` |
+| 本服务不做什么 | 不解析 PDF/DOCX/XLSX/PPTX，不做 OCR；正文解析由 Host 端工具完成 |
+| 下载成功意味着什么 | 字节已就绪，**不**表示模型已读过文件正文 |
+| 搜索能否证明不存在 | **不能**。Provider 搜索是索引候选，非穷尽；“不存在”只能依据完整 Inventory 的终态结论 |
 
-## Interface
-
-默认 `drive` toolset：
+## 核心工具
 
 | 工具 | 用途 |
 |---|---|
-| `yfy_status` | 验证身份并列出可复制 PlaceRef |
+| `yfy_status` | 查看身份、配置、下载交付方式、可用工作流 |
 | `yfy_browse` | 浏览个人盘、协作空间、部门、文件夹或 Workspace |
-| `yfy_search` | Provider 索引候选发现；`claim_allowed=true` 只证明返回元数据支持查询匹配，当前存在性仍须 `yfy_get` 确认，永不证明不存在 |
-| `yfy_resolve` | 按精确相对路径逐层解析 |
-| `yfy_get` | 读取单个文件或文件夹元数据 |
-| `yfy_get_many` | 批量读取最多 100 个 ItemRef |
-| `yfy_versions` | 返回绑定文件身份的历史 VersionRef |
-| `yfy_open` | 读取当前或历史内容，不要求 Workspace |
-| `yfy_comments` | 分页读取文件评论 |
-| `yfy_shares` | 分页读取脱敏分享元数据 |
+| `yfy_search` | 非穷尽候选搜索；需消歧，并用 `yfy_get` 确认当前是否存在 |
+| `yfy_resolve` | 按精确相对路径解析；遇同名返回候选，不自动猜测 |
+| `yfy_get` / `yfy_get_many` | 获取当前元数据 |
+| `yfy_versions` | 列出当前版与可复制的历史 `VersionRef` |
+| `yfy_download` | 下载当前版或历史版；返回 path/URL、哈希、大小、TTL |
+| `yfy_download_release` | 可选：提前释放临时下载（幂等） |
+| `yfy_workspace_validate` | 校验已配置的命名 Workspace |
+| `yfy_membership_check` | 判断文件是否在 Workspace 内 / 外 / 证据不足 |
+| `yfy_inventory_*` | 创建、查询、取消、释放目录清单（见下方「术语」） |
 
-高级平面：
+按需 toolset：`organization`、`collaboration`、`mutation`、`admin`、`transfer`。
+**写操作**与 **Provider transfer URL** 默认均不注册。
 
-| Toolset | 工具 |
+### 术语速查（文档中常见难词）
+
+| 说法 | 实际含义 |
 |---|---|
-| `workspace` | `yfy_workspace_validate`、`yfy_membership_check` |
-| `inventory` | `yfy_inventory_create`、`yfy_inventory_get`、`yfy_inventory_search`、`yfy_inventory_cancel`、`yfy_inventory_release` |
-| `evidence` | `yfy_capture` |
-| `organization` | 明确的 department、user、group 工具，不使用 action union |
+| Workspace | 配置里划定的业务目录边界（根文件夹 + 访问身份）；**不**额外授予云盘权限 |
+| membership | 文件是否仍落在该 Workspace 根目录子树内 |
+| staged 下载 | HTTP 模式下，文件先落盘，再通过 `/staged/v1/...` 受认证 GET 取回 |
+| 临时配额 / 预留（reservation） | 下载前先占住临时空间额度，成功后按实际大小计入；不足则拒绝新下载 |
+| Inventory | 对 Workspace（或子树）做递归只读扫描，结果落本地 SQLite |
+| commit_watermark（水位） | 已成功写入本地库的扫描进度标记；查询/分页绑定该值，避免读到未提交数据 |
+| frontier | 尚未扫完的文件夹/分页任务队列 |
+| `safe_to_claim_absence` | 清单已完整终态时，才允许在扫描范围内声明“某类文件不存在” |
 
-`yfy_resource_release` 是 Drive/Evidence 共享的 Resource 生命周期工具：启用任一平面时都会注册。
+## 推荐下载流程
 
-## 引用与分页
+**已知精确路径：**
 
-位置使用可复制字符串：
+1. `yfy_resolve({ path, from })`
+2. `yfy_get({ ref })`
+3. `yfy_download({ file })`
+4. Host 打开 `download.local_path`，或带认证 GET `download.fetch_url`
+5. （可选）`yfy_download_release({ download_id })`
+
+**限制在 Workspace 内下载：**
+
+1. `yfy_workspace_validate({ workspace })`
+2. 在同一 Workspace 内 resolve / browse 得到目标文件
+3. `yfy_download({ workspace, file, version?, expected? })`
+
+传入 `workspace` 后，服务会在下载**前、后**各做一次 membership 校验。结果为 `outside` 或 `unavailable` 时**不会**返回可用文件。
+
+**历史版本：** 必须原样复制 `yfy_versions` 返回的 `VersionRef`。当前版请省略 `version`，不要自行构造“当前版”引用。
+
+## stdio 与 HTTP
+
+| 模式 | 默认交付 | 适用场景 |
+|---|---|---|
+| `stdio` | `download.local_path` | MCP Host 与 Server **同机** |
+| `http` | `download.fetch_url` | 远程 Host；通过受认证 staged GET 取文件 |
+
+- stdio **不**启动 HTTP staged 服务，因此必须 `YFY_DOWNLOAD_EXPOSE_LOCAL_PATH=enabled`。
+- HTTP 可同时开启 path 与 staged URL；远程部署通常只开放 `fetch_url`。
+
+staged 路由：
 
 ```text
-personal
-collaboration
-department:480
-folder:501000715605@default.aaaaaaaaaaaaaaaaaaaaaaaa
-workspace:tender_public
+GET /staged/v1/{download_id}/{optional_file_name}
 ```
 
-文件和版本引用：
-
-```text
-file:501@default.aaaaaaaaaaaaaaaaaaaaaaaa
-folder:502@default.aaaaaaaaaaaaaaaaaaaaaaaa
-version:7001@ZmlsZTo1MDFAZGVmYXVsdC5hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh
-```
-
-ItemRef 绑定 `access_context` 和身份指纹。不要构造或修改 Ref；Context 配置变化后应重新发现项目。
-
-Inventory Ref（1.0.0+）为稳定可复制形式：
-
-```text
-inventory:123e4567-e89b-12d3-a456-426614174000@default.a1b2c3d4e5f6789012345678
-```
-
-同一 inventory 在 create/get/search 间字符串不变；`inventory_id` 不能单独作为工具输入。Client secret 或 Workspace 绑定变化后须重建 Inventory。
-
-分页输入使用扁平字段：首次调用直接传业务参数（如 `at`/`query`/`limit`），续页只执行返回的 `next_action`（参数为 `cursor`，inventory 等固定字段除外）。Provider 页码、页内 offset 和签名细节由服务端隐藏。
-
-Drive 列表默认每页 10 条，Inventory 列表默认每页 25 条。`yfy_browse` 和 `yfy_search` 默认 `detail=basic`；需要 owner、space 等字段时显式请求 `standard` 或 `full`。
-
-Provider 返回的路径明确投影为 `provider_path_chain` 和 `path_basis=provider_supplied`。Workspace 结果另返回基于配置根目录的相对祖先链，调用方不得比较不同 Provider endpoint 的原始路径数组来判断项目身份。
-
-## 两个内容工具
-
-- `yfy_open`：普通网盘内容读取，可读取当前版或 `yfy_versions` 返回的历史 VersionRef。
-- `yfy_capture`：要求命名 Workspace，下载前后校验成员关系、版本历史和文件元数据，并返回三态 assurance 检查。
-
-`expected` 是断言。任一字段不匹配时，`yfy_capture` 返回 `YFY_EXPECTATION_MISMATCH`，删除临时内容，不返回可用 Resource。
-
-成功结果始终含 `must_release: true` 与 `content_delivery`：不超过 32 KiB 的已验证 UTF-8 文本可作为标准 MCP embedded resource 同时进入工具 `content`，并在 `structuredContent.resource.preview_text` 中保留；否则为 `resource_link_only` / `multipart_manifest_only` / `binary_no_preview`。可用 `include_text_preview=false` 禁止内嵌。服务只声明协议结果中是否已嵌入，不声称 Host 一定把内容送进模型。
-
-文本 Resource 经大小和 SHA-256 复核后返回 MCP `text`，二进制返回 `blob`。大文件返回 multipart manifest，调用方按 manifest 中的 part URI 分段读取；任何结果都不暴露服务器 `local_path`。embedded resource 和 resource link 均符合 MCP 工具结果内容类型，resource link 不代表客户端会自动读取。
-
-## Inventory Refresh
-
-`yfy_inventory_create`：
-
-```json
-{
-  "workspace": "workspace:tender_public",
-  "root_folder": "folder:502@default…",
-  "refresh": {"mode": "reuse_if_fresh", "max_age_seconds": 300},
-  "limits": {"max_item_depth": 8, "max_items": 10000}
-}
-```
-
-- `root_folder` 可选：将扫描限制在 Workspace 内已验证子树（大库推荐）。
-- `reuse_if_fresh`：只复用未超过调用方新鲜度要求的完整 Inventory，或加入仍在运行的等价 Inventory。
-- `force_refresh`：始终创建新 Inventory。
-- `partial`、`cancelled`、`failed` 永不自动复用。
-- 对终态调用 `yfy_inventory_cancel` 是真正 no-op，不改变状态、revision 或时间戳。
-
-只有终态结果中 `safe_to_claim_absence=true`（`agent_guidance.may_claim_absence=true`）时，才能在持久化的 **Workspace 根 + scan root + 身份 + 观察窗口** 内声明未找到。Workspace 根配置变化后旧 InventoryRef 返回 `YFY_INVENTORY_STALE`；运行中请遵循 `suggested_wait_ms`。
-
-Inventory 不再提供隐藏上限默认值。每次创建都必须显式传 `limits.max_item_depth` 和 `limits.max_items`，因为它们直接决定是否可以证明不存在。查询 cursor 固定首次查询时的 `commit_watermark`，后台继续扫描不会使续页失效；新查询才会看到后续提交。完成后可调用 `yfy_inventory_release` 立即回收本地状态。
-
-## Toolsets
-
-默认配置只启用 Drive：
-
-```env
-YFY_TOOLSETS=drive
-```
-
-投标完整工作流（**矩阵固定为 `drive,workspace,inventory,evidence`；`transfer` 永不默认**）：
-
-```env
-YFY_TOOLSETS=drive,workspace,inventory,evidence
-YFY_WORKFLOW_PROFILES=tender
-YFY_WORKSPACES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_context":"default","tags":["tender"]}]
-```
-
-其他可选 toolset：`organization`、`collaboration`、`mutation`、`admin`、`transfer`。云端写工具与 transfer 均不会默认注册。
+与 `/mcp` 共用 Bearer、Host、Origin 防护。URL 过期、显式 release、完整性校验失败，或抓取次数用尽后均不可用。
 
 ## 最小配置
 
@@ -135,60 +92,78 @@ YFY_CLIENT_SECRET=your-client-secret
 YFY_ENTERPRISE_ID=115
 YFY_DEFAULT_USER_ID=530
 YFY_TOOLSETS=drive
-YFY_ACCESS_CONTEXTS_JSON=[]
-YFY_WORKSPACES_JSON=[]
-YFY_WORKFLOW_PROFILES=
+YFY_TRANSPORT=stdio
 ```
 
-Workspace 只收窄已有 Provider 权限，不授予新权限。普通 Drive 工具不自动受 Workspace 限制；需要范围保证时使用 Workspace/Inventory/Capture 工具。
+招投标（Tender）工作流：
 
-## 典型流程
+```env
+YFY_TOOLSETS=drive,workspace,inventory
+YFY_WORKFLOW_PROFILES=tender
+YFY_WORKSPACES_JSON=[{"id":"tender_public","root_folder_id":"501000715605","access_context":"default","tags":["tender"]}]
+```
 
-精确查找并读取：
+远程 HTTP 示例：
 
-1. `yfy_resolve({path,from})`；未知路径时 `yfy_search` 只作候选，**仅 `claim_allowed=true` 可声称匹配**
-2. `yfy_open({file,include_text_preview?})`；检查 `content_delivery`（是否已有 embedded resource，或仍需 `resources/read`）
-3. 处理完后调用 `yfy_resource_release`（`must_release=true`）
+```env
+YFY_TRANSPORT=http
+YFY_HTTP_HOST=0.0.0.0
+YFY_HTTP_PORT=3000
+YFY_HTTP_BEARER_TOKEN=replace-with-a-long-random-token
+YFY_HTTP_ALLOWED_HOSTS=mcp.example.com
+YFY_HTTP_ALLOWED_ORIGINS=https://agent.example.com
+YFY_DOWNLOAD_EXPOSE_LOCAL_PATH=disabled
+YFY_DOWNLOAD_STAGED_HTTP=enabled
+YFY_DOWNLOAD_STAGED_MAX_CONCURRENT_READS=20
+YFY_DOWNLOAD_STAGED_PUBLIC_BASE_URL=https://mcp.example.com
+```
 
-完整性审计：
+非回环监听，或 staged 对外 base URL 指向远程主机时：必须配置 Bearer、允许的 Host 与 Origin。
+staged 响应从受保护本地文件句柄**单遍流式**输出；默认并发读 20，硬上限 40。生产建议由反向代理终止 TLS。
 
-1. `yfy_workspace_validate`
-2. `yfy_inventory_create({workspace,refresh,limits,root_folder?})`（大库优先子树）
-3. 遵循 `suggested_wait_ms`，跟随 `next_action` 直到 `terminal=true`
-4. 对每个材料类别调用 `yfy_inventory_search`
-5. 仅在 `safe_to_claim_absence=true` / `agent_guidance.may_claim_absence=true` 时声明缺失
+Provider 请求默认：同一访问身份并发 `20`，全局并发 `40`。预签名文件下载按身份单独限流，避免单身份占满全局容量。
 
-原件固化：
+Inventory 的 SQLite 在**专用 Worker 线程**中运行。Worker 异常退出后，新的 Inventory 请求会立即失败；服务关闭不会等待已失效的 RPC。
 
-1. `yfy_resolve` 或经 `claim_allowed` 确认后的 `yfy_search`；必要时 `yfy_membership_check` 读 `agent_interpretation`
-2. 需要历史版时先调用 `yfy_versions`（当前版 `ref=null`，省略 version 参数）
-3. `yfy_capture({workspace,file,version?,expected?,include_text_preview?})`
-4. 记录 file/version ref、Workspace proof、SHA-256、size、`content_delivery`、观察时间和 Resource URI
-5. `yfy_resource_release`
+## 临时存储
+
+下载中与已登记下载共用 `YFY_MAX_TEMP_BYTES`。服务**不会**为腾出空间而删除尚未过期的旧下载；空间不足返回 `YFY_LOCAL_STORAGE_INSUFFICIENT`。
+
+`YFY_TEMP_DIR` 下由服务独占管理：
+
+| 目录 | 作用 |
+|---|---|
+| `artifacts/` | Provider 流先写入的候选文件 |
+| `downloads/{identity}/{download_id}/` | 校验通过后移入；含 manifest，支持崩溃恢复与 TTL 清理 |
+
+启动时：先清理已过期或无效的 download，再对仍有效文件做配额校验。
+`release` 仅在物理删除成功后才成功并扣减配额；删除失败会返回错误，不会假成功。
+
+**不要**把 `YFY_STATE_DB` 或其他业务文件放进 `artifacts/`、`downloads/`。
 
 ## 运行与验证
 
 ```bash
 npm ci
 npm run build
-node --env-file=.env dist/index.js
-```
-
-要求 Node.js `>=24`。HTTP 端点为 `POST /mcp`、`GET /health`、`GET /metrics`。
-
-```bash
-npm run build
 npm test
 npm run test:perf
-npm run check
 npm pack --dry-run
 ```
 
-## 文档
+启动（需 Node.js `>=24`）：
 
-- [配置指南](docs/configuration.md)
-- [工具参考](docs/tools.md)
-- [架构与安全](docs/architecture-security.md)
-- [部署](docs/deployment.md)
-- [OpenAPI 覆盖](docs/openapi-coverage.md)
-- [迁移说明](docs/migration-v1.md)
+```bash
+node --env-file=.env dist/index.js
+```
+
+## 文档索引
+
+| 文档 | 内容 |
+|---|---|
+| [配置指南](docs/configuration.md) | 环境变量、toolset、传输与下载交付 |
+| [工具参考](docs/tools.md) | 各工具契约、参数与错误 |
+| [架构与安全](docs/architecture-security.md) | 模块边界、下载与 staged 完整性 |
+| [部署指南](docs/deployment.md) | stdio/HTTP、反向代理、容器与监控 |
+| [OpenAPI 覆盖](docs/openapi-coverage.md) | Provider 能力与工具映射 |
+| [测试指南](docs/testing.md) | 单元 / 性能 / Live 测试 |

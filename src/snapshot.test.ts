@@ -9,6 +9,7 @@ import { AccessRegistry } from "./runtime/access.js";
 import { ScopeScanEngine } from "./scan/engine.js";
 import { SnapshotService } from "./scan/service.js";
 import { SqliteScopeScanStore } from "./scan/store.js";
+import { WorkerScopeScanStore } from "./scan/workerStore.js";
 import type { ScopeScanPage, ScopeScanPolicy, ScopeScanProvider } from "./scan/types.js";
 import type { ApiResponseMeta, AppConfig } from "./types.js";
 import { SNAPSHOT_SCHEMA_VERSION } from "./version.js";
@@ -187,7 +188,7 @@ test("max_item_depth never stores deeper items and keeps absence claims disabled
 });
 
 test("concurrent equivalent snapshot creation reuses one operation", async () => {
-  const store = new SqliteScopeScanStore(":memory:", 3600, 10_000_000);
+  const store = await WorkerScopeScanStore.create(":memory:", 3600, 10_000_000);
   const appConfig = config(":memory:");
   const service = new SnapshotService(new ScopeScanEngine(store, provider()), store, new AccessRegistry(appConfig));
   await service.initialize();
@@ -199,6 +200,30 @@ test("concurrent equivalent snapshot creation reuses one operation", async () =>
     await service.waitForIdle(left.state.scanId);
   } finally {
     await service.close();
+  }
+});
+
+test("Worker-backed snapshot service closes while a scan is active", async () => {
+  const store = await WorkerScopeScanStore.create(":memory:", 3600, 10_000_000);
+  const slowProvider: ScopeScanProvider = {
+    getRoot: async () => ({ folder: { id: "1", name: "Root", type: "folder" }, meta: meta("/root") }),
+    listChildren: async (_folderId, _userId, _pageId, _pageCapacity, signal) => new Promise<ScopeScanPage>((_resolve, reject) => {
+      const cancelled = () => reject(new YifangyunError("cancelled", { code: "YFY_REQUEST_CANCELLED", phase: "provider_request" }));
+      if (signal?.aborted) cancelled();
+      else signal?.addEventListener("abort", cancelled, { once: true });
+    })
+  };
+  const service = new SnapshotService(new ScopeScanEngine(store, slowProvider), store, new AccessRegistry(config(":memory:")));
+  await service.initialize();
+  await service.create({ accessContextId: "default", includeFiles: true, includeFolders: true, maxItemDepth: 1, maxItems: 100, pageCapacity: 10, rootFolderId: "1" });
+  let closeTimer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      service.close(),
+      new Promise<never>((_, reject) => { closeTimer = setTimeout(() => reject(new Error("snapshot close timed out")), 1000); })
+    ]);
+  } finally {
+    if (closeTimer) clearTimeout(closeTimer);
   }
 });
 
@@ -768,7 +793,7 @@ test("SQLite snapshot handles 50000 synthetic files", { skip: process.env.YFY_RU
   };
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-snapshot-perf-"));
   const databasePath = path.join(dir, "state.sqlite");
-  const store = new SqliteScopeScanStore(databasePath, 1, 100_000_000);
+  const store = await WorkerScopeScanStore.create(databasePath, 1, 100_000_000);
   const appConfig = config(databasePath);
   const service = new SnapshotService(new ScopeScanEngine(store, largeProvider), store, new AccessRegistry(appConfig), 4);
   await service.initialize();
@@ -788,7 +813,7 @@ test("SQLite snapshot handles 50000 synthetic files", { skip: process.env.YFY_RU
     assert.ok(performance.now() - queryStartedAt < 2_000, "20 indexed snapshot queries exceeded 2 seconds");
     const scanBudgetMs = process.platform === "win32" ? 15_000 : 10_000;
     assert.ok(performance.now() - startedAt < scanBudgetMs, `50k disk-backed snapshot exceeded ${scanBudgetMs}ms`);
-    assert.ok(store.storageBytes() > 0);
+    assert.ok((await store.storageStats()).logical_bytes > 0);
     await new Promise((resolve) => setTimeout(resolve, 1100));
     const pruneStartedAt = performance.now();
     await store.pruneExpired();
@@ -822,7 +847,7 @@ test("SQLite frontier handles a wide folder tree without state JSON rewrites", {
   };
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-snapshot-wide-perf-"));
   const databasePath = path.join(dir, "state.sqlite");
-  const store = new SqliteScopeScanStore(databasePath, 3600, 100_000_000);
+  const store = await WorkerScopeScanStore.create(databasePath, 3600, 100_000_000);
   const service = new SnapshotService(new ScopeScanEngine(store, wideProvider), store, new AccessRegistry(config(databasePath)), 4);
   await service.initialize();
   try {

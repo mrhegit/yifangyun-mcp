@@ -42,7 +42,7 @@ test("live read-only catalog works against Yifangyun", { skip: process.env.YFY_L
   loadDotEnv(envPath);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yfy-v1-live-"));
   process.env.YFY_STATE_DB = path.join(dir, "state.sqlite");
-  process.env.YFY_TOOLSETS = "drive,workspace,inventory,evidence,organization";
+  process.env.YFY_TOOLSETS = "drive,workspace,inventory,organization";
   const rootFolderId = process.env.YFY_LIVE_WORKSPACE_ROOT_FOLDER_ID;
   process.env.YFY_WORKFLOW_PROFILES = rootFolderId ? "tender" : "";
   if (rootFolderId) {

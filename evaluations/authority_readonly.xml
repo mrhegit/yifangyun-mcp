@@ -56,7 +56,7 @@
     <answer>force_refresh</answer>
   </qa_pair>
   <qa_pair>
-    <question>yfy_capture 的 expected.sha256 不匹配时，是否应保留可读取 Resource？只回答是或否。</question>
+    <question>yfy_download 的 expected.sha256 不匹配时，是否应保留可读取临时文件？只回答是或否。</question>
     <answer>否</answer>
   </qa_pair>
 </evaluation>

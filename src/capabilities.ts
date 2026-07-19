@@ -3,7 +3,7 @@ import type { AppConfig, Toolset, WorkflowProfile } from "./types.js";
 import { CONTRACT_VERSION } from "./version.js";
 
 const PROFILE_REQUIREMENTS: Record<WorkflowProfile, { requiresScope: boolean; toolsets: Toolset[] }> = {
-  tender: { requiresScope: true, toolsets: ["drive", "workspace", "inventory", "evidence"] }
+  tender: { requiresScope: true, toolsets: ["drive", "workspace", "inventory"] }
 };
 
 export interface ProfileReadiness {
@@ -39,7 +39,6 @@ export function configFingerprint(config: AppConfig): string {
     oauth_base_url: config.oauthBaseUrl,
     max_page_capacity: config.maxPageCapacity,
     max_download_bytes: config.maxDownloadBytes,
-    max_evidence_resource_bytes: config.maxEvidenceResourceBytes ?? null,
     max_state_bytes: config.maxStateBytes ?? null,
     max_temp_bytes: config.maxTempBytes ?? null,
     request_timeout_ms: config.requestTimeoutMs,
@@ -50,7 +49,13 @@ export function configFingerprint(config: AppConfig): string {
     max_concurrent_requests_per_identity: config.maxConcurrentRequestsPerIdentity ?? null,
     inventory_concurrency: config.snapshotConcurrency ?? null,
     inventory_ttl_seconds: config.snapshotTtlSeconds ?? null,
-    evidence_ttl_seconds: config.tempFileTtlSeconds,
+    download_ttl_seconds: config.tempFileTtlSeconds,
+    download_expose_local_path: config.downloadExposeLocalPath ?? null,
+    download_staged_http_enabled: config.downloadStagedHttpEnabled ?? null,
+    download_staged_max_concurrent_reads: config.downloadStagedMaxConcurrentReads ?? null,
+    download_staged_max_fetches: config.downloadStagedMaxFetches ?? null,
+    download_staged_public_base_url: config.downloadStagedPublicBaseUrl ?? null,
+    text_preview_max_bytes: config.textPreviewMaxBytes ?? null,
     upload_enabled: Boolean(config.uploadRootDir),
     toolsets: config.toolsets,
     transport: config.transport ?? "stdio",

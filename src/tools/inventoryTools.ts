@@ -15,7 +15,7 @@ import { INVENTORY_CURSOR_VERSION, INVENTORY_REF_VERSION, WORKSPACE_FINGERPRINT_
 import { continuationAction, pageOutput, paginatedInputSchemaWithFixed, resolvePaginationArgs } from "./pagination.js";
 import { FolderRefSchema, NextActionSchema, SimplePageSchema, WorkspaceRefSchema } from "./schemas.js";
 import { registerTool } from "./tooling.js";
-import { workspaceMembershipProof } from "./workspaceContentTools.js";
+import { workspaceMembershipProof } from "./workspaceTools.js";
 
 const InventoryStatusSchema = z.enum(["running", "retry_wait", "complete", "partial", "cancelled", "failed"]);
 /** Stable MAC-bound inventory reference: inventory:<uuid>@<access_context>.<mac24>. */
@@ -130,7 +130,7 @@ function parseInventoryRefParts(raw: string): { accessContext: string; inventory
   };
 }
 
-function resolveInventoryHandle(runtime: AppRuntime, value: unknown): InventoryRefPayload {
+function resolveInventoryHandle(value: unknown): InventoryRefPayload {
   const raw = String(value).trim();
   let parts: { accessContext: string; inventoryId: string; mac: string };
   try {
@@ -390,7 +390,7 @@ function suggestedWaitMs(state: ScopeScanState): number | undefined {
   return undefined;
 }
 
-function summary(runtime: AppRuntime, state: ScopeScanState, extra?: { planning?: JsonObject }): JsonObject {
+async function summary(runtime: AppRuntime, state: ScopeScanState, extra?: { planning?: JsonObject }): Promise<JsonObject> {
   const internal = runtime.snapshots.summary(state);
   const observedAt = state.observationUpdatedAt;
   const ref = inventoryRef(runtime, state);
@@ -415,7 +415,7 @@ function summary(runtime: AppRuntime, state: ScopeScanState, extra?: { planning?
     limits: { max_item_depth: state.policy.maxItemDepth, max_items: state.policy.maxItems },
     checkpoint: { commit_watermark: state.commitWatermark, control_revision: state.revision, remaining_frontier_count: state.frontierCount },
     diagnostics: { retry_count: state.retryCount, ...(state.nextRetryAt ? { next_retry_at: state.nextRetryAt } : {}), ...(state.lastError ? { last_error: state.lastError } : {}), incomplete_reasons: state.incompleteReasons },
-    retention: { expires_at: state.expiresAt, storage: runtime.snapshots.storageStats() },
+    retention: { expires_at: state.expiresAt, storage: await runtime.snapshots.storageStats() },
     observation_window: { started_at: state.observationStartedAt, updated_at: state.observationUpdatedAt },
     created_at: state.createdAt, updated_at: state.updatedAt,
     manifest_uri: `yfy://inventory/${state.scanId}/${state.artifactToken}/${state.accessContextId}/manifest`,
@@ -458,8 +458,8 @@ async function resolveScanRootFolderId(runtime: AppRuntime, workspace: ResolvedS
     runtime.gateway.getUser(`/v2/folder/${encodeURIComponent(folder.id)}/info`, workspace.context.id, {}, signal),
     runtime.gateway.getUser(`/v2/folder/${encodeURIComponent(workspace.scope.rootFolderId)}/info`, workspace.context.id, {}, signal)
   ]);
-  const folderItem = projectItem(folderResponse.data, "evidence");
-  const rootItem = projectItem(rootResponse.data, "evidence");
+  const folderItem = projectItem(folderResponse.data, "verification");
+  const rootItem = projectItem(rootResponse.data, "verification");
   const membership = workspaceMembershipProof(folderItem, rootItem, workspace.scope.rootFolderId);
   if (membership.status === "outside") {
     throw new YifangyunError("root_folder is outside the configured workspace.", {
@@ -522,7 +522,7 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
     });
     const planning = inventoryPlanning(args.root_folder !== undefined && args.root_folder !== null, limits.max_items, limits.max_item_depth);
     return {
-      ...summary(runtime, started.state, { planning }),
+      ...await summary(runtime, started.state, { planning }),
       reuse: { reused: started.reused, reason: started.reuseReason, mode: refresh.mode, ...(refresh.mode === "reuse_if_fresh" ? { max_age_seconds: refresh.max_age_seconds } : {}) }
     };
   });
@@ -533,7 +533,7 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
     inputSchema: { inventory: InventoryHandleSchema },
     outputSchema: InventorySummaryShape
   }, { readOnly: true, openWorld: false }, async ({ inventory }) => {
-    const ref = resolveInventoryHandle(runtime, inventory);
+    const ref = resolveInventoryHandle(inventory);
     return summary(runtime, await stateForRef(runtime, ref));
   });
 
@@ -559,7 +559,7 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
   }, { readOnly: true, openWorld: false }, async (args) => {
     const pageArgs = resolvePaginationArgs(args, "inventory_search", { fixedKeys: ["inventory"] });
     const inventoryValue = String(pageArgs.kind === "continuation" ? pageArgs.fixed.inventory : (pageArgs.data as { inventory: string }).inventory);
-    const ref = resolveInventoryHandle(runtime, inventoryValue);
+    const ref = resolveInventoryHandle(inventoryValue);
     const loaded = await stateForRef(runtime, ref);
     const first = pageArgs.kind === "first" ? pageArgs.data as {
       inventory: string; query?: string; kind: "file" | "folder" | "all"; match_fields: Array<"name" | "path">; case_sensitive: boolean; limit: number;
@@ -603,18 +603,18 @@ export function registerInventoryTools(server: McpServer, runtime: AppRuntime): 
 
   registerTool(server, "yfy_inventory_cancel", {
     title: "Cancel Yifangyun Workspace Inventory", description: "Cancel an active inventory. Cancelling a terminal inventory is a no-op.", inputSchema: { inventory: InventoryHandleSchema }, outputSchema: { ...InventorySummaryShape, cancellation: z.object({ outcome: z.enum(["cancelled", "already_terminal"]) }).strict() }
-  }, { readOnly: false, idempotent: true, openWorld: false }, async ({ inventory }) => {
-    const ref = resolveInventoryHandle(runtime, inventory);
+  }, { readOnly: false, destructive: true, idempotent: true, openWorld: false }, async ({ inventory }) => {
+    const ref = resolveInventoryHandle(inventory);
     const before = await stateForRef(runtime, ref);
     const terminal = ["complete", "partial", "cancelled", "failed"].includes(before.status);
     const state = terminal ? before : await runtime.snapshots.cancel(ref.inventoryId, ref.accessContext);
-    return { ...summary(runtime, state), cancellation: { outcome: !terminal && state.status === "cancelled" ? "cancelled" : "already_terminal" } };
+    return { ...await summary(runtime, state), cancellation: { outcome: !terminal && state.status === "cancelled" ? "cancelled" : "already_terminal" } };
   });
 
   registerTool(server, "yfy_inventory_release", {
     title: "Release Yifangyun Workspace Inventory", description: "Delete one local inventory and invalidate its ref, cursors, manifest and receipt resources.", inputSchema: { inventory: InventoryHandleSchema }, outputSchema: { inventory: InventoryRefSchema, status: z.enum(["released", "already_unavailable"]) }
   }, { readOnly: false, destructive: true, idempotent: true, openWorld: false }, async ({ inventory }) => {
-    const ref = resolveInventoryHandle(runtime, inventory);
+    const ref = resolveInventoryHandle(inventory);
     try {
       await stateForRef(runtime, ref);
     } catch (error) {

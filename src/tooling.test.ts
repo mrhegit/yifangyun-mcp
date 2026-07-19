@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -8,8 +12,10 @@ import { YifangyunError } from "./client.js";
 import { decodeCanonicalBase64Url } from "./domain/base64url.js";
 import { decodeCursor, encodeCursor } from "./domain/cursors.js";
 import { formatItemRef } from "./domain/refs.js";
+import { DownloadRegistry } from "./runtime/downloads.js";
+import { TempStorageManager } from "./runtime/tempStorage.js";
 import type { AppRuntime } from "./runtime/runtime.js";
-import { registerWorkspaceContentTools } from "./tools/workspaceContentTools.js";
+import { registerDownloadTools } from "./tools/downloadTools.js";
 import { registerDriveTools } from "./tools/driveTools.js";
 import { registerInventoryTools } from "./tools/inventoryTools.js";
 import { serializeToolText } from "./tools/resultDelivery.js";
@@ -69,10 +75,12 @@ test("tool errors bypass successful output schema validation", async () => {
   }
 });
 
-test("evidence integrity and Provider fallback errors use actionable categories", () => {
-  assert.equal(serializeError(new YifangyunError("mismatch", { code: "YFY_EVIDENCE_CONTENT_MISMATCH" })).category, "provider_contract");
-  assert.equal(serializeError(new YifangyunError("integrity", { code: "YFY_EVIDENCE_ARTIFACT_INTEGRITY_FAILED" })).category, "conflict");
-  assert.equal(serializeError(new YifangyunError("fallback", { code: "YFY_DOWNLOAD_VERSION_FALLBACK_DETECTED" })).category, "provider_contract");
+test("download integrity, delivery configuration and Provider errors use actionable categories", () => {
+  assert.equal(serializeError(new YifangyunError("mismatch", { code: "YFY_DOWNLOAD_CONTENT_MISMATCH" })).category, "provider_contract");
+  assert.equal(serializeError(new YifangyunError("integrity", { code: "YFY_DOWNLOAD_INTEGRITY_FAILED" })).category, "conflict");
+  assert.equal(serializeError(new YifangyunError("delivery", { code: "YFY_DOWNLOAD_DELIVERY_CHANNEL_UNAVAILABLE" })).category, "configuration");
+  assert.equal(serializeError(new YifangyunError("ticket", { code: "YFY_DOWNLOAD_TICKET_INVALID" })).category, "provider_contract");
+  assert.equal(serializeError(new YifangyunError("stream", { code: "YFY_DOWNLOAD_STREAM_FAILED", retryable: true })).category, "provider_unavailable");
 });
 
 test("stale snapshot cursors expose a recoverable state category and safe diagnostics", () => {
@@ -152,28 +160,30 @@ test("large tool results retain useful data and continuation in compact text", a
   }
 });
 
-test("compact text keeps resource operations without copying inline body text", () => {
+test("compact text keeps download anchors without copying preview body text", () => {
   const body = "sensitive-body-".repeat(4000);
-  const text = serializeToolText("yfy_open", {
-    must_release: true,
-    content_delivery: { mode: "inline_preview", agent_readable: true, model_has_body_text: true },
-    next_action: { tool: "yfy_resource_release", arguments: { resource_uri: "yfy://evidence/token" } },
-    resource: {
-      delivery: "mcp_resource",
-      resource_uri: "yfy://evidence/token",
-      file_name: "bid.txt",
+  const text = serializeToolText("yfy_download", {
+    status: "ready",
+    agent_hint: "Open local_path",
+    cleanup: { mode: "ttl", ttl_seconds: 60, release_tool: "yfy_download_release", release_args: { download_id: `dl_${"a".repeat(32)}` } },
+    download: {
+      download_id: `dl_${"a".repeat(32)}`,
+      local_path: "C:/temp/bid.txt",
+      fetch_url: null,
       media_type: "text/plain",
-      preview_text: body,
+      sha256: "b".repeat(64),
+      sha1: "a".repeat(40),
       size_bytes: body.length,
-      must_release: true
-    }
+      expires_at: "2026-07-19T00:00:00.000Z"
+    },
+    preview: { kind: "utf8_text", complete: true, charset: "utf-8", bytes: body.length, text: body }
   }, 12_000);
   const parsed = JSON.parse(text) as Record<string, unknown>;
   const control = parsed.control as Record<string, unknown>;
-  const resource = control.resource as Record<string, unknown>;
+  const download = control.download as Record<string, unknown>;
   assert.ok(text.length <= 12_000);
-  assert.equal(resource.resource_uri, "yfy://evidence/token");
-  assert.equal(resource.preview_text, undefined);
+  assert.equal(download.download_id, `dl_${"a".repeat(32)}`);
+  assert.equal(download.local_path, "C:/temp/bid.txt");
   assert.doesNotMatch(text, /sensitive-body/);
 });
 
@@ -303,76 +313,98 @@ test("the MCP client validates a paginated success result", async () => {
   }
 });
 
-test("the real MCP client validates current evidence capture and release", async () => {
-  const server = new McpServer({ name: "test-server", version: "1.0.0" });
-  const resourceUri = `yfy://evidence/${"a".repeat(48)}`;
+test("the real MCP client validates yfy_download path and release", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-tooling-dl-"));
+  const source = path.join(dir, "report.pdf");
+  const body = "pdf-body!";
+  await fs.writeFile(source, body);
+  const sha1 = crypto.createHash("sha1").update(body).digest("hex");
+  const sha256 = crypto.createHash("sha256").update(body).digest("hex");
+  const tempStorage = new TempStorageManager(dir, 1_048_576, 60);
+  const downloads = new DownloadRegistry(tempStorage, 60);
+  const server = new McpServer({ name: "test-server", version: "1.1.0-beta.1" });
   const runtime = {
-    config: { maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, toolsets: ["evidence"], transport: "stdio" },
+    config: { tempFileTtlSeconds: 60, toolsets: ["drive"], transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false },
     access: { resolveWorkspaceRef: () => ({ context: { id: "default", userId: "530" }, identityRef: IDENTITY_REF, scope: { id: "scope", rootFolderId: "501", accessContext: "default", tags: [] } }) },
-    gateway: { getUser: async (endpoint: string) => ({
-      data: endpoint.endsWith("/versions")
-        ? { file_versions: [{ current: true, sha1: "a".repeat(40), size: 9, modified_at: 1 }] }
-        : endpoint.endsWith("/download_v2") ? { download_url: "https://download.example/file" }
-          : { id: 10, name: "evidence.pdf", type: "file", size: 9, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] },
-      meta: { endpoint, fetchedAtIso: "2026-07-16T00:00:00.000Z", fetchedAtUnix: 1, sourceApiVersion: "v2", statusCode: 200 }
-    }) },
-    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/evidence.pdf", sha1: "a".repeat(40), sha256: "b".repeat(64), sizeBytes: 9, meta: { endpoint: "/download", fetchedAtIso: "2026-07-16T00:00:00.000Z", fetchedAtUnix: 1, sourceApiVersion: "v2", statusCode: 200 } }) },
-    evidence: { register: async () => resourceUri, release: async () => true, read: async () => ({ kind: "blob", blob: "", mimeType: "application/pdf", name: "evidence.pdf" }) }
+    gateway: {
+      context: () => ({ context: { id: "default", userId: "530" }, identityRef: IDENTITY_REF }),
+      getUser: async (endpoint: string) => ({
+        data: endpoint.endsWith("/versions")
+          ? { file_versions: [{ current: true, sha1, size: Buffer.byteLength(body), modified_at: 1 }] }
+          : endpoint.endsWith("/download_v2") ? { download_url: "https://download.example/file" }
+            : { id: 10, name: "report.pdf", type: "file", size: 9, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] },
+        meta: { endpoint, fetchedAtIso: "2026-07-16T00:00:00.000Z", fetchedAtUnix: 1, sourceApiVersion: "v2", statusCode: 200 }
+      })
+    },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "document.pdf", tempPath: source, sha1, sha256, sizeBytes: Buffer.byteLength(body), meta: { endpoint: "/download", fetchedAtIso: "2026-07-16T00:00:00.000Z", fetchedAtUnix: 1, sourceApiVersion: "v2", statusCode: 200 } }) },
+    downloads,
+    tempStorage
   } as unknown as AppRuntime;
-  registerWorkspaceContentTools(server, runtime);
+  registerDownloadTools(server, runtime);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test-client", version: "1.0.0" });
   try {
     await server.connect(serverTransport);
     await client.connect(clientTransport);
     await client.listTools();
-    const captured = await client.callTool({ name: "yfy_capture", arguments: { workspace: WORKSPACE_SCOPE, file: FILE_10 } });
+    const captured = await client.callTool({ name: "yfy_download", arguments: { workspace: WORKSPACE_SCOPE, file: FILE_10 } });
     assert.equal(captured.isError, undefined, JSON.stringify(captured.content));
-    const resource = (captured.structuredContent as Record<string, unknown>).resource as Record<string, unknown>;
-    assert.equal(resource.resource_uri, resourceUri);
-    assert.equal(resource.local_path, undefined);
-    const released = await client.callTool({ name: "yfy_resource_release", arguments: { resource_uri: resourceUri } });
+    const download = (captured.structuredContent as Record<string, unknown>).download as Record<string, unknown>;
+    assert.equal(typeof download.local_path, "string");
+    assert.equal(download.fetch_url, null);
+    assert.match(String(download.download_id), /^dl_[a-f0-9]{32}$/);
+    const released = await client.callTool({ name: "yfy_download_release", arguments: { download_id: download.download_id } });
     assert.equal(((released.structuredContent as Record<string, unknown>).status), "released");
   } finally {
     await client.close();
     await server.close();
+    await downloads.close();
+    await fs.rm(dir, { recursive: true, force: true });
   }
 });
 
-test("the real MCP client accepts embedded text and resource-link content together", async () => {
-  const server = new McpServer({ name: "test-server", version: "1.0.0" });
-  const resourceUri = `yfy://evidence/${"c".repeat(48)}`;
+test("the real MCP client returns text preview for yfy_download", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-tooling-txt-"));
   const body = "verified text";
+  const source = path.join(dir, "notes.txt");
+  await fs.writeFile(source, body);
+  const sha1 = crypto.createHash("sha1").update(body).digest("hex");
+  const sha256 = crypto.createHash("sha256").update(body).digest("hex");
+  const tempStorage = new TempStorageManager(dir, 1_048_576, 60);
+  const downloads = new DownloadRegistry(tempStorage, 60);
+  const server = new McpServer({ name: "test-server", version: "1.1.0-beta.1" });
   const runtime = {
-    config: { maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, toolsets: ["drive"], transport: "stdio" },
+    config: { tempFileTtlSeconds: 60, toolsets: ["drive"], transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false, textPreviewMaxBytes: 32768 },
     gateway: {
       context: () => ({ context: { id: "default", userId: "530" }, identityRef: IDENTITY_REF }),
       getUser: async (endpoint: string) => ({
         data: endpoint.endsWith("/versions")
-          ? { file_versions: [{ current: true, sha1: "a".repeat(40), size: body.length, modified_at: 1 }] }
+          ? { file_versions: [{ current: true, sha1, size: body.length, modified_at: 1 }] }
           : endpoint.endsWith("/download_v2") ? { download_url: "https://download.example/file" }
             : { id: 10, name: "notes.txt", type: "file", size: body.length, modified_at: 1, file_version_key: "v1" },
         meta: { endpoint, fetchedAtIso: "2026-07-16T00:00:00.000Z", fetchedAtUnix: 1, sourceApiVersion: "v2", statusCode: 200 }
       })
     },
-    client: { downloadFromUrlToTemp: async () => ({ fileName: "notes.txt", tempPath: "C:/temp/notes.txt", sha1: "a".repeat(40), sha256: "b".repeat(64), sizeBytes: body.length, contentType: "text/plain", meta: { endpoint: "/download", fetchedAtIso: "2026-07-16T00:00:00.000Z", fetchedAtUnix: 1, sourceApiVersion: "v2", statusCode: 200 } }) },
-    evidence: { register: async () => resourceUri, release: async () => true, readTextPreview: async () => ({ bytes: Buffer.byteLength(body), text: body }) }
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "notes.txt", tempPath: source, sha1, sha256, sizeBytes: body.length, contentType: "text/plain", meta: { endpoint: "/download", fetchedAtIso: "2026-07-16T00:00:00.000Z", fetchedAtUnix: 1, sourceApiVersion: "v2", statusCode: 200 } }) },
+    downloads,
+    tempStorage
   } as unknown as AppRuntime;
-  registerWorkspaceContentTools(server, runtime);
+  registerDownloadTools(server, runtime);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test-client", version: "1.0.0" });
   try {
     await server.connect(serverTransport);
     await client.connect(clientTransport);
-    const opened = await client.callTool({ name: "yfy_open", arguments: { file: FILE_10 } });
+    const opened = await client.callTool({ name: "yfy_download", arguments: { file: FILE_10, include_text_preview: true } });
     assert.equal(opened.isError, undefined, JSON.stringify(opened.content));
-    const content = opened.content as Array<{ resource?: { text?: string }; type: string; uri?: string }>;
-    const embedded = content.find((entry) => entry.type === "resource");
-    const link = content.find((entry) => entry.type === "resource_link");
-    assert.equal(embedded?.resource?.text, body);
-    assert.equal(link?.uri, resourceUri);
+    const preview = (opened.structuredContent as Record<string, unknown>).preview as Record<string, unknown>;
+    assert.equal(preview.text, body);
+    const download = (opened.structuredContent as Record<string, unknown>).download as Record<string, unknown>;
+    assert.equal(typeof download.local_path, "string");
   } finally {
     await client.close();
     await server.close();
+    await downloads.close();
+    await fs.rm(dir, { recursive: true, force: true });
   }
 });

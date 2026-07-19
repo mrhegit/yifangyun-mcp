@@ -113,12 +113,12 @@ export interface ScopeItemPage {
 }
 
 export interface ScopeScanProvider {
-  getRoot(folderId: IdLike, userId?: IdLike, signal?: AbortSignal): Promise<{ folder: JsonObject; meta: ApiResponseMeta }>;
-  listChildren(folderId: IdLike, userId: IdLike | undefined, pageId: number, pageCapacity: number, signal?: AbortSignal): Promise<ScopeScanPage>;
+  getRoot(folderId: IdLike, userId?: IdLike, signal?: AbortSignal, externalEnterpriseId?: IdLike): Promise<{ folder: JsonObject; meta: ApiResponseMeta }>;
+  listChildren(folderId: IdLike, userId: IdLike | undefined, pageId: number, pageCapacity: number, signal?: AbortSignal, externalEnterpriseId?: IdLike): Promise<ScopeScanPage>;
 }
 
 export interface ScopeScanRepository {
-  close(): void;
+  close(): void | Promise<void>;
   commitPage(scanId: string, artifact: ScopePageArtifact, seenItems: ScopeSeenItem[], state: ScopeScanState, current: ScopeScanFrontier, append: ScopeScanFrontier[]): Promise<void>;
   create(state: ScopeScanState, frontier: ScopeScanFrontier[]): Promise<void>;
   findSeenItems(scanId: string, itemIds: string[]): Promise<Map<string, ScopeSeenItem>>;
@@ -137,8 +137,7 @@ export interface ScopeScanRepository {
   removeFrontier(scanId: string, cursor: ScopeScanFrontier, state: ScopeScanState): Promise<void>;
   save(state: ScopeScanState): Promise<void>;
   searchItems(scanId: string, queries: Array<{ normalized: string; original: string }>, matchFields: Array<"name" | "path">, type: "file" | "folder" | "all", cursor: ScopeItemCursor | undefined, limit: number, caseSensitive: boolean, watermark: number): Promise<ScopeItemPage>;
-  storageBytes(): number;
-  storageStats(): { database_bytes: number; logical_bytes: number; wal_bytes: number };
+  storageStats(): { database_bytes: number; logical_bytes: number; wal_bytes: number } | Promise<{ database_bytes: number; logical_bytes: number; wal_bytes: number }>;
   updateFrontier(scanId: string, cursor: ScopeScanFrontier): Promise<void>;
   withLock<T>(scanId: string, work: () => Promise<T>): Promise<T>;
 }

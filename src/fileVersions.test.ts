@@ -19,6 +19,15 @@ test("file version selection rejects unknown historical ids", () => {
   assert.throws(() => selectFileVersion(result.versions, { kind: "historical", version_id: "501" }), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_VERSION_NOT_FOUND"));
 });
 
+test("historical versions without Provider ids are not marked download ready", () => {
+  const result = normalizeFileVersions({ file_versions: [
+    { current: true, sha1: "a".repeat(40), size: 10 },
+    { current: false, sha1: "b".repeat(40), size: 9 }
+  ] });
+  assert.equal(result.versions[1]?.download_ready, false);
+  assert.equal(result.versions[1]?.provider_version_id, undefined);
+});
+
 test("file versions reject ambiguous ordering", () => {
   assert.throws(() => normalizeFileVersions({ file_versions: [{ current: false, sha1: "a".repeat(40), size: 10 }] }), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_DOWNLOAD_VERSION_ORDER_AMBIGUOUS"));
   assert.throws(() => normalizeFileVersions({ file_versions: [
@@ -33,14 +42,6 @@ test("file versions normalize Provider hashes and enforce current generation ide
   const result = normalizeFileVersions({ file_versions: [{ current: true, sha1: "A".repeat(40), size: 10 }] });
   assert.equal(result.versions[0]?.sha1, "a".repeat(40));
   assert.throws(() => selectFileVersion([{ ...result.versions[0]!, generation: 1 }], { kind: "current" }), (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "YFY_DOWNLOAD_VERSION_ORDER_AMBIGUOUS"));
-});
-
-test("file versions prefer file_versions over duplicate compatibility arrays", () => {
-  const result = normalizeFileVersions({
-    file_versions: [{ current: true, sha1: "a".repeat(40), size: 10 }],
-    versions: [{ current: true, sha1: "a".repeat(40), size: 10 }]
-  });
-  assert.equal(result.versions.length, 1);
 });
 
 test("file versions reject duplicate provider version ids", () => {

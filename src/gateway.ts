@@ -21,12 +21,12 @@ export class YifangyunGateway {
 
   getUser(pathname: string, contextId?: string, params: Record<string, string | number | boolean | undefined> = {}, signal?: AbortSignal): Promise<ApiJsonResponse> {
     const resolved = this.context(contextId);
-    return this.client.getAsUser(pathname, resolved.context.userId, params, signal);
+    return this.client.getAsUser(pathname, resolved.context.userId, params, signal, resolved.context.externalEnterpriseId);
   }
 
   postUser(pathname: string, contextId: string | undefined, body: JsonValue, params: Record<string, string | number | boolean | undefined> = {}, signal?: AbortSignal): Promise<ApiJsonResponse> {
     const resolved = this.context(contextId);
-    return this.client.postAsUser(pathname, resolved.context.userId, body, params, signal);
+    return this.client.postAsUser(pathname, resolved.context.userId, body, params, signal, resolved.context.externalEnterpriseId);
   }
 
   getEnterprise(pathname: string, params: Record<string, string | number | boolean | undefined> = {}, signal?: AbortSignal): Promise<ApiJsonResponse> {
@@ -39,16 +39,16 @@ export class YifangyunGateway {
 
   scanProvider(): ScopeScanProvider {
     return {
-      getRoot: async (folderId: IdLike, userId?: IdLike, signal?: AbortSignal) => {
-        const response = await this.client.getAsUser(`/v2/folder/${encodeURIComponent(String(folderId))}/info`, userId, {}, signal);
-        return { folder: projectItem(response.data, "evidence"), meta: response.meta };
+      getRoot: async (folderId: IdLike, userId?: IdLike, signal?: AbortSignal, externalEnterpriseId?: IdLike) => {
+        const response = await this.client.getAsUser(`/v2/folder/${encodeURIComponent(String(folderId))}/info`, userId, {}, signal, externalEnterpriseId);
+        return { folder: projectItem(response.data, "verification"), meta: response.meta };
       },
-      listChildren: async (folderId: IdLike, userId: IdLike | undefined, pageId: number, pageCapacity: number, signal?: AbortSignal) => {
+      listChildren: async (folderId: IdLike, userId: IdLike | undefined, pageId: number, pageCapacity: number, signal?: AbortSignal, externalEnterpriseId?: IdLike) => {
         const response = await this.client.getAsUser(`/v2/folder/${encodeURIComponent(String(folderId))}/children`, userId, {
           type: "all",
           page_id: pageId,
           page_capacity: Math.min(pageCapacity, this.maxPageCapacity)
-        }, signal);
+        }, signal, externalEnterpriseId);
         return this.toScanPage(response, pageId, pageCapacity);
       }
     };
@@ -56,8 +56,8 @@ export class YifangyunGateway {
 
   private toScanPage(response: ApiJsonResponse, requestedPageId: number, requestedCapacity: number): ScopeScanPage {
     const source = objectValue(response.data) ?? {};
-    const folders = arrayValue(source.folders).map((item) => projectItem(item, "evidence")).filter((item) => Object.keys(item).length > 0);
-    const files = arrayValue(source.files).map((item) => projectItem(item, "evidence")).filter((item) => Object.keys(item).length > 0);
+    const folders = arrayValue(source.folders).map((item) => projectItem(item, "verification")).filter((item) => Object.keys(item).length > 0);
+    const files = arrayValue(source.files).map((item) => projectItem(item, "verification")).filter((item) => Object.keys(item).length > 0);
     const pageId = numberValue(source.page_id) ?? requestedPageId;
     const pageCapacity = numberValue(source.page_capacity) ?? requestedCapacity;
     const pageCount = numberValue(source.page_count);

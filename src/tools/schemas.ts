@@ -4,7 +4,7 @@ export const JsonObjectSchema = z.record(z.unknown());
 export const JsonValueSchema = z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(z.unknown()), z.record(z.unknown())]);
 const BoundItemRefPattern = /^(file|folder):\d+@[A-Za-z0-9_-]+\.[a-f0-9]{24}$/;
 export const WorkspaceRefSchema = z.string().trim().regex(/^workspace:[A-Za-z0-9_-]+$/).describe("Copy the workspace:<id> ref returned by yfy_status.");
-export const ItemRefSchema = z.string().trim().regex(BoundItemRefPattern).describe("Context-bound item ref returned by this server. Copy it exactly; legacy numeric IDs are invalid.");
+export const ItemRefSchema = z.string().trim().regex(BoundItemRefPattern).describe("Context-bound item ref returned by this server. Copy it exactly; unbound numeric IDs are invalid.");
 export const FileRefSchema = z.string().trim().regex(/^file:\d+@[A-Za-z0-9_-]+\.[a-f0-9]{24}$/).describe("Context-bound file ref returned by this server.");
 export const FolderRefSchema = z.string().trim().regex(/^folder:\d+@[A-Za-z0-9_-]+\.[a-f0-9]{24}$/).describe("Context-bound folder ref returned by this server.");
 export const PlaceRefSchema = z.union([z.enum(["personal", "collaboration"]), z.string().trim().regex(/^department:\d+$/), FolderRefSchema, WorkspaceRefSchema]).describe("Copy a place ref returned by this server.");
@@ -15,7 +15,6 @@ export const SimplePageSchema = z.object({
   next_cursor: z.string().optional()
 }).strict();
 export const NextActionSchema = z.object({ tool: z.string(), arguments: z.record(z.unknown()) }).strict();
-export const VerificationStatusSchema = z.enum(["pass", "not_applicable", "unavailable"]);
 export const CheckStatusSchema = z.enum(["pass", "fail", "unavailable"]);
 export const ProvenanceSchema = z.object({
   source: z.literal("yifangyun_openapi"),
@@ -41,20 +40,13 @@ export const ItemSchema = z.object({
   space: z.object({ id: z.string().optional(), name: z.string().optional(), type: z.string().optional() }).strict().optional(), comments_count: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(),
   sequence_id: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(), remark: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional()
 }).strict();
-export const VersionSelectionProofSchema = z.object({
-  kind: z.enum(["current", "historical"]),
-  generation: z.number().int().min(0),
-  provider_version_id: z.string().optional(),
-  download_strategy: z.enum(["current_ordinal", "historical_reverse_ordinal", "historical_ordinal", "historical_version_id"]),
-  validation_level: z.literal("content_and_metadata")
-}).strict();
 export const FileVersionSchema = z.object({
   generation: z.number().int().min(0), provider_version_id: z.string().optional(), current: z.boolean(), name: z.string().optional(),
   sha1: z.string().regex(/^[a-f\d]{40}$/i).optional(), size_bytes: z.number().int().nonnegative().optional(), modified_at_unix: z.number().int().nonnegative().optional(),
-  modified_at_iso: z.string().optional(), remark: z.string().optional(), evidence_ready: z.boolean()
+  modified_at_iso: z.string().optional(), remark: z.string().optional(), download_ready: z.boolean()
 }).strict();
 export const DomainErrorSchema = z.object({
-  code: z.string(), category: z.enum(["invalid_input", "authentication", "authorization", "not_found", "rate_limited", "timeout", "provider_unavailable", "provider_contract", "stale_state", "capacity_limit", "cancelled", "conflict", "internal"]),
+  code: z.string(), category: z.enum(["invalid_input", "configuration", "authentication", "authorization", "not_found", "rate_limited", "timeout", "provider_unavailable", "provider_contract", "stale_state", "capacity_limit", "cancelled", "conflict", "internal"]),
   message: z.string(), retryable: z.boolean(), phase: z.string().optional(), retry_after_ms: z.number().int().nonnegative().optional(), suggested_action: z.string().optional(),
   diagnostics: z.record(JsonValueSchema).optional(),
   provider: z.object({ status_code: z.number().int().optional(), code: z.string().optional(), request_id: z.string().optional() }).strict().optional()

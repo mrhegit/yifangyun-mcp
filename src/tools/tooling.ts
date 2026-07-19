@@ -89,12 +89,15 @@ function errorCategory(error: YifangyunError, normalizedCode: string): string {
   if (error.statusCode === 429) return "rate_limited";
   if (error.statusCode !== undefined && error.statusCode >= 500) return "provider_unavailable";
   if (normalizedCode.includes("INPUT") || normalizedCode.includes("PATH_INVALID")) return "invalid_input";
+  if (normalizedCode.includes("CONFIG") || normalizedCode.includes("DELIVERY_CHANNEL")) return "configuration";
+  if (normalizedCode === "YFY_DOWNLOAD_TICKET_INVALID") return "provider_contract";
+  if (normalizedCode === "YFY_DOWNLOAD_STREAM_FAILED") return "provider_unavailable";
   if (normalizedCode.includes("REF_IDENTITY_MISMATCH")) return "stale_state";
   if (normalizedCode.endsWith("_CURSOR_STALE") || normalizedCode.includes("STALE") || normalizedCode.includes("REVISION_CONFLICT")) return "stale_state";
   if (normalizedCode.includes("TOO_LARGE") || normalizedCode.includes("QUOTA") || normalizedCode.includes("CAPACITY") || normalizedCode.includes("STORAGE_INSUFFICIENT")) return "capacity_limit";
-  if (normalizedCode.includes("CONTENT_MISMATCH") || normalizedCode.includes("FALLBACK_DETECTED") || normalizedCode.includes("HISTORICAL_CAPTURE")) return "provider_contract";
-  if (normalizedCode.includes("CONFLICT") || normalizedCode.includes("DRIFT") || normalizedCode.includes("CONTENT_MISMATCH") || normalizedCode.includes("EXPECTATION_MISMATCH") || normalizedCode.includes("ARTIFACT_INTEGRITY") || normalizedCode.includes("IDENTITY_AMBIGUOUS")) return "conflict";
-  if (normalizedCode.includes("PROVIDER") || normalizedCode.includes("VERSION_ORDER") || normalizedCode.includes("METADATA_INCOMPLETE") || normalizedCode.includes("FALLBACK_DETECTED") || normalizedCode.includes("UNAVAILABLE")) return "provider_contract";
+  if (normalizedCode.includes("CONTENT_MISMATCH") || normalizedCode.includes("HISTORICAL_DOWNLOAD")) return "provider_contract";
+  if (normalizedCode.includes("CONFLICT") || normalizedCode.includes("DRIFT") || normalizedCode.includes("CONTENT_MISMATCH") || normalizedCode.includes("EXPECTATION_MISMATCH") || normalizedCode.includes("INTEGRITY_FAILED") || normalizedCode.includes("IDENTITY_AMBIGUOUS")) return "conflict";
+  if (normalizedCode.includes("PROVIDER") || normalizedCode.includes("VERSION_ORDER") || normalizedCode.includes("METADATA_INCOMPLETE") || normalizedCode.includes("UNAVAILABLE")) return "provider_contract";
   return "internal";
 }
 
@@ -216,21 +219,10 @@ export function registerTool(
         });
       }
       const output = validated.data as Record<string, unknown>;
-      const resource = output.resource && typeof output.resource === "object" && !Array.isArray(output.resource) ? output.resource as Record<string, unknown> : undefined;
-      const artifact = output.artifact && typeof output.artifact === "object" && !Array.isArray(output.artifact) ? output.artifact as Record<string, unknown> : undefined;
-      const legacyEvidence = output.evidence && typeof output.evidence === "object" && !Array.isArray(output.evidence) ? output.evidence as Record<string, unknown> : undefined;
-      const resourceUri = typeof resource?.resource_uri === "string" ? resource.resource_uri : typeof artifact?.resource_uri === "string" ? artifact.resource_uri : typeof legacyEvidence?.resource_uri === "string" ? legacyEvidence.resource_uri : undefined;
-      const delivery = resource?.delivery ?? artifact?.delivery;
-      const resourceReadable = delivery === undefined || delivery === "mcp_resource" || delivery === "multipart_resource";
-      const embeddedText = delivery === "mcp_resource" && typeof resource?.preview_text === "string" ? resource.preview_text : undefined;
       const text = serializeToolText(name, output);
       cleanupRequired = false;
       return {
-        content: [
-          { type: "text" as const, text },
-          ...(resourceUri && embeddedText !== undefined ? [{ type: "resource" as const, resource: { uri: resourceUri, mimeType: typeof resource?.media_type === "string" ? resource.media_type : "text/plain", text: embeddedText } }] : []),
-          ...(resourceUri && resourceReadable ? [{ type: "resource_link" as const, uri: resourceUri, name: typeof resource?.file_name === "string" ? resource.file_name : typeof artifact?.file_name === "string" ? artifact.file_name : typeof legacyEvidence?.file_name === "string" ? legacyEvidence.file_name : "Yifangyun content", mimeType: delivery === "multipart_resource" ? "application/json" : typeof resource?.media_type === "string" ? resource.media_type : typeof artifact?.media_type === "string" ? artifact.media_type : "application/octet-stream" }] : [])
-        ],
+        content: [{ type: "text" as const, text }],
         structuredContent: output
       };
     } catch (error) {

@@ -68,8 +68,8 @@ const SharesCursorSchema = z.object({ item: ItemRefSchema, page_id: z.number().i
 const SEARCH_NON_EXHAUSTIVE_WARNING = "Indexed search is non-exhaustive: it cannot prove current existence or absence.";
 const SEARCH_CLAIM_WARNING = "match.claim_allowed=true means returned metadata supports the query match; confirm current existence with yfy_get before relying on the item. Provider snippets and unverified index hits must not be asserted as confirmed matches.";
 const VERSION_SELECTION_RULES = {
-  current: "Omit the version parameter on yfy_open/yfy_capture for the current version. Do not invent a version ref.",
-  historical: "Copy the historical version ref from this result and pass it as the version parameter on yfy_open/yfy_capture."
+  current: "Omit the version parameter on yfy_download for the current version. Do not invent a version ref.",
+  historical: "Copy the historical version ref from this result and pass it as the version parameter on yfy_download."
 } as const;
 
 const SearchMatchFieldSchema = z.object({
@@ -104,8 +104,8 @@ const SearchMatchSchema = z.discriminatedUnion("trust", [
   z.object({ ...SearchMatchCommonShape, trust: z.literal("unverified_index_hit"), claim_allowed: z.literal(false) }).strict()
 ]);
 
-function detailView(detail: Detail): "summary" | "evidence" | "full" {
-  return detail === "basic" ? "summary" : detail === "standard" ? "evidence" : "full";
+function detailView(detail: Detail): "summary" | "verification" | "full" {
+  return detail === "basic" ? "summary" : detail === "standard" ? "verification" : "full";
 }
 
 function assertRefAccess(runtime: AppRuntime, ref: ReturnType<typeof parseItemRef>): ResolvedAccess {
@@ -193,7 +193,7 @@ function searchMatch(source: JsonObject, item: JsonObject, field: SearchField, q
   const snippet = [source.snippet, source.highlight, source.content_highlight].find((value) => typeof value === "string");
   if ((field === "content" || field === "all") && typeof snippet === "string") {
     const snippetText = String(snippet);
-    // Snippet without the query string is not usable as match evidence.
+    // Snippet without the query string is not usable as a match basis.
     if (snippetText.toLocaleLowerCase("zh-CN").includes(lowerQuery)) fields.push({ field: "content", basis: "provider_snippet", value: snippetText, verifiable: false });
     else fields.push({ field: "content", basis: "provider_index_only", value: snippetText, verifiable: false });
   }
@@ -290,20 +290,25 @@ function recommendedWorkflows(runtime: AppRuntime): JsonObject[] {
   const hasWorkspace = runtime.access.listScopes().length > 0;
   const drive = toolsets.has("drive");
   const inventory = toolsets.has("workspace") && toolsets.has("inventory") && hasWorkspace;
-  const evidence = drive && toolsets.has("workspace") && toolsets.has("evidence") && hasWorkspace;
+  const workspaceDownload = drive && toolsets.has("workspace") && hasWorkspace;
   const transfer = toolsets.has("transfer");
+  const consume = runtime.config.downloadExposeLocalPath && runtime.config.downloadStagedHttpEnabled
+    ? "prefer download.local_path when co-located; otherwise GET download.fetch_url"
+    : runtime.config.downloadExposeLocalPath
+      ? "open download.local_path with a host parser"
+      : "GET download.fetch_url with MCP HTTP authorization";
   return [
     {
       id: "read_small_text",
-      when: "Exact path or known file ref; small text-like content",
-      steps: ["yfy_status", "yfy_resolve or yfy_get", "yfy_open", "inspect content_delivery.agent_readable", "execute next_action yfy_resource_release"],
+      when: "Exact path or known file ref; download for host parsing",
+      steps: ["yfy_status", "yfy_resolve or yfy_get", "yfy_download", consume, "optional yfy_download_release"],
       enabled: drive
     },
     {
-      id: "capture_evidence",
-      when: "Workspace-bound original bytes required",
-      steps: ["yfy_workspace_validate", "yfy_resolve or yfy_search (disambiguate if must_disambiguate)", "yfy_get", "yfy_capture", "execute next_action yfy_resource_release"],
-      enabled: evidence
+      id: "workspace_download",
+      when: "Workspace-bound download for host parsing",
+      steps: ["yfy_workspace_validate", "yfy_resolve or yfy_search (disambiguate if must_disambiguate)", "yfy_get", "yfy_download with workspace", consume, "optional yfy_download_release"],
+      enabled: workspaceDownload
     },
     {
       id: "absence_audit",
@@ -313,8 +318,8 @@ function recommendedWorkflows(runtime: AppRuntime): JsonObject[] {
     },
     {
       id: "transfer_url_only",
-      when: "Special integration only: short-lived Provider URL (never for evidence or ordinary reads)",
-      steps: ["yfy_transfer_ticket_get", "do_not_echo_url; not_for_evidence; prefer yfy_open/yfy_capture otherwise"],
+      when: "Special integration only: short-lived Provider URL (never for ordinary reads)",
+      steps: ["yfy_transfer_ticket_get", "do_not_echo_url; not_for_verified_download; prefer yfy_download otherwise"],
       enabled: transfer
     }
   ];
@@ -332,6 +337,15 @@ export function registerStatusTool(server: McpServer, runtime: AppRuntime): void
       identity: z.object({ access_context: z.string(), user: z.record(z.unknown()).optional() }).strict(),
       places: z.array(z.object({ ref: PlaceRefSchema, kind: z.string(), name: z.string().optional(), tags: z.array(z.string()).optional() }).strict()),
       capabilities: z.array(z.string()),
+      download_delivery: z.object({
+        local_path: z.boolean(),
+        staged_http: z.boolean(),
+        staged_max_concurrent_reads: z.number().int().positive(),
+        staged_max_fetches: z.number().int().positive(),
+        public_base_configured: z.boolean(),
+        transport: z.enum(["stdio", "http"])
+      }).strict(),
+      temp_storage: z.object({ max_bytes: z.number().int().positive(), reserved_bytes: z.number().int().nonnegative(), used_bytes: z.number().int().nonnegative() }).strict(),
       profiles: z.array(z.record(z.unknown())),
       recommended_workflows: z.array(z.object({
         id: z.string(),
@@ -348,6 +362,15 @@ export function registerStatusTool(server: McpServer, runtime: AppRuntime): void
       server: { name: SERVER_NAME, version: SERVER_VERSION, contract_version: CONTRACT_VERSION, build_id: BUILD_ID, build_commit: BUILD_COMMIT, instance_id: runtime.instanceId, started_at: runtime.startedAtIso, config_fingerprint: runtime.configFingerprint },
       places: [{ ref: "personal", kind: "personal", name: "Personal drive" }, { ref: "collaboration", kind: "collaboration", name: "Collaboration" }, ...runtime.access.listScopes().map((workspace) => ({ ref: runtime.access.workspaceRef(workspace.id), kind: "workspace", name: workspace.id, tags: workspace.tags }))],
       capabilities: runtime.config.toolsets,
+      download_delivery: {
+        local_path: runtime.config.downloadExposeLocalPath === true,
+        staged_http: runtime.config.downloadStagedHttpEnabled === true,
+        staged_max_concurrent_reads: runtime.config.downloadStagedMaxConcurrentReads ?? 20,
+        staged_max_fetches: runtime.config.downloadStagedMaxFetches ?? 10,
+        public_base_configured: Boolean(runtime.config.downloadStagedPublicBaseUrl),
+        transport: runtime.config.transport ?? "stdio"
+      },
+      temp_storage: runtime.tempStorage.usage(),
       profiles: profileReadiness(runtime.config),
       recommended_workflows: recommendedWorkflows(runtime),
       runtime: getConfigSummary(runtime.config)
@@ -399,7 +422,7 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
 
   registerTool(server, "yfy_search", {
     title: "Search Yifangyun Drive",
-    description: "WHEN: unknown location, need candidates. DO NOT: treat empty hits as absence; do not open/capture under selection_policy=must_disambiguate without path uniqueness; content hits never claim_allowed. EXAMPLE: {\"query\":\"投标函\",\"in\":\"workspace:tender_public\",\"field\":\"name\",\"limit\":10}",
+    description: "WHEN: unknown location, need candidates. DO NOT: treat empty hits as absence or download hits[0] under selection_policy=must_disambiguate without path uniqueness. Content hits never claim_allowed. EXAMPLE: {\"query\":\"投标函\",\"in\":\"workspace:tender_public\",\"field\":\"name\",\"limit\":10}",
     inputSchema: SearchInputSchema.inputSchema,
     inputValidator: SearchInputSchema.validator,
     outputSchema: {
@@ -534,24 +557,24 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
         : "must_disambiguate" as const;
     const recommended_actions: string[] = [];
     if (selection_policy === "must_disambiguate") {
-      recommended_actions.push("selection_policy=must_disambiguate: do not open/capture hits[0] without path uniqueness.");
+      recommended_actions.push("selection_policy=must_disambiguate: do not download hits[0] without path uniqueness.");
       recommended_actions.push(nextCursor
         ? "Additional Provider pages may contain competing candidates; follow next_action or narrow with in=folder:<ref>."
-        : "Narrow with in=folder:<ref>, or yfy_resolve / yfy_browse, then yfy_get before capture.");
+        : "Narrow with in=folder:<ref>, or yfy_resolve / yfy_browse, then yfy_get before download.");
     } else if (selection_policy === "continue_search") {
       recommended_actions.push("No visible candidate was found on this page, but more Provider pages remain; execute next_action.");
       recommended_actions.push("Do not claim absence. Refine the search or use workspace inventory only after pagination is exhausted.");
     } else if (selection_policy === "no_candidates") {
       recommended_actions.push("Empty search results never prove absence; use workspace inventory for completeness.");
     } else {
-      recommended_actions.push("Confirm current existence with yfy_get before open/capture.");
+      recommended_actions.push("Confirm current existence with yfy_get before download.");
     }
     const agentWarnings = [SEARCH_NON_EXHAUSTIVE_WARNING, SEARCH_CLAIM_WARNING];
     if (unverifiedEligible.length > 0 && !includeUnverified) {
       agentWarnings.push(`${unverifiedEligible.length} unverified Provider index hit(s) were counted but omitted from hits (set include_unverified_index_hits=true to inspect them).`);
     }
     if (disambiguationGroups > 0) {
-      agentWarnings.push("selection_policy=must_disambiguate: some Provider-page candidates share the same name; disambiguate by path/ref and confirm with yfy_get before opening or capturing.");
+      agentWarnings.push("selection_policy=must_disambiguate: some Provider-page candidates share the same name; disambiguate by path/ref and confirm with yfy_get before downloading.");
     }
     if (nextCursor && totalVisible > 0) {
       agentWarnings.push("Additional Provider pages remain, so current-page candidates are not globally unique; follow next_action or narrow the scope before selection.");
@@ -566,7 +589,7 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
           default_hits_include_unverified: true,
           include_unverified_index_hits_effective: includeUnverified,
           interpretation: "field=content uses Provider index only. Hits are non-claimable (claim_allowed=false). Unverified index hits are included by default for content search. Always yfy_get before relying on existence.",
-          recommended_actions: ["Do not assert content hits as confirmed matches.", "Call yfy_get before open/capture.", "Use inventory for absence."]
+          recommended_actions: ["Do not assert content hits as confirmed matches.", "Call yfy_get before download.", "Use inventory for absence."]
         }
       : { applies: false as const };
     if (field === "content") {
@@ -651,7 +674,7 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
 
   registerTool(server, "yfy_versions", {
     title: "List Yifangyun File Versions",
-    description: "List file versions for one context-bound file ref. Current versions use ref=null (omit version on open/capture); historical versions return a copyable version ref.",
+    description: "List file versions for one context-bound file ref. Current versions use ref=null (omit version on yfy_download); selectable historical versions return a copyable version ref, while entries without a Provider version ID are marked unavailable.",
     inputSchema: VersionsInputSchema.inputSchema,
     inputValidator: VersionsInputSchema.validator,
     outputSchema: {
@@ -660,7 +683,7 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
         ref: VersionRefSchema.nullable(),
         file: FileRefSchema,
         usage: z.object({
-          for_open_or_capture: z.enum(["omit_version_parameter", "pass_version_ref"]),
+          for_download: z.enum(["omit_version_parameter", "pass_version_ref", "unavailable"]),
           note: z.string()
         }).strict()
       })),
@@ -687,8 +710,19 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
           file,
           ref: null,
           usage: {
-            for_open_or_capture: "omit_version_parameter" as const,
-            note: "Current version: omit the version parameter on yfy_open/yfy_capture."
+            for_download: "omit_version_parameter" as const,
+            note: "Current version: omit the version parameter on yfy_download."
+          }
+        };
+      }
+      if (!version.provider_version_id) {
+        return {
+          ...version,
+          file,
+          ref: null,
+          usage: {
+            for_download: "unavailable" as const,
+            note: "Historical version lacks a Provider version ID and cannot be selected safely."
           }
         };
       }
@@ -697,8 +731,8 @@ export function registerDriveTools(server: McpServer, runtime: AppRuntime): void
         file,
         ref: formatVersionRef(file, version.provider_version_id!),
         usage: {
-          for_open_or_capture: "pass_version_ref" as const,
-          note: "Historical version: pass this ref as the version parameter on yfy_open/yfy_capture."
+          for_download: "pass_version_ref" as const,
+          note: "Historical version: pass this ref as the version parameter on yfy_download."
         }
       };
     });

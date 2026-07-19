@@ -1,6 +1,6 @@
 export const SERVER_NAME = "yifangyun-mcp-server";
-export const SERVER_VERSION = "1.0.0";
-export const CONTRACT_VERSION = 1;
+export const SERVER_VERSION = "1.1.0-beta.1";
+export const CONTRACT_VERSION = 2;
 export const CURSOR_ENVELOPE_VERSION = 1;
 export const INVENTORY_CURSOR_VERSION = 1;
 export const INVENTORY_REF_VERSION = 1;

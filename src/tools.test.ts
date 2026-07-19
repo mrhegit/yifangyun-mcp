@@ -9,9 +9,11 @@ import { YifangyunError } from "./client.js";
 import { provenance } from "./domain/projectors.js";
 import { formatItemRef, formatVersionRef, parseItemRef } from "./domain/refs.js";
 import type { AppRuntime } from "./runtime/runtime.js";
-import { EvidenceArtifactRegistry } from "./runtime/evidence.js";
+import { DownloadRegistry } from "./runtime/downloads.js";
+import { TempStorageManager } from "./runtime/tempStorage.js";
 import { registerAdminTools } from "./tools/adminTools.js";
-import { normalizedMediaType, registerWorkspaceContentTools } from "./tools/workspaceContentTools.js";
+import { normalizedMediaType, registerWorkspaceTools } from "./tools/workspaceTools.js";
+import { registerDownloadTools } from "./tools/downloadTools.js";
 import { registerDriveTools } from "./tools/driveTools.js";
 import { registerMutationTools } from "./tools/mutationTools.js";
 import { registerInventoryTools } from "./tools/inventoryTools.js";
@@ -20,7 +22,7 @@ import { registerTransferTools } from "./tools/transferTools.js";
 import type { ApiJsonResponse, JsonValue } from "./types.js";
 
 type ToolResult = { content?: Array<{ resource?: { mimeType?: string; text?: string; uri?: string }; text?: string; type: string; uri?: string; mimeType?: string }>; structuredContent?: Record<string, unknown>; isError?: boolean };
-type Handler = (args: Record<string, unknown>, extra: { signal: AbortSignal; sendNotification: () => Promise<void> }) => Promise<ToolResult>;
+type Handler = (args: Record<string, unknown>, extra: { _meta?: { progressToken?: string | number }; signal: AbortSignal; sendNotification: (notification?: unknown) => Promise<void> }) => Promise<ToolResult>;
 type ResourceHandler = (uri: URL, variables: Record<string, string>) => Promise<{ contents: Array<{ text?: string }> }>;
 class FakeServer {
   readonly tools = new Map<string, Handler>();
@@ -32,6 +34,20 @@ class FakeServer {
 
 function response(endpoint: string, data: JsonValue): ApiJsonResponse {
   return { data, meta: { endpoint, fetchedAtIso: new Date().toISOString(), fetchedAtUnix: 1, sourceApiVersion: "v2", statusCode: 200 } };
+}
+
+function downloadHarness(root: string, ttlSeconds = 60, maxBytes = 1_048_576) {
+  const tempStorage = new TempStorageManager(root, maxBytes, ttlSeconds);
+  return { downloads: new DownloadRegistry(tempStorage, ttlSeconds), tempStorage };
+}
+
+function contentHashes(body: string | Buffer) {
+  const bytes = Buffer.isBuffer(body) ? body : Buffer.from(body);
+  return {
+    sha1: crypto.createHash("sha1").update(bytes).digest("hex"),
+    sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+    sizeBytes: bytes.length
+  };
 }
 
 function access() {
@@ -76,7 +92,7 @@ test("provenance exposes a logical operation without transport paths", () => {
   assert.doesNotMatch(JSON.stringify(value), /download\.example|secret\/path|private-context/);
 });
 
-test("legacy Office media types are normalized for MCP clients", () => {
+test("Office media types are normalized for MCP clients", () => {
   assert.equal(normalizedMediaType("application/excel", undefined), "application/vnd.ms-excel");
   assert.equal(normalizedMediaType("application/powerpoint; charset=binary", undefined), "application/vnd.ms-powerpoint");
   assert.equal(normalizedMediaType("application/octet-stream", "application/pdf"), "application/pdf");
@@ -95,7 +111,7 @@ test("media type falls back from magic sniff then file extension including svg",
   assert.equal(normalizedMediaType("application/octet-stream", undefined, "blob.bin"), "application/octet-stream");
 });
 
-test("context-bound refs reject legacy numeric IDs and preserve identity", () => {
+test("context-bound refs reject unbound numeric IDs and preserve identity", () => {
   assert.deepEqual(parseItemRef(FILE_10), { type: "file", id: "10", accessContextId: "default", identityRef: IDENTITY_REF });
   assert.throws(() => parseItemRef("file:10"), /Item reference is invalid/);
 });
@@ -585,7 +601,8 @@ test("current file versions omit historical VersionRef values", async () => {
       context: access,
       getUser: async (endpoint: string) => response(endpoint, { file_versions: [
         { current: true, sha1: "a".repeat(40), size: 9, modified_at: 2 },
-        { id: 7, current: false, sha1: "b".repeat(40), size: 8, modified_at: 1 }
+        { id: 7, current: false, sha1: "b".repeat(40), size: 8, modified_at: 1 },
+        { current: false, sha1: "c".repeat(40), size: 7, modified_at: 0 }
       ] })
     }
   } as unknown as AppRuntime;
@@ -597,17 +614,23 @@ test("current file versions omit historical VersionRef values", async () => {
   assert.equal(versions[0]?.ref, null);
   assert.ok(Object.prototype.hasOwnProperty.call(versions[0], "ref"));
   assert.deepEqual(versions[0]?.usage, {
-    for_open_or_capture: "omit_version_parameter",
-    note: "Current version: omit the version parameter on yfy_open/yfy_capture."
+    for_download: "omit_version_parameter",
+    note: "Current version: omit the version parameter on yfy_download."
   });
   assert.equal(versions[1]?.ref, VERSION_10_7);
   assert.deepEqual(versions[1]?.usage, {
-    for_open_or_capture: "pass_version_ref",
-    note: "Historical version: pass this ref as the version parameter on yfy_open/yfy_capture."
+    for_download: "pass_version_ref",
+    note: "Historical version: pass this ref as the version parameter on yfy_download."
+  });
+  assert.equal(versions[2]?.download_ready, false);
+  assert.equal(versions[2]?.ref, null);
+  assert.deepEqual(versions[2]?.usage, {
+    for_download: "unavailable",
+    note: "Historical version lacks a Provider version ID and cannot be selected safely."
   });
   assert.deepEqual(result.structuredContent?.version_selection_rules, {
-    current: "Omit the version parameter on yfy_open/yfy_capture for the current version. Do not invent a version ref.",
-    historical: "Copy the historical version ref from this result and pass it as the version parameter on yfy_open/yfy_capture."
+    current: "Omit the version parameter on yfy_download for the current version. Do not invent a version ref.",
+    historical: "Copy the historical version ref from this result and pass it as the version parameter on yfy_download."
   });
 });
 
@@ -620,7 +643,7 @@ test("workspace membership distinguishes query and assert semantics", async () =
       ? response(endpoint, { id: 501, name: "Root", type: "folder", space: { id: 1, type: "department" } })
       : response(endpoint, { id: 10, name: "outside.pdf", type: "file", parent_folder_id: 2, path: [{ id: 2, name: "Other", type: "folder" }], space: { id: 2, type: "department" } }) }
   } as unknown as AppRuntime;
-  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  registerWorkspaceTools(server as unknown as McpServer, runtime);
   const query = await call(server, "yfy_membership_check", { file: FILE_10, workspace: WORKSPACE_TENDER, mode: "query" });
   assert.equal(query.structuredContent?.membership, "outside");
   assert.equal(query.structuredContent?.path_basis, "configured_workspace_root");
@@ -630,7 +653,7 @@ test("workspace membership distinguishes query and assert semantics", async () =
   const interpretation = query.structuredContent?.agent_interpretation as Record<string, unknown>;
   assert.equal(interpretation.may_claim_inside, false);
   assert.equal(interpretation.may_claim_outside, true);
-  assert.equal(interpretation.may_capture, false);
+  assert.equal(interpretation.may_download, false);
   assert.deepEqual((query.structuredContent?.diagnostics as Record<string, unknown>).observed_file_space, { id: "2", type: "department" });
   assert.deepEqual((query.structuredContent?.diagnostics as Record<string, unknown>).observed_root_space, { id: "1", type: "department" });
   assert.equal(query.isError, undefined);
@@ -640,7 +663,7 @@ test("workspace membership distinguishes query and assert semantics", async () =
   assert.equal(errorCategory(assertion), "authorization");
   const diagnostics = JSON.parse(assertion.content?.find((entry) => entry.type === "text")?.text ?? "{}") as { error?: { diagnostics?: Record<string, unknown> } };
   assert.equal(diagnostics.error?.diagnostics?.reason, "different_space_id");
-  assert.equal((diagnostics.error?.diagnostics?.agent_interpretation as Record<string, unknown> | undefined)?.may_capture, false);
+  assert.equal((diagnostics.error?.diagnostics?.agent_interpretation as Record<string, unknown> | undefined)?.may_download, false);
 });
 
 test("workspace membership marks different space types as outside", async () => {
@@ -652,14 +675,14 @@ test("workspace membership marks different space types as outside", async () => 
       ? response(endpoint, { id: 501, name: "Root", type: "folder", space: { type: "department" } })
       : response(endpoint, { id: 10, name: "personal.svg", type: "file", parent_folder_id: 0, space: { type: "personal" } }) }
   } as unknown as AppRuntime;
-  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  registerWorkspaceTools(server as unknown as McpServer, runtime);
   const query = await call(server, "yfy_membership_check", { file: FILE_10, workspace: WORKSPACE_TENDER, mode: "query" });
   assert.equal(query.structuredContent?.membership, "outside");
   assert.equal((query.structuredContent?.diagnostics as Record<string, unknown>).reason, "different_space_type");
   const interpretation = query.structuredContent?.agent_interpretation as Record<string, unknown>;
   assert.equal(interpretation.may_claim_outside, true);
   assert.equal(interpretation.may_claim_inside, false);
-  assert.equal(interpretation.may_capture, false);
+  assert.equal(interpretation.may_download, false);
 });
 
 test("workspace membership reports unavailable when ancestry is incomplete", async () => {
@@ -669,14 +692,14 @@ test("workspace membership reports unavailable when ancestry is incomplete", asy
     access: { resolveWorkspaceRef: () => ({ ...access(), scope: { id: "tender", rootFolderId: "501", accessContext: "default", tags: [] } }) },
     gateway: { getUser: async (endpoint: string) => response(endpoint, { id: 10, name: "unknown.pdf", type: "file", parent_folder_id: 2 }) }
   } as unknown as AppRuntime;
-  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  registerWorkspaceTools(server as unknown as McpServer, runtime);
   const query = await call(server, "yfy_membership_check", { file: FILE_10, workspace: WORKSPACE_TENDER, mode: "query" });
   assert.equal(query.structuredContent?.membership, "unavailable");
   assert.equal((query.structuredContent?.diagnostics as Record<string, unknown>).reason, "missing_ancestor_chain");
   const interpretation = query.structuredContent?.agent_interpretation as Record<string, unknown>;
   assert.equal(interpretation.may_claim_inside, false);
   assert.equal(interpretation.may_claim_outside, false);
-  assert.equal(interpretation.may_capture, false);
+  assert.equal(interpretation.may_download, false);
   const nextSteps = interpretation.next_steps as string[];
   assert.match(nextSteps[0] ?? "", /Do not re-run yfy_membership_check on the same file ref/i);
   assert.match(nextSteps.join(" "), /yfy_browse|yfy_resolve/);
@@ -689,7 +712,7 @@ test("workspace membership reports unavailable when ancestry is incomplete", asy
   assert.equal(diagnostics.error?.suggested_action, nextSteps[0]);
 });
 
-test("workspace membership rejects conflicting path and storage-space evidence", async () => {
+test("workspace membership rejects conflicting path and storage-space signals", async () => {
   const server = new FakeServer();
   const runtime = {
     config: { toolsets: ["workspace"] },
@@ -698,20 +721,20 @@ test("workspace membership rejects conflicting path and storage-space evidence",
       ? response(endpoint, { id: 501, name: "Root", type: "folder", space: { id: 1, type: "Department" } })
       : response(endpoint, { id: 10, name: "conflict.pdf", type: "file", parent_folder_id: 501, path: [{ id: 501, name: "Root", type: "folder" }], space: { id: 2, type: "department" } }) }
   } as unknown as AppRuntime;
-  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  registerWorkspaceTools(server as unknown as McpServer, runtime);
   const result = await call(server, "yfy_membership_check", { file: FILE_10, workspace: WORKSPACE_TENDER, mode: "query" });
   assert.equal(result.structuredContent?.membership, "unavailable");
-  assert.equal((result.structuredContent?.diagnostics as Record<string, unknown>).reason, "conflicting_membership_evidence");
+  assert.equal((result.structuredContent?.diagnostics as Record<string, unknown>).reason, "conflicting_membership_signals");
   const interpretation = result.structuredContent?.agent_interpretation as Record<string, unknown>;
   assert.equal(interpretation.may_claim_inside, false);
   assert.equal(interpretation.may_claim_outside, false);
-  assert.equal(interpretation.may_capture, false);
+  assert.equal(interpretation.may_download, false);
   const nextSteps = interpretation.next_steps as string[];
-  assert.match(nextSteps[0] ?? "", /Stop automatic capture/i);
+  assert.match(nextSteps[0] ?? "", /Stop automatic download/i);
   assert.match(nextSteps.join(" "), /diagnostics/i);
 });
 
-test("workspace validation keeps missing evidence unavailable instead of invalid", async () => {
+test("workspace validation keeps missing metadata unavailable instead of invalid", async () => {
   const server = new FakeServer();
   const runtime = {
     config: { toolsets: ["workspace"] },
@@ -720,7 +743,7 @@ test("workspace validation keeps missing evidence unavailable instead of invalid
       ? response(endpoint, { name: "Root", type: "folder", is_deleted: false, in_trash: false })
       : response(endpoint, { files: [], folders: [], page_count: 1 }) }
   } as unknown as AppRuntime;
-  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
+  registerWorkspaceTools(server as unknown as McpServer, runtime);
   const result = await call(server, "yfy_workspace_validate", { workspace: WORKSPACE_TENDER, expected_path: ["Root"] });
   assert.equal(result.structuredContent?.verdict, "unavailable");
   const checks = result.structuredContent?.checks as Record<string, unknown>;
@@ -763,7 +786,7 @@ test("inventory search returns a signed context-bound cursor", async () => {
       },
       summary: () => ({ terminal: true, completeness: { pagination_complete: true, safe_to_claim_absence: true, scope: "observed_subtree", consistency_level: "best_effort_complete_observation", incomplete_reasons: [] } }),
       manifest: async () => ({ completeness: { pagination_complete: true, safe_to_claim_absence: true, scope: "observed_subtree", consistency_level: "best_effort_complete_observation", incomplete_reasons: [] }, observation_digest: "digest" }),
-      storageStats: () => ({ database_bytes: 0, logical_bytes: 0, wal_bytes: 0 })
+      storageStats: async () => ({ database_bytes: 0, logical_bytes: 0, wal_bytes: 0 })
     }
   } as unknown as AppRuntime;
   registerInventoryTools(server as unknown as McpServer, runtime);
@@ -888,6 +911,7 @@ test("inventory refs preserve non-default identity across instances and release 
 test("inventory refs become stale when the configured workspace root changes", async () => {
   const server = new FakeServer();
   let configuredRoot = "501";
+  let storageFails = false;
   let state!: Record<string, unknown>;
   const runtime = {
     config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["inventory"] },
@@ -905,7 +929,10 @@ test("inventory refs become stale when the configured workspace root changes", a
       },
       get: async () => state,
       summary: () => ({ terminal: true, completeness: { pagination_complete: true, safe_to_claim_absence: true, scope: "entire_observed_accessible_scope", consistency_level: "best_effort_complete_observation", incomplete_reasons: [] } }),
-      storageStats: () => ({ database_bytes: 0, logical_bytes: 0, wal_bytes: 0 })
+      storageStats: async () => {
+        if (storageFails) throw new Error("storage stats unavailable");
+        return { database_bytes: 0, logical_bytes: 0, wal_bytes: 0 };
+      }
     }
   } as unknown as AppRuntime;
   registerInventoryTools(server as unknown as McpServer, runtime);
@@ -913,13 +940,17 @@ test("inventory refs become stale when the configured workspace root changes", a
   const inventory = String(created.structuredContent?.inventory);
   const before = await call(server, "yfy_inventory_get", { inventory });
   assert.notEqual(before.isError, true, JSON.stringify(before.content));
+  storageFails = true;
+  const storageFailure = await call(server, "yfy_inventory_get", { inventory });
+  assert.equal(storageFailure.isError, true);
+  storageFails = false;
   configuredRoot = "999";
   const after = await call(server, "yfy_inventory_get", { inventory });
   assert.equal(errorCode(after), "YFY_INVENTORY_STALE");
   assert.equal(errorCategory(after), "stale_state");
 });
 
-test("inventory root_folder rejects conflicting path and storage-space evidence", async () => {
+test("inventory root_folder rejects conflicting path and storage-space signals", async () => {
   const server = new FakeServer();
   const runtime = {
     config: { clientSecret: "secret", maxPageCapacity: 500, toolsets: ["inventory"] },
@@ -934,7 +965,7 @@ test("inventory root_folder rejects conflicting path and storage-space evidence"
   registerInventoryTools(server as unknown as McpServer, runtime);
   const result = await call(server, "yfy_inventory_create", { workspace: WORKSPACE_SCOPE, root_folder: FOLDER_10, refresh: { mode: "force_refresh" }, limits: { max_item_depth: 20, max_items: 50000 } });
   assert.equal(errorCode(result), "YFY_WORKSPACE_MEMBERSHIP_UNAVAILABLE");
-  assert.match(JSON.stringify(result.content), /conflicting_membership_evidence/);
+  assert.match(JSON.stringify(result.content), /conflicting_membership_signals/);
 });
 
 test("inventory cancel reports the terminal state won by a concurrent completion", async () => {
@@ -971,357 +1002,461 @@ test("inventory cancel reports the terminal state won by a concurrent completion
   assert.equal(result.structuredContent?.status, "complete");
 });
 
-test("ordinary open does not require workspace ancestry metadata", async () => {
+test("yfy_download returns a verified stdio local_path and release handle", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-bin-"));
+  const body = "pdf-bytes!";
+  const hashes = contentHashes(body);
+  const source = path.join(root, "source.pdf");
+  await fs.writeFile(source, body);
+  const { downloads, tempStorage } = downloadHarness(root);
   const server = new FakeServer();
   const runtime = {
-    config: { toolsets: ["drive"], maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, transport: "stdio" },
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false },
     gateway: {
       context: access,
       getUser: async (endpoint: string) => endpoint.endsWith("/versions")
-        ? response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 9, modified_at: 1 }] })
+        ? response(endpoint, { file_versions: [{ current: true, sha1: hashes.sha1, size: hashes.sizeBytes, modified_at: 1 }] })
         : endpoint.endsWith("/download_v2")
           ? response(endpoint, { download_url: "https://download.example/file" })
-          : response(endpoint, { id: 10, name: "ordinary.pdf", type: "file", size: 9, modified_at: 1, file_version_key: "v1" })
+          : response(endpoint, { id: 10, name: "ordinary.pdf", type: "file", size: hashes.sizeBytes, modified_at: 1, file_version_key: "v1" })
     },
-    client: { downloadFromUrlToTemp: async () => ({ fileName: "ordinary.pdf", tempPath: "C:/temp/ordinary.pdf", sha1: "a".repeat(40), sha256: "b".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
-    evidence: { register: () => `yfy://evidence/${"5".repeat(48)}` }
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "ordinary.pdf", tempPath: source, ...hashes, meta: response("/download", {}).meta }) },
+    downloads,
+    tempStorage
   } as unknown as AppRuntime;
-  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_open", { file: FILE_10 });
-  assert.notEqual(result.isError, true, JSON.stringify(result.content));
-  assert.equal(((result.structuredContent?.assurance as Record<string, unknown>).checks as Record<string, unknown>).workspace_membership, "not_applicable");
-  assert.equal(result.structuredContent?.must_release, true);
-  const delivery = result.structuredContent?.content_delivery as Record<string, unknown>;
-  assert.equal(delivery.host_auto_fetch_not_guaranteed, true);
-  assert.equal(delivery.mode, "binary_no_preview");
-  assert.equal(delivery.resource_fetch_required, true);
-  assert.equal(delivery.embedded_resource_in_tool_result, false);
-  assert.equal(delivery.agent_readable, false);
-  assert.equal(delivery.human_attachment_only, true);
-  assert.equal(delivery.model_has_body_text, false);
-  assert.equal(delivery.body_text_basis, "none");
-  assert.match(String(delivery.next_step), /does not mean the model has read the body text/i);
-  assert.match(String(delivery.next_step), /agent_readable=false/);
-  assert.match(String(delivery.next_step), /yfy_resource_release/);
-  const resource = result.structuredContent?.resource as Record<string, unknown>;
-  assert.equal(resource.must_release, true);
-  assert.equal(resource.media_type, "application/pdf");
-  assert.equal(resource.media_type_source, "file_extension");
-  const nextAction = result.structuredContent?.next_action as Record<string, unknown>;
-  assert.equal(nextAction.tool, "yfy_resource_release");
-  assert.equal((nextAction.arguments as Record<string, unknown>).resource_uri, resource.resource_uri);
-  const lifecycle = result.structuredContent?.lifecycle as Record<string, unknown>;
-  assert.equal(lifecycle.must_release, true);
-  assert.equal(lifecycle.release_tool, "yfy_resource_release");
-  assert.equal(lifecycle.resource_uri, resource.resource_uri);
-  assert.equal(lifecycle.release_is_idempotent, true);
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_download", { file: FILE_10 });
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    assert.equal(result.structuredContent?.status, "ready");
+    const download = result.structuredContent?.download as Record<string, unknown>;
+    assert.equal(typeof download.local_path, "string");
+    assert.equal(download.fetch_url, null);
+    assert.equal(download.media_type, "application/pdf");
+    assert.equal(download.sha256, hashes.sha256);
+    assert.equal(await fs.readFile(String(download.local_path), "utf8"), body);
+    assert.equal(result.structuredContent?.preview, null);
+    assert.equal((result.structuredContent?.cleanup as Record<string, unknown>).release_tool, "yfy_download_release");
+    const released = await call(server, "yfy_download_release", { download_id: download.download_id });
+    assert.equal(released.structuredContent?.status, "released");
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
 });
 
-test("open returns inline preview for small text and svg media types", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-open-preview-"));
-  const svgPath = path.join(dir, "icon.svg");
-  const svgBody = `<svg xmlns="http://www.w3.org/2000/svg"><text>${"x".repeat(16_000)}</text></svg>`;
-  await fs.writeFile(svgPath, svgBody);
-  const registry = new EvidenceArtifactRegistry(60, 1024 * 1024);
+test("yfy_download text preview is opt-in and bounded", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-txt-"));
+  const body = "hello preview";
+  const source = path.join(root, "notes.txt");
+  await fs.writeFile(source, body);
+  const hashes = contentHashes(body);
+  const { downloads, tempStorage } = downloadHarness(root);
   const server = new FakeServer();
   const runtime = {
-    config: { toolsets: ["drive"], maxEvidenceResourceBytes: 1024 * 1024, tempFileTtlSeconds: 60, transport: "stdio" },
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false, textPreviewMaxBytes: 32768 },
     gateway: {
       context: access,
       getUser: async (endpoint: string) => endpoint.endsWith("/versions")
-        ? response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: svgBody.length, modified_at: 1 }] })
+        ? response(endpoint, { file_versions: [{ current: true, sha1: hashes.sha1, size: body.length, modified_at: 1 }] })
         : endpoint.endsWith("/download_v2")
           ? response(endpoint, { download_url: "https://download.example/file" })
-          : response(endpoint, { id: 10, name: "icon.svg", type: "file", size: svgBody.length, modified_at: 1, file_version_key: "v1" })
+          : response(endpoint, { id: 10, name: "notes.txt", type: "file", size: body.length, modified_at: 1, file_version_key: "v1" })
     },
     client: {
       downloadFromUrlToTemp: async () => ({
-        fileName: "icon.svg",
-        tempPath: svgPath,
-        sha1: "a".repeat(40),
-        sha256: crypto.createHash("sha256").update(svgBody).digest("hex"),
-        sizeBytes: svgBody.length,
-        contentType: "application/octet-stream",
+        fileName: "notes.txt",
+        tempPath: source,
+        ...hashes,
+        contentType: "text/plain",
         meta: response("/download", {}).meta
       })
     },
-    evidence: registry
+    downloads,
+    tempStorage
   } as unknown as AppRuntime;
   try {
-    registerWorkspaceContentTools(server as unknown as McpServer, runtime);
-    const result = await call(server, "yfy_open", { file: FILE_10 });
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_download", { file: FILE_10, include_text_preview: true });
     assert.notEqual(result.isError, true, JSON.stringify(result.content));
-    assert.equal(result.structuredContent?.must_release, true);
-    const resource = result.structuredContent?.resource as Record<string, unknown>;
-    assert.equal(resource.media_type, "image/svg+xml");
-    assert.equal(resource.media_type_source, "file_extension");
-    assert.equal(resource.preview_text, svgBody);
-    assert.equal(resource.preview_complete, true);
-    assert.equal(resource.preview_bytes, Buffer.byteLength(svgBody));
-    const delivery = result.structuredContent?.content_delivery as Record<string, unknown>;
-    assert.equal(delivery.mode, "inline_preview");
-    assert.equal(delivery.resource_fetch_required, false);
-    assert.equal(delivery.embedded_resource_in_tool_result, true);
-    assert.equal(delivery.preview_charset, "utf-8");
-    assert.equal(delivery.agent_readable, true);
-    assert.equal(delivery.human_attachment_only, false);
-    assert.equal(delivery.model_has_body_text, true);
-    assert.equal(delivery.body_text_basis, "inline_preview");
-    assert.match(String(delivery.next_step), /yfy_resource_release/);
-    const nextAction = result.structuredContent?.next_action as Record<string, unknown>;
-    assert.equal(nextAction.tool, "yfy_resource_release");
-    assert.equal((nextAction.arguments as Record<string, unknown>).resource_uri, resource.resource_uri);
-    assert.equal((result.structuredContent?.lifecycle as Record<string, unknown>).release_is_idempotent, true);
-    const embedded = result.content?.find((entry) => entry.type === "resource");
-    assert.equal(embedded?.resource?.text, svgBody);
-    assert.match(String(embedded?.resource?.uri), /^yfy:\/\/evidence\//);
-    const textEnvelope = JSON.parse(result.content?.find((entry) => entry.type === "text")?.text ?? "{}") as {
-      text_delivery?: { mode?: string; continuation_ready?: boolean };
-      control?: { next_action?: { tool?: string }; resource?: { resource_uri?: string } };
-    };
-    assert.ok(["compact_preview", "control_only"].includes(String(textEnvelope.text_delivery?.mode)));
-    assert.equal(textEnvelope.control?.next_action?.tool, "yfy_resource_release");
-    assert.equal(textEnvelope.control?.resource?.resource_uri, resource.resource_uri);
-    const disabled = await call(server, "yfy_open", { file: FILE_10, include_text_preview: false });
-    const disabledDelivery = disabled.structuredContent?.content_delivery as Record<string, unknown>;
-    assert.equal(disabledDelivery.mode, "resource_link_only");
-    assert.equal(disabledDelivery.reason, "preview_disabled_by_request");
-    assert.equal(disabledDelivery.agent_readable, false);
-    assert.equal(disabledDelivery.human_attachment_only, false);
-    assert.equal(disabledDelivery.model_has_body_text, false);
-    assert.equal(disabledDelivery.body_text_basis, "none");
-    assert.equal((disabled.structuredContent?.resource as Record<string, unknown>).preview_text, undefined);
-    assert.equal(disabled.content?.some((entry) => entry.type === "resource"), false);
+    const preview = result.structuredContent?.preview as Record<string, unknown>;
+    assert.equal(preview.kind, "utf8_text");
+    assert.equal(preview.text, body);
+    assert.equal(typeof (result.structuredContent?.download as Record<string, unknown>).local_path, "string");
   } finally {
-    await registry.close().catch(() => undefined);
-    await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }
 });
 
-test("open refuses an inline preview whose bytes no longer match the registered digest", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-open-preview-drift-"));
-  const tempPath = path.join(dir, "changed.svg");
-  const changed = "<svg>changed</svg>";
-  await fs.writeFile(tempPath, changed);
-  const registry = new EvidenceArtifactRegistry(60, 1024 * 1024);
+test("yfy_download enforces workspace membership for a historical version", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-hist-"));
+  const body = "history";
+  const hashes = contentHashes(body);
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  let requestedVersion: unknown;
+  const source = path.join(root, "history.pdf");
+  await fs.writeFile(source, body);
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false },
+    access: { resolveWorkspaceRef: scopedAccess },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string, _context: string, params: Record<string, unknown> = {}) => {
+        if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [
+          { current: true, sha1: "a".repeat(40), size: 10, modified_at: 2 },
+          { id: 7, current: false, sha1: hashes.sha1, size: hashes.sizeBytes, modified_at: 1 }
+        ] });
+        if (endpoint.endsWith("/download_v2")) { requestedVersion = params.version; return response(endpoint, { download_url: "https://download.example/file" }); }
+        return response(endpoint, { id: 10, name: "report.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
+      }
+    },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "history.pdf", tempPath: source, ...hashes, meta: response("/download", {}).meta }) },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_download", { workspace: WORKSPACE_SCOPE, file: FILE_10, version: VERSION_10_7 });
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    assert.equal(requestedVersion, "7");
+    assert.equal((result.structuredContent?.workspace as Record<string, unknown>).membership, "inside");
+    assert.equal(typeof (result.structuredContent?.download as Record<string, unknown>).local_path, "string");
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download preserves historical Provider version ids beyond MAX_SAFE_INTEGER", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-large-version-"));
+  const body = "history";
+  const hashes = contentHashes(body);
+  const source = path.join(root, "history.pdf");
+  const providerVersionId = "90071992547409931234";
+  const versionRef = formatVersionRef(FILE_10, providerVersionId);
+  let requestedVersion: unknown;
+  await fs.writeFile(source, body);
+  const { downloads, tempStorage } = downloadHarness(root);
   const server = new FakeServer();
   const runtime = {
-    config: { toolsets: ["drive"], maxEvidenceResourceBytes: 1024 * 1024, tempFileTtlSeconds: 60, transport: "stdio" },
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false },
+    access: { resolveWorkspaceRef: scopedAccess },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string, _context: string, params: Record<string, unknown> = {}) => {
+        if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [
+          { current: true, sha1: "a".repeat(40), size: 10, modified_at: 2 },
+          { id: providerVersionId, current: false, sha1: hashes.sha1, size: hashes.sizeBytes, modified_at: 1 }
+        ] });
+        if (endpoint.endsWith("/download_v2")) { requestedVersion = params.version; return response(endpoint, { download_url: "https://download.example/file" }); }
+        return response(endpoint, { id: 10, name: "report.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
+      }
+    },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "history.pdf", tempPath: source, ...hashes, meta: response("/download", {}).meta }) },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_download", { workspace: WORKSPACE_SCOPE, file: FILE_10, version: versionRef });
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    assert.equal(requestedVersion, providerVersionId);
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download retries a failed transfer stream with a fresh ticket", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-stream-retry-"));
+  const body = "retried";
+  const hashes = contentHashes(body);
+  const source = path.join(root, "retried.pdf");
+  let ticketCalls = 0;
+  let transferCalls = 0;
+  const timeoutBudgets: number[] = [];
+  const notifications: unknown[] = [];
+  await fs.writeFile(source, body);
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false, downloadWallTimeoutMs: 5000 },
     gateway: {
       context: access,
       getUser: async (endpoint: string) => endpoint.endsWith("/versions")
-        ? response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: changed.length, modified_at: 1 }] })
+        ? response(endpoint, { file_versions: [{ current: true, sha1: hashes.sha1, size: hashes.sizeBytes, modified_at: 1 }] })
         : endpoint.endsWith("/download_v2")
-          ? response(endpoint, { download_url: "https://download.example/file" })
-          : response(endpoint, { id: 10, name: "changed.svg", type: "file", size: changed.length, modified_at: 1, file_version_key: "v1" })
+          ? (ticketCalls += 1, response(endpoint, { download_url: `https://download.example/file-${ticketCalls}` }))
+          : response(endpoint, { id: 10, name: "retried.pdf", type: "file", size: hashes.sizeBytes, modified_at: 1, file_version_key: "v1" })
     },
-    client: { downloadFromUrlToTemp: async () => ({ fileName: "changed.svg", tempPath, sha1: "a".repeat(40), sha256: "b".repeat(64), sizeBytes: changed.length, contentType: "image/svg+xml", meta: response("/download", {}).meta }) },
-    evidence: registry
+    client: {
+      downloadFromUrlToTemp: async (_url: string, options: { onProgress?: (bytes: number, totalBytes?: number) => void; timeoutMs?: number }) => {
+        transferCalls += 1;
+        timeoutBudgets.push(options.timeoutMs ?? 0);
+        if (transferCalls === 1) {
+          options.onProgress?.(5, hashes.sizeBytes);
+          await new Promise((resolve) => setTimeout(resolve, 1050));
+          throw new YifangyunError("stream reset", { code: "YFY_DOWNLOAD_STREAM_FAILED", phase: "download_stream", retryable: true });
+        }
+        options.onProgress?.(1, hashes.sizeBytes);
+        options.onProgress?.(hashes.sizeBytes, hashes.sizeBytes);
+        return { fileName: "retried.pdf", tempPath: source, ...hashes, meta: response("/download", {}).meta };
+      }
+    },
+    downloads,
+    tempStorage
   } as unknown as AppRuntime;
   try {
-    registerWorkspaceContentTools(server as unknown as McpServer, runtime);
-    const result = await call(server, "yfy_open", { file: FILE_10 });
-    assert.equal(result.isError, true);
-    assert.equal(errorCode(result), "YFY_EVIDENCE_ARTIFACT_INTEGRITY_FAILED");
-    await assert.rejects(() => fs.stat(tempPath), { code: "ENOENT" });
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const result = await server.tools.get("yfy_download")!({ file: FILE_10 }, {
+      _meta: { progressToken: "download-progress" },
+      signal: new AbortController().signal,
+      sendNotification: async (notification) => { notifications.push(notification); }
+    });
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    assert.equal(ticketCalls, 2);
+    assert.equal(transferCalls, 2);
+    assert.ok(timeoutBudgets[1]! < timeoutBudgets[0]!);
+    assert.deepEqual(notifications.map((notification) => ((notification as { params: { progress: number } }).params.progress)), [5, hashes.sizeBytes]);
   } finally {
-    await registry.close().catch(() => undefined);
-    await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }
 });
 
-test("evidence capture rejects a current file version key for historical content", async () => {
+test("yfy_download enforces one wall timeout across all stream attempts", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-wall-timeout-"));
+  const body = "timeout";
+  const hashes = contentHashes(body);
+  let ticketCalls = 0;
+  let transferCalls = 0;
+  const { downloads, tempStorage } = downloadHarness(root);
   const server = new FakeServer();
-  const runtime = { config: { toolsets: ["evidence"] }, access: { resolveWorkspaceRef: scopedAccess } } as unknown as AppRuntime;
-  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_capture", { workspace: WORKSPACE_SCOPE, file: FILE_10, version: VERSION_10_7, expected: { file_version_key: "current-key" } });
-  assert.equal(result.isError, true);
-  assert.equal(errorCode(result), "YFY_INPUT_INVALID");
-});
-
-test("evidence capture validates a historical version with the reverse-ordinal strategy", async () => {
-  const server = new FakeServer();
-  let requestedVersion: unknown;
   const runtime = {
-    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, transport: "stdio" },
-    access: { resolveWorkspaceRef: scopedAccess },
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false, downloadWallTimeoutMs: 30 },
     gateway: {
-      getUser: async (endpoint: string, _context: string, params: Record<string, unknown>) => {
-        if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [
-          { current: true, sha1: "a".repeat(40), size: 10, modified_at: 2 },
-          { id: 7, current: false, sha1: "b".repeat(40), size: 9, modified_at: 1 }
-        ] });
-        if (endpoint.endsWith("/download_v2")) { requestedVersion = params.version; return response(endpoint, { download_url: "https://download.example/file" }); }
-        return response(endpoint, { id: 10, name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
+      context: access,
+      getUser: async (endpoint: string) => endpoint.endsWith("/versions")
+        ? response(endpoint, { file_versions: [{ current: true, sha1: hashes.sha1, size: hashes.sizeBytes, modified_at: 1 }] })
+        : endpoint.endsWith("/download_v2")
+          ? (ticketCalls += 1, response(endpoint, { download_url: `https://download.example/file-${ticketCalls}` }))
+          : response(endpoint, { id: 10, name: "timeout.pdf", type: "file", size: hashes.sizeBytes, modified_at: 1, file_version_key: "v1" })
+    },
+    client: {
+      downloadFromUrlToTemp: async () => {
+        transferCalls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        throw new YifangyunError("stream reset", { code: "YFY_DOWNLOAD_STREAM_FAILED", phase: "download_stream", retryable: true });
       }
     },
-    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/evidence.pdf", sha1: "b".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
-    evidence: { register: () => `yfy://evidence/${"1".repeat(48)}` }
-  } as unknown as AppRuntime;
-  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_capture", { workspace: WORKSPACE_SCOPE, file: FILE_10, version: VERSION_10_7 });
-  assert.notEqual(result.isError, true);
-  assert.equal(requestedVersion, 1);
-  assert.equal((result.structuredContent?.selection as Record<string, unknown>).download_strategy, "historical_reverse_ordinal");
-  assert.deepEqual((result.structuredContent?.provenance as Array<Record<string, unknown>>).map((entry) => entry.operation), [
-    "file_metadata_before", "workspace_root_metadata_before", "version_history_before", "download_ticket", "content_download", "version_history_after", "file_metadata_after", "workspace_root_metadata_after"
-  ]);
-});
-
-test("evidence capture falls back to a validated historical version-id strategy", async () => {
-  const server = new FakeServer();
-  const requestedVersions: unknown[] = [];
-  let selectedVersion: unknown;
-  const runtime = {
-    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, transport: "stdio" },
-    access: { resolveWorkspaceRef: scopedAccess },
-    gateway: {
-      getUser: async (endpoint: string, _context: string, params: Record<string, unknown>) => {
-        if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 10 }, { id: 7, current: false, sha1: "b".repeat(40), size: 9 }, { id: 8, current: false, sha1: "e".repeat(40), size: 8 }] });
-        if (endpoint.endsWith("/download_v2")) { selectedVersion = params.version; requestedVersions.push(params.version); return response(endpoint, { download_url: "https://download.example/file" }); }
-        return response(endpoint, { id: "10", name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
-      }
-    },
-    client: { downloadFromUrlToTemp: async () => selectedVersion === "7"
-      ? ({ fileName: "evidence.pdf", tempPath: "C:/temp/history.pdf", sha1: "b".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta })
-      : ({ fileName: "evidence.pdf", tempPath: "C:/temp/current.pdf", sha1: "a".repeat(40), sha256: "d".repeat(64), sizeBytes: 10, meta: response("/download", {}).meta }) },
-    evidence: { register: () => `yfy://evidence/${"2".repeat(48)}` }
-  } as unknown as AppRuntime;
-  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_capture", { workspace: WORKSPACE_SCOPE, file: FILE_10, version: VERSION_10_7 });
-  assert.notEqual(result.isError, true, JSON.stringify(result.content));
-  assert.deepEqual(requestedVersions, [2, 1, "7"]);
-  assert.equal((result.structuredContent?.selection as Record<string, unknown>).download_strategy, "historical_version_id");
-});
-
-test("evidence capture returns provider-contract diagnostics when history is unavailable", async () => {
-  const server = new FakeServer();
-  const runtime = {
-    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, transport: "stdio" }, access: { resolveWorkspaceRef: scopedAccess },
-    gateway: { getUser: async (endpoint: string) => {
-      if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [
-        { current: true, sha1: "a".repeat(40), size: 10 },
-        { id: 7, current: false, sha1: "b".repeat(40), size: 9 }
-      ] });
-      if (endpoint.endsWith("/download_v2")) return response(endpoint, { download_url: "https://download.example/file" });
-      return response(endpoint, { id: "10", name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
-    } },
-    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/current.pdf", sha1: "a".repeat(40), sha256: "d".repeat(64), sizeBytes: 10, meta: response("/download", {}).meta }) }
-  } as unknown as AppRuntime;
-  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_capture", { workspace: WORKSPACE_SCOPE, file: FILE_10, version: VERSION_10_7 });
-  assert.equal(result.isError, true);
-  assert.equal(errorCode(result), "YFY_HISTORICAL_CAPTURE_UNAVAILABLE");
-  assert.match(JSON.stringify(result.content), /provider_contract|attempts/);
-});
-
-test("historical evidence capture preserves authorization errors", async () => {
-  const server = new FakeServer();
-  let downloadRequests = 0;
-  const runtime = {
-    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, transport: "stdio" }, access: { resolveWorkspaceRef: scopedAccess },
-    gateway: { getUser: async (endpoint: string) => {
-      if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 10 }, { id: 7, current: false, sha1: "b".repeat(40), size: 9 }] });
-      if (endpoint.endsWith("/download_v2")) {
-        downloadRequests += 1;
-        throw new YifangyunError("forbidden", { code: "YFY_PERMISSION_DENIED", statusCode: 403 });
-      }
-      return response(endpoint, { id: "10", name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
-    } }
-  } as unknown as AppRuntime;
-  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_capture", { workspace: WORKSPACE_SCOPE, file: FILE_10, version: VERSION_10_7 });
-  assert.equal(result.isError, true);
-  assert.equal(errorCode(result), "YFY_PERMISSION_DENIED");
-  assert.equal(downloadRequests, 1);
-});
-
-test("current evidence capture rejects disagreement with current file metadata", async () => {
-  const server = new FakeServer();
-  const runtime = {
-    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, transport: "stdio" }, access: { resolveWorkspaceRef: scopedAccess },
-    gateway: { getUser: async (endpoint: string) => {
-      if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 9 }] });
-      if (endpoint.endsWith("/download_v2")) return response(endpoint, { download_url: "https://download.example/file" });
-      return response(endpoint, { id: "10", name: "evidence.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
-    } },
-    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/metadata-mismatch.pdf", sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
-    evidence: { register: () => { throw new Error("mismatched evidence must not be registered"); } }
-  } as unknown as AppRuntime;
-  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_capture", { workspace: WORKSPACE_SCOPE, file: FILE_10 });
-  assert.equal(result.isError, true);
-  assert.equal(errorCode(result), "YFY_EVIDENCE_DRIFT");
-  assert.match(JSON.stringify(result.content), /current_metadata_size/);
-});
-
-test("capture rolls back content when an expectation does not match", async () => {
-  const server = new FakeServer();
-  const runtime = {
-    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1024, tempFileTtlSeconds: 60, transport: "stdio" },
-    access: { resolveWorkspaceRef: scopedAccess },
-    gateway: {
-      getUser: async (endpoint: string) => {
-        if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 9, modified_at: 1 }] });
-        if (endpoint.endsWith("/download_v2")) return response(endpoint, { download_url: "https://download.example/file" });
-        return response(endpoint, { id: 10, name: "evidence.pdf", type: "file", size: 9, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
-      }
-    },
-    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.pdf", tempPath: "C:/temp/evidence.pdf", sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 9, meta: response("/download", {}).meta }) },
-    evidence: { register: () => { throw new Error("mismatched content must not be registered"); } }
-  } as unknown as AppRuntime;
-  registerWorkspaceContentTools(server as unknown as McpServer, runtime);
-  const result = await call(server, "yfy_capture", { file: FILE_10, workspace: WORKSPACE_SCOPE, expected: { sha256: "d".repeat(64) } });
-  assert.equal(result.isError, true);
-  assert.equal(errorCode(result), "YFY_EXPECTATION_MISMATCH");
-  assert.match(JSON.stringify(result.content), /actual|expected|sha256/);
-});
-
-test("large captured content returns a multipart resource without a local path", async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-http-evidence-large-"));
-  const tempPath = path.join(dir, "evidence.bin");
-  await fs.writeFile(tempPath, "content");
-  const server = new FakeServer();
-  const runtime = {
-    config: { toolsets: ["evidence"], maxEvidenceResourceBytes: 1, tempFileTtlSeconds: 60, transport: "http" }, access: { resolveWorkspaceRef: scopedAccess },
-    gateway: { getUser: async (endpoint: string) => endpoint.endsWith("/versions")
-      ? response(endpoint, { file_versions: [{ current: true, sha1: "a".repeat(40), size: 7, modified_at: 1 }] })
-      : endpoint.endsWith("/download_v2") ? response(endpoint, { download_url: "https://download.example/file" })
-        : response(endpoint, { id: 10, name: "evidence.bin", type: "file", size: 7, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] }) },
-    client: { downloadFromUrlToTemp: async () => ({ fileName: "evidence.xls", tempPath, sha1: "a".repeat(40), sha256: "c".repeat(64), sizeBytes: 7, contentType: "application/excel", meta: response("/download", {}).meta }) },
-    evidence: { register: () => `yfy://evidence/${"4".repeat(48)}` }
+    downloads,
+    tempStorage
   } as unknown as AppRuntime;
   try {
-    registerWorkspaceContentTools(server as unknown as McpServer, runtime);
-    const result = await call(server, "yfy_capture", { workspace: WORKSPACE_SCOPE, file: FILE_10 });
-    assert.notEqual(result.isError, true, JSON.stringify(result.content));
-    const resource = result.structuredContent?.resource as Record<string, unknown>;
-    assert.equal(resource.delivery, "multipart_resource");
-    assert.equal(resource.media_type, "application/vnd.ms-excel");
-    assert.equal(resource.media_type_source, "content_type");
-    assert.equal(resource.must_release, true);
-    assert.equal(resource.preview_text, undefined);
-    assert.match(String(resource.resource_uri), /\/manifest$/);
-    assert.equal(result.structuredContent?.must_release, true);
-    const delivery = result.structuredContent?.content_delivery as Record<string, unknown>;
-    assert.equal(delivery.mode, "multipart_manifest_only");
-    assert.equal(delivery.resource_fetch_required, true);
-    assert.equal(delivery.embedded_resource_in_tool_result, false);
-    assert.equal(delivery.host_auto_fetch_not_guaranteed, true);
-    assert.equal(delivery.agent_readable, false);
-    assert.equal(delivery.human_attachment_only, true);
-    assert.equal(delivery.model_has_body_text, false);
-    assert.equal(delivery.body_text_basis, "none");
-    const nextAction = result.structuredContent?.next_action as Record<string, unknown>;
-    assert.equal(nextAction.tool, "yfy_resource_release");
-    assert.equal((nextAction.arguments as Record<string, unknown>).resource_uri, resource.resource_uri);
-    assert.equal((result.structuredContent?.lifecycle as Record<string, unknown>).resource_uri, resource.resource_uri);
-    const link = result.content?.find((entry) => entry.type === "resource_link") as ({ mimeType?: string } | undefined);
-    assert.equal(link?.mimeType, "application/json");
-    assert.equal(resource.local_path, undefined);
-    assert.equal((await fs.stat(tempPath)).size, 7);
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_download", { file: FILE_10 });
+    assert.equal(result.isError, true);
+    assert.equal(errorCode(result), "YFY_PROVIDER_TIMEOUT");
+    assert.equal(ticketCalls, 1);
+    assert.equal(transferCalls, 1);
   } finally {
-    await fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download cancellation prevents a stream retry", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-retry-cancel-"));
+  const hashes = contentHashes("cancelled");
+  let ticketCalls = 0;
+  let transferCalls = 0;
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false, downloadWallTimeoutMs: 5000 },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => endpoint.endsWith("/versions")
+        ? response(endpoint, { file_versions: [{ current: true, sha1: hashes.sha1, size: hashes.sizeBytes, modified_at: 1 }] })
+        : endpoint.endsWith("/download_v2")
+          ? (ticketCalls += 1, response(endpoint, { download_url: "https://download.example/file" }))
+          : response(endpoint, { id: 10, name: "cancelled.pdf", type: "file", size: hashes.sizeBytes, modified_at: 1, file_version_key: "v1" })
+    },
+    client: {
+      downloadFromUrlToTemp: async (_url: string, options: { signal?: AbortSignal }) => {
+        transferCalls += 1;
+        await new Promise<void>((resolve) => options.signal?.addEventListener("abort", () => resolve(), { once: true }));
+        throw new YifangyunError("cancelled", { code: "YFY_DOWNLOAD_STREAM_FAILED", phase: "download_stream", retryable: true });
+      }
+    },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  const controller = new AbortController();
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const resultPromise = call(server, "yfy_download", { file: FILE_10 }, controller.signal);
+    setTimeout(() => controller.abort(), 20);
+    const result = await resultPromise;
+    assert.equal(result.isError, true);
+    assert.equal(ticketCalls, 1);
+    assert.equal(transferCalls, 1);
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download reports an unavailable historical original without substitution", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-unavail-"));
+  const source = path.join(root, "current.pdf");
+  await fs.writeFile(source, "current!!!");
+  const hashes = contentHashes("current!!!");
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true },
+    access: { resolveWorkspaceRef: scopedAccess },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => {
+        if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [
+          { current: true, sha1: "a".repeat(40), size: 10 },
+          { id: 7, current: false, sha1: "b".repeat(40), size: 9 }
+        ] });
+        if (endpoint.endsWith("/download_v2")) return response(endpoint, { download_url: "https://download.example/file" });
+        return response(endpoint, { id: "10", name: "report.pdf", type: "file", size: 10, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
+      }
+    },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "current.pdf", tempPath: source, ...hashes, meta: response("/download", {}).meta }) },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_download", { workspace: WORKSPACE_SCOPE, file: FILE_10, version: VERSION_10_7 });
+    assert.equal(result.isError, true);
+    assert.equal(errorCode(result), "YFY_HISTORICAL_DOWNLOAD_UNAVAILABLE");
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download rolls back when expectation does not match", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-exp-"));
+  const source = path.join(root, "report.pdf");
+  await fs.writeFile(source, "content9!");
+  const hashes = contentHashes("content9!");
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true },
+    access: { resolveWorkspaceRef: scopedAccess },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => {
+        if (endpoint.endsWith("/versions")) return response(endpoint, { file_versions: [{ current: true, sha1: hashes.sha1, size: hashes.sizeBytes, modified_at: 1 }] });
+        if (endpoint.endsWith("/download_v2")) return response(endpoint, { download_url: "https://download.example/file" });
+        return response(endpoint, { id: 10, name: "report.pdf", type: "file", size: 9, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] });
+      }
+    },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "document.pdf", tempPath: source, ...hashes, meta: response("/download", {}).meta }) },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_download", { file: FILE_10, workspace: WORKSPACE_SCOPE, expected: { sha256: "d".repeat(64) } });
+    assert.equal(result.isError, true);
+    assert.equal(errorCode(result), "YFY_EXPECTATION_MISMATCH");
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download_release is idempotent at the tool layer", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-rel-"));
+  const source = path.join(root, "a.bin");
+  await fs.writeFile(source, "abc");
+  const hashes = contentHashes("abc");
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  const runtime = {
+    config: { toolsets: ["drive"], tempFileTtlSeconds: 60, transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => endpoint.endsWith("/versions")
+        ? response(endpoint, { file_versions: [{ current: true, sha1: hashes.sha1, size: hashes.sizeBytes, modified_at: 1 }] })
+        : endpoint.endsWith("/download_v2")
+          ? response(endpoint, { download_url: "https://download.example/file" })
+          : response(endpoint, { id: 10, name: "a.bin", type: "file", size: 3, modified_at: 1, file_version_key: "v1" })
+    },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "a.bin", tempPath: source, ...hashes, meta: response("/download", {}).meta }) },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_download", { file: FILE_10 });
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    const id = (result.structuredContent?.download as Record<string, unknown>).download_id;
+    const first = await call(server, "yfy_download_release", { download_id: id });
+    assert.equal(first.structuredContent?.status, "released");
+    const second = await call(server, "yfy_download_release", { download_id: id });
+    assert.equal(second.structuredContent?.status, "already_unavailable");
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+});
+
+test("yfy_download on http transport returns fetch_url without local_path by default", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "yfy-dl-http-"));
+  const source = path.join(root, "report.bin");
+  await fs.writeFile(source, "content");
+  const hashes = contentHashes("content");
+  const { downloads, tempStorage } = downloadHarness(root);
+  const server = new FakeServer();
+  const runtime = {
+    config: {
+      toolsets: ["drive"],
+      tempFileTtlSeconds: 60,
+      transport: "http",
+      downloadExposeLocalPath: false,
+      downloadStagedHttpEnabled: true,
+      httpHost: "::1",
+      httpPort: 3000
+    },
+    access: { resolveWorkspaceRef: scopedAccess },
+    gateway: {
+      context: access,
+      getUser: async (endpoint: string) => endpoint.endsWith("/versions")
+        ? response(endpoint, { file_versions: [{ current: true, sha1: hashes.sha1, size: hashes.sizeBytes, modified_at: 1 }] })
+        : endpoint.endsWith("/download_v2") ? response(endpoint, { download_url: "https://download.example/file" })
+          : response(endpoint, { id: 10, name: "report.xls", type: "file", size: 7, modified_at: 1, file_version_key: "v1", path: [{ id: 501, name: "Root", type: "folder" }] })
+    },
+    client: { downloadFromUrlToTemp: async () => ({ fileName: "report.xls", tempPath: source, ...hashes, contentType: "application/excel", meta: response("/download", {}).meta }) },
+    downloads,
+    tempStorage
+  } as unknown as AppRuntime;
+  try {
+    registerDownloadTools(server as unknown as McpServer, runtime);
+    const result = await call(server, "yfy_download", { workspace: WORKSPACE_SCOPE, file: FILE_10 });
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    const download = result.structuredContent?.download as Record<string, unknown>;
+    assert.equal(download.local_path, null);
+    assert.match(String(download.fetch_url), /^http:\/\/\[::1\]:3000\/staged\/v1\/dl_[a-f0-9]{32}\//);
+    assert.equal(download.media_type, "application/vnd.ms-excel");
+    const record = downloads.get(String(download.download_id));
+    assert.ok(record);
+    assert.equal((await fs.stat(record!.localPath)).size, 7);
+  } finally {
+    await downloads.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }
 });
 
@@ -1356,9 +1491,9 @@ test("transfer tickets are current-only and claim metadata-only validation", asy
   assert.notEqual(result.isError, true, JSON.stringify(result.content));
   assert.equal((result.structuredContent?.selection as Record<string, unknown>).validation_level, "metadata_only");
   assert.equal(result.structuredContent?.usage_policy, "special_integration_only");
-  assert.equal(result.structuredContent?.not_for_evidence, true);
+  assert.equal(result.structuredContent?.not_for_verified_download, true);
   assert.equal(result.structuredContent?.do_not_echo_url, true);
-  assert.deepEqual(result.structuredContent?.preferred_alternatives, { ordinary_read: "yfy_open", workspace_evidence: "yfy_capture" });
+  assert.deepEqual(result.structuredContent?.preferred_alternatives, { ordinary_read: "yfy_download", workspace_bound: "yfy_download" });
   assert.equal(result.structuredContent?.download_url, "https://download.example/file");
   const text = result.content?.find((entry) => entry.type === "text")?.text ?? "";
   assert.ok(!text.includes("https://download.example/file"));

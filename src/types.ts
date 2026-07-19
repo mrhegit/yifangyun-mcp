@@ -7,7 +7,7 @@ export type IdLike = string | number;
 
 export type TokenSubjectType = "enterprise" | "user";
 
-export type Toolset = "drive" | "workspace" | "inventory" | "evidence" | "organization" | "collaboration" | "mutation" | "admin" | "transfer";
+export type Toolset = "drive" | "workspace" | "inventory" | "organization" | "collaboration" | "mutation" | "admin" | "transfer";
 export type WorkflowProfile = "tender";
 
 export interface AccessContext {
@@ -93,13 +93,23 @@ export interface AppConfig {
   httpSessionIdleSeconds?: number;
   maxConcurrentProviderRequests?: number;
   maxConcurrentRequestsPerIdentity?: number;
-  maxEvidenceResourceBytes?: number;
   maxRetryDelayMs?: number;
   maxStateBytes?: number;
   maxTempBytes?: number;
   snapshotConcurrency?: number;
   snapshotTtlSeconds?: number;
   stateDatabasePath: string;
+  textPreviewMaxBytes?: number;
+  /** When true, yfy_download returns server local_path. Default: true for stdio, false for http. */
+  downloadExposeLocalPath?: boolean;
+  /** When true, HTTP transport returns a staged fetch_url. Not supported by stdio transport. */
+  downloadStagedHttpEnabled?: boolean;
+  /** Max HTTP GET fetches per staged download. */
+  downloadStagedMaxFetches?: number;
+  /** Max concurrent verified staged responses retained in memory. */
+  downloadStagedMaxConcurrentReads?: number;
+  /** Public base URL for staged links, e.g. http://127.0.0.1:3000 */
+  downloadStagedPublicBaseUrl?: string;
   toolsets: Toolset[];
   transport?: "stdio" | "http";
   uploadRootDir?: string;
@@ -117,10 +127,4 @@ export interface TokenResponse {
 export interface TokenRecord {
   accessToken: string;
   expiresAtMs: number;
-}
-
-export interface ToolOutput extends Record<string, unknown> {
-  error?: JsonObject;
-  provenance?: JsonObject;
-  warnings?: string[];
 }

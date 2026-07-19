@@ -29,51 +29,52 @@ function loadDotEnv(filePath: string): void {
   }
 }
 
-test("live evidence tools download and hash a controlled file", { skip: process.env.YFY_LIVE_EVIDENCE_TESTS !== "enabled" }, async () => {
+test("live download tools stage a controlled file with hash", { skip: process.env.YFY_LIVE_DOWNLOAD_TESTS !== "enabled" }, async () => {
   const envPath = process.env.YFY_LIVE_ENV_PATH ?? path.resolve(process.cwd(), ".env");
   assert.ok(fs.existsSync(envPath), `Live env file not found: ${envPath}`);
   loadDotEnv(envPath);
   const fileId = process.env.YFY_LIVE_DOWNLOAD_FILE_ID;
-  assert.ok(fileId, "YFY_LIVE_DOWNLOAD_FILE_ID is required for live evidence testing.");
+  assert.ok(fileId, "YFY_LIVE_DOWNLOAD_FILE_ID is required for live download testing.");
   const rootFolderId = process.env.YFY_LIVE_DOWNLOAD_ROOT_FOLDER_ID;
-  assert.ok(rootFolderId, "YFY_LIVE_DOWNLOAD_ROOT_FOLDER_ID is required for workspace-bound evidence testing.");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yfy-v1-evidence-"));
+  assert.ok(rootFolderId, "YFY_LIVE_DOWNLOAD_ROOT_FOLDER_ID is required for workspace-bound download testing.");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yfy-download-"));
   process.env.YFY_STATE_DB = path.join(dir, "state.sqlite");
-  process.env.YFY_TOOLSETS = "drive,workspace,evidence";
+  process.env.YFY_TOOLSETS = "drive,workspace";
   process.env.YFY_WORKFLOW_PROFILES = "";
-  process.env.YFY_WORKSPACES_JSON = JSON.stringify([{ id: "evidence_scope", root_folder_id: rootFolderId, access_context: "default", tags: ["live-test"] }]);
+  process.env.YFY_WORKSPACES_JSON = JSON.stringify([{ id: "download_scope", root_folder_id: rootFolderId, access_context: "default", tags: ["live-test"] }]);
+  process.env.YFY_DOWNLOAD_EXPOSE_LOCAL_PATH = "true";
   const runtime = await AppRuntime.create(loadConfig());
   const server = new FakeServer();
   registerCatalog(server as unknown as McpServer, runtime);
-  const resourceUris: string[] = [];
+  const downloadIds: string[] = [];
   try {
     const access = runtime.access.resolveContext("default");
     const fileRef = formatItemRef("file", fileId, access.context.id, access.identityRef);
-    const handler = server.tools.get("yfy_capture")!;
-    const result = await handler({ file: fileRef, workspace: "workspace:evidence_scope" }, { signal: new AbortController().signal, sendNotification: async () => undefined });
+    const handler = server.tools.get("yfy_download")!;
+    const result = await handler({ file: fileRef, workspace: "workspace:download_scope" }, { signal: new AbortController().signal, sendNotification: async () => undefined });
     assert.notEqual(result.isError, true, JSON.stringify(result.structuredContent));
-    const resource = result.structuredContent?.resource as Record<string, unknown>;
-    assert.match(String(resource.sha256), /^[a-f0-9]{64}$/i);
-    assert.equal(resource.local_path, undefined);
-    if (typeof resource.resource_uri === "string") resourceUris.push(resource.resource_uri);
-    const verified = await handler({ file: fileRef, workspace: "workspace:evidence_scope", expected: { sha256: String(resource.sha256), size_bytes: Number(resource.size_bytes) } }, { signal: new AbortController().signal, sendNotification: async () => undefined });
+    const download = result.structuredContent?.download as Record<string, unknown>;
+    assert.match(String(download.sha256), /^[a-f0-9]{64}$/i);
+    assert.equal(typeof download.local_path, "string");
+    assert.ok(fs.existsSync(String(download.local_path)));
+    if (typeof download.download_id === "string") downloadIds.push(download.download_id);
+    const verified = await handler({ file: fileRef, workspace: "workspace:download_scope", expected: { sha256: String(download.sha256), size_bytes: Number(download.size_bytes) } }, { signal: new AbortController().signal, sendNotification: async () => undefined });
     assert.notEqual(verified.isError, true, JSON.stringify(verified.structuredContent));
-    assert.equal((verified.structuredContent?.expectation as Record<string, unknown>).verdict, "matched");
-    const verifiedResource = verified.structuredContent?.resource as Record<string, unknown>;
-    if (typeof verifiedResource?.resource_uri === "string") resourceUris.push(verifiedResource.resource_uri);
+    const verifiedDownload = verified.structuredContent?.download as Record<string, unknown>;
+    if (typeof verifiedDownload?.download_id === "string") downloadIds.push(verifiedDownload.download_id);
     const versionsHandler = server.tools.get("yfy_versions")!;
     const versionsResult = await versionsHandler({ file: fileRef }, { signal: new AbortController().signal, sendNotification: async () => undefined });
     const versions = versionsResult.structuredContent?.versions as Array<Record<string, unknown>>;
     if (process.env.YFY_LIVE_HISTORY_TESTS === "enabled" && versions.length > 1 && typeof versions[1]?.ref === "string") {
-      const historical = await handler({ file: fileRef, workspace: "workspace:evidence_scope", version: versions[1].ref }, { signal: new AbortController().signal, sendNotification: async () => undefined });
+      const historical = await handler({ file: fileRef, workspace: "workspace:download_scope", version: versions[1].ref }, { signal: new AbortController().signal, sendNotification: async () => undefined });
       assert.notEqual(historical.isError, true, JSON.stringify(historical.structuredContent));
-      const historicalResource = historical.structuredContent?.resource as Record<string, unknown>;
-      assert.equal(historicalResource.sha1, versions[1]?.sha1);
-      if (typeof historicalResource.resource_uri === "string") resourceUris.push(historicalResource.resource_uri);
+      const historicalDownload = historical.structuredContent?.download as Record<string, unknown>;
+      assert.equal(historicalDownload.sha1, versions[1]?.sha1);
+      if (typeof historicalDownload.download_id === "string") downloadIds.push(historicalDownload.download_id);
     }
   } finally {
-    const release = server.tools.get("yfy_resource_release");
-    for (const resourceUri of resourceUris) await release?.({ resource_uri: resourceUri }, { signal: new AbortController().signal, sendNotification: async () => undefined });
+    const release = server.tools.get("yfy_download_release");
+    for (const downloadId of downloadIds) await release?.({ download_id: downloadId }, { signal: new AbortController().signal, sendNotification: async () => undefined });
     await runtime.close();
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }

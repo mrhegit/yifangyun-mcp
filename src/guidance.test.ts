@@ -14,7 +14,7 @@ class FakeGuidanceServer {
 
 test("tender prompt accepts MCP string arguments", async () => {
   const server = new FakeGuidanceServer();
-  const runtime = { config: { toolsets: ["drive", "workspace", "inventory", "evidence"], workflowProfiles: ["tender"], authorityScopes: [{ id: "tender" }] } } as unknown as AppRuntime;
+  const runtime = { config: { toolsets: ["drive", "workspace", "inventory"], workflowProfiles: ["tender"], authorityScopes: [{ id: "tender" }], transport: "http", downloadExposeLocalPath: false, downloadStagedHttpEnabled: true } } as unknown as AppRuntime;
   registerGuidance(server as unknown as McpServer, runtime);
   const handler = server.prompts.get("yfy_tender_material_audit");
   assert.ok(handler);
@@ -26,7 +26,10 @@ test("tender prompt accepts MCP string arguments", async () => {
   assert.ok(compare);
   const comparison = await compare({ file: `file:501@default.${"a".repeat(24)}`, workspace: "workspace:tender", expected_sha256: "a".repeat(64) });
   assert.match(JSON.stringify(comparison), /Workspace: workspace:tender/);
-  assert.match(JSON.stringify(comparison), /yfy_capture/);
+  assert.match(JSON.stringify(comparison), /yfy_download/);
+  const downloadOriginal = server.prompts.get("yfy_tender_download_original");
+  assert.ok(downloadOriginal);
+  assert.match(JSON.stringify(await downloadOriginal({ workspace: "workspace:tender", file_hint: "bid.pdf" })), /fetch_url/);
 });
 
 test("tender prompts are absent when the profile is not configured", () => {
@@ -37,22 +40,19 @@ test("tender prompts are absent when the profile is not configured", () => {
 });
 
 test("server instructions only recommend available and ready capabilities", () => {
-  const evidenceOnly = { config: { toolsets: ["evidence"], workflowProfiles: [], authorityScopes: [] } } as unknown as AppRuntime;
-  const instructions = serverInstructions(evidenceOnly);
+  const workspaceOnly = { config: { toolsets: ["workspace"], workflowProfiles: [], authorityScopes: [] } } as unknown as AppRuntime;
+  const instructions = serverInstructions(workspaceOnly);
   assert.match(instructions, /yfy_status/);
-  assert.doesNotMatch(instructions, /inventory|yfy_capture/);
-  const ready = { config: { toolsets: ["drive", "inventory", "evidence", "transfer"], workflowProfiles: [], authorityScopes: [{ id: "workspace" }] } } as unknown as AppRuntime;
+  assert.doesNotMatch(instructions, /inventory/);
+  const ready = { config: { toolsets: ["drive", "inventory", "transfer"], workflowProfiles: [], authorityScopes: [{ id: "workspace" }], transport: "stdio", downloadExposeLocalPath: true, downloadStagedHttpEnabled: false } } as unknown as AppRuntime;
   const readyInstructions = serverInstructions(ready);
   assert.match(readyInstructions, /ItemRef.*yfy_get/);
-  assert.match(readyInstructions, /yfy_open/);
+  assert.match(readyInstructions, /yfy_download/);
+  assert.match(readyInstructions, /local_path|fetch_url/);
   assert.match(readyInstructions, /safe_to_claim_absence=true/);
   assert.match(readyInstructions, /agent_guidance/);
   assert.match(readyInstructions, /claim_allowed=true/);
-  assert.match(readyInstructions, /content_delivery/);
-  assert.match(readyInstructions, /agent_readable/);
-  assert.match(readyInstructions, /must_release/);
-  assert.match(readyInstructions, /next_action \(yfy_resource_release\)/);
-  assert.match(readyInstructions, /yfy_capture/);
+  assert.match(readyInstructions, /yfy_download_release/);
   assert.match(readyInstructions, /Do not use yfy_transfer_ticket_get/);
   assert.match(readyInstructions, /usage_policy=special_integration_only/);
   assert.match(readyInstructions, /do_not_echo_url/);

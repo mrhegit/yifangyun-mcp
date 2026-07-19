@@ -1,51 +1,67 @@
-﻿# OpenAPI 覆盖矩阵
+# OpenAPI 覆盖矩阵
 
-`1.0.0` 不按 endpoint 创建浅工具，而是把 Provider 差异隐藏在 Drive、Workspace、Inventory、Content 和 Organization Module 内。所有项目工具使用 context-bound Ref，分页工具统一使用扁平 first 字段 / `cursor` 续页契约（见 `docs/migration-v1.md`）。当前服务器不包含 PDF/Office 正文解析、OCR 或 Provider 知识库训练/召回；知识库能力需要独立授权与状态工作流，不属于当前工具集。
+版本 `1.1.0-beta.1` **不是**“一个 HTTP endpoint 对应一个 MCP 工具”，而是把 Provider 差异收敛到 Drive、Workspace、Inventory、Download、Organization 等模块中。
+
+共性约定：
+
+- 工具使用绑定访问上下文的 Ref（context-bound Ref）
+- 分页：首次用扁平业务字段，续页用 `cursor` / `next_action`
+- **不包含**：PDF/Office 正文解析、OCR、Provider 知识库训练/召回
+
+---
 
 ## Drive
 
 | Provider 能力 | 工具 | 状态 |
 |---|---|---|
-| personal/collaboration/department/folder/workspace roots | `yfy_browse` | 已覆盖 |
-| folder/file info | `yfy_get`、`yfy_get_many` | 已覆盖 |
-| indexed search | `yfy_search` | 已覆盖，非穷尽；返回字段级 match evidence |
-| exact path traversal | `yfy_resolve` | 组合覆盖；同名候选返回 ambiguous |
-| version list | `yfy_versions` | 已覆盖，VersionRef 绑定完整 FileRef |
-| current/historical download | `yfy_open` | 组合覆盖并校验内容 |
-| comments/shares | `yfy_comments`、`yfy_shares` | 已覆盖，分享敏感字段脱敏 |
+| personal / collaboration / department / folder / workspace 根 | `yfy_browse` | 已覆盖 |
+| 文件夹 / 文件信息 | `yfy_get`、`yfy_get_many` | 已覆盖 |
+| 索引搜索 | `yfy_search` | 已覆盖；**非穷尽**；返回字段级匹配依据 |
+| 精确路径遍历 | `yfy_resolve` | 组合覆盖；同名返回 ambiguous |
+| 版本列表 | `yfy_versions` | 已覆盖；VersionRef 绑定完整 FileRef |
+| 当前 / 历史下载 | `yfy_download` | 落盘校验；stdio → `local_path`，HTTP → `fetch_url` |
+| 评论 / 分享列表 | `yfy_comments`、`yfy_shares` | 已覆盖；分享敏感字段脱敏 |
 
-## Workspace、Inventory 与 Capture
+---
+
+## Workspace、Inventory、Download
 
 | Provider 能力 | 工具 | 状态 |
 |---|---|---|
-| folder/department ancestry | `yfy_workspace_validate` | 组合覆盖，检查为 pass/fail/unavailable |
-| file path membership | `yfy_membership_check` | 组合覆盖，结果为 inside/outside/unavailable |
-| recursive complete observation | `yfy_inventory_*` | SQLite 后台覆盖，分离 Workspace root/scan root，支持 refresh、固定 commit watermark 和显式 release |
-| validated current/historical bytes | `yfy_open`、`yfy_capture` | Workspace-bound 组合覆盖；小文本可按 MCP embedded resource 交付 |
-| expected metadata/content assertions | `yfy_capture.expected` | mismatch 为错误并回滚 |
-| resource lifecycle | `yfy_resource_release` | 单体和 multipart 均覆盖 |
-| inventory artifact lifecycle | `yfy_inventory_release` | Inventory、cursor、manifest 和 receipt 一并失效 |
+| 文件夹 / 部门祖先关系 | `yfy_workspace_validate` | 组合覆盖；检查为 pass / fail / unavailable |
+| 文件是否在业务范围内 | `yfy_membership_check` | 组合覆盖；inside / outside / unavailable |
+| 递归完整观测 | `yfy_inventory_*` | Worker 线程 + SQLite 后台扫描；区分 Workspace 根与 scan 根；支持 refresh、查询绑定固定 commit_watermark、显式 release |
+| 校验后的当前 / 历史字节 | `yfy_download` | 可选 `workspace`；小文本 preview；大文件整文件落盘 |
+| 期望元数据 / 内容断言 | `yfy_download.expected` | 不匹配则报错并删除 temp |
+| 下载生命周期 | `yfy_download_release` + TTL | 可显式释放；主清理路径为 TTL |
+| 清单生命周期 | `yfy_inventory_release` | Inventory、cursor、manifest、receipt 一并失效 |
+
+说明：`commit_watermark` 表示已成功写入本地库的扫描进度；Inventory 搜索/分页绑定该值，避免读到未提交观测。
+
+---
 
 ## Organization 与写入
 
 | Provider 能力 | 工具 |
 |---|---|
-| department info/children/users | `yfy_department_get/children/users` |
-| user search | `yfy_user_search` |
-| group list/users | `yfy_group_list/users` |
-| collaboration | `yfy_collaboration_read/mutate` |
-| folder/file mutation and upload | mutation toolset |
-| enterprise administration | admin toolset；Provider 未声明 page capacity 的列表使用本地 offset/limit cursor |
+| 部门信息 / 子部门 / 部门用户 | `yfy_department_get` / `children` / `users` |
+| 用户搜索 | `yfy_user_search` |
+| 群组列表 / 群组成员 | `yfy_group_list` / `users` |
+| 协作 | `yfy_collaboration_read` / `mutate` |
+| 文件夹 / 文件变更与上传 | mutation toolset |
+| 企业管理 | admin toolset；Provider 未声明 page capacity 的列表使用本地 offset/limit cursor |
+
+---
 
 ## 暂未覆盖
 
-- tags 和文件标签管理
-- favorite/recent items
-- recycle bin 批量操作
-- file version promote/delete
-- pack download
-- share-link create/update/close
-- comment create/delete
-- review、knowledge base 和 device synchronization
+- 标签（tags）与文件标签管理
+- 收藏 / 最近项
+- 回收站批量操作
+- 文件版本 promote / delete
+- 打包下载
+- 分享链接创建 / 更新 / 关闭
+- 评论创建 / 删除
+- 审批、知识库、设备同步
 
-扩展时应优先加深现有 Module，避免重新引入一 endpoint 一 tool 的接口。
+扩展时优先加深现有模块，避免重新退回“一 endpoint 一 tool”。

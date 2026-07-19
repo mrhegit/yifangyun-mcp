@@ -2,6 +2,8 @@
 
 import crypto from "node:crypto";
 import type { Server as HttpServer } from "node:http";
+import { pathToFileURL } from "node:url";
+import { pipeline } from "node:stream/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -14,7 +16,8 @@ import { AppRuntime } from "./runtime/runtime.js";
 import { registerCatalog } from "./tools/registerCatalog.js";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
 
-interface RunningServer {
+export interface RunningServer {
+  baseUrl?: string;
   close(): Promise<void>;
 }
 
@@ -35,7 +38,7 @@ function mcpRequestId(body: unknown): unknown {
   return typeof body === "object" && body !== null && "id" in body ? (body as { id?: unknown }).id ?? null : null;
 }
 
-async function runStdio(runtime: AppRuntime): Promise<RunningServer> {
+export async function runStdio(runtime: AppRuntime): Promise<RunningServer> {
   const server = createServer(runtime);
   const transport = new StdioServerTransport();
   await server.connect(transport);
@@ -43,16 +46,19 @@ async function runStdio(runtime: AppRuntime): Promise<RunningServer> {
   return { close: async () => server.close() };
 }
 
-async function runHttp(runtime: AppRuntime): Promise<RunningServer> {
+export async function runHttp(runtime: AppRuntime): Promise<RunningServer> {
   const config = runtime.config;
   const host = config.httpHost ?? "127.0.0.1";
   const port = config.httpPort ?? 3000;
   const isLocalHost = host === "127.0.0.1" || host === "localhost" || host === "::1";
-  if (!isLocalHost && !config.httpBearerToken) {
-    throw new Error("YFY_HTTP_BEARER_TOKEN is required when HTTP transport binds to a non-localhost address.");
+  const stagedPublicHost = config.downloadStagedPublicBaseUrl ? new URL(config.downloadStagedPublicBaseUrl).hostname : undefined;
+  const remotePublicDelivery = stagedPublicHost !== undefined && !["localhost", "127.0.0.1", "::1", "[::1]"].includes(stagedPublicHost);
+  const externallyReachable = !isLocalHost || remotePublicDelivery;
+  if (externallyReachable && !config.httpBearerToken) {
+    throw new Error("YFY_HTTP_BEARER_TOKEN is required for non-localhost HTTP or staged download delivery.");
   }
-  if (!isLocalHost && (!config.httpAllowedHosts?.length || !config.httpAllowedOrigins?.length)) {
-    throw new Error("YFY_HTTP_ALLOWED_HOSTS and YFY_HTTP_ALLOWED_ORIGINS are required for non-localhost HTTP transport.");
+  if (externallyReachable && (!config.httpAllowedHosts?.length || !config.httpAllowedOrigins?.length)) {
+    throw new Error("YFY_HTTP_ALLOWED_HOSTS and YFY_HTTP_ALLOWED_ORIGINS are required for externally reachable HTTP delivery.");
   }
   const app = createMcpExpressApp({ host, ...(config.httpAllowedHosts ? { allowedHosts: config.httpAllowedHosts } : {}) });
   app.disable("x-powered-by");
@@ -169,6 +175,58 @@ async function runHttp(runtime: AppRuntime): Promise<RunningServer> {
       }
     }
   });
+  if (config.downloadStagedHttpEnabled) {
+    // Express 5 optional path segments use braces. The file name is cosmetic; download_id is authoritative.
+    app.get("/staged/v1/:downloadId{/:fileName}", async (request, response) => {
+      const downloadId = String(request.params.downloadId ?? "");
+      if (!/^dl_[a-f0-9]{32}$/.test(downloadId)) {
+        response.status(400).json({ error: "Invalid download id." });
+        return;
+      }
+      let lease: Awaited<ReturnType<AppRuntime["downloads"]["acquireForHttpFetch"]>> | undefined;
+      const abortController = new AbortController();
+      const abort = () => abortController.abort();
+      const abortOnResponseClose = () => {
+        if (!response.writableEnded) abort();
+      };
+      request.once("aborted", abort);
+      response.once("close", abortOnResponseClose);
+      try {
+        lease = await runtime.downloads.acquireForHttpFetch(downloadId, abortController.signal);
+        const record = lease.record;
+        response.status(200);
+        response.setHeader("Content-Type", record.mediaType || "application/octet-stream");
+        response.setHeader("Content-Length", String(record.sizeBytes));
+        response.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(record.fileName)}`);
+        response.setHeader("Cache-Control", "no-store");
+        response.setHeader("ETag", `"${record.sha256}"`);
+        await pipeline(lease.createReadStream(), response);
+      } catch (error) {
+        const code = error instanceof Error && "code" in error ? String((error as { code?: string }).code) : "";
+        if (!response.headersSent && (code === "YFY_DOWNLOAD_NOT_FOUND" || code === "YFY_DOWNLOAD_FETCH_LIMIT")) {
+          response.status(404).json({ error: "Download unavailable." });
+          return;
+        }
+        if (!response.headersSent && code === "YFY_DOWNLOAD_INTEGRITY_FAILED") {
+          response.status(410).json({ error: "Download integrity failed." });
+          return;
+        }
+        if (!response.headersSent && code === "YFY_DOWNLOAD_READ_CAPACITY") {
+          response.setHeader("Retry-After", "1");
+          response.status(503).json({ error: "Download capacity is busy." });
+          return;
+        }
+        if (code === "YFY_REQUEST_CANCELLED") return;
+        logEvent("error", "staged_download_failed", { error: error instanceof Error ? error.message : String(error) });
+        if (!response.headersSent) response.status(500).json({ error: "Internal server error." });
+        else response.destroy();
+      } finally {
+        request.off("aborted", abort);
+        response.off("close", abortOnResponseClose);
+        await lease?.release().catch(() => undefined);
+      }
+    });
+  }
   app.get("/health", (_request, response) => response.json({ status: "ok", version: SERVER_VERSION }));
   app.get("/metrics", (_request, response) => response.json(metrics.snapshot()));
   const httpServer = await new Promise<HttpServer>((resolve) => {
@@ -177,7 +235,11 @@ async function runHttp(runtime: AppRuntime): Promise<RunningServer> {
       resolve(httpServer);
     });
   });
+  const address = httpServer.address();
+  const actualPort = typeof address === "object" && address ? address.port : port;
+  const displayHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   return {
+    baseUrl: `http://${displayHost}:${actualPort}`,
     close: async () => {
       acceptingRequests = false;
       clearInterval(sessionCleanupTimer);
@@ -217,8 +279,11 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`yifangyun-mcp-server failed: ${message}`);
-  process.exit(1);
-});
+const entryPoint = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";
+if (import.meta.url === entryPoint) {
+  main().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`yifangyun-mcp-server failed: ${message}`);
+    process.exit(1);
+  });
+}

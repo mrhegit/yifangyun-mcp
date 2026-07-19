@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -42,6 +45,9 @@ function config(toolsets: AppConfig["toolsets"]): AppConfig {
     defaultAccessContext: "default",
     defaultUserId: "530",
     enterpriseId: "115",
+    downloadExposeLocalPath: true,
+    downloadStagedHttpEnabled: false,
+    downloadStagedMaxFetches: 10,
     logLevel: "info",
     maxDownloadBytes: 1024,
     maxPageCapacity: 500,
@@ -49,7 +55,7 @@ function config(toolsets: AppConfig["toolsets"]): AppConfig {
     retryBaseDelayMs: 1,
     retryMaxAttempts: 1,
     stateDatabasePath: ":memory:",
-    tempDir: process.cwd(),
+    tempDir: path.join(os.tmpdir(), `yfy-catalog-${crypto.randomUUID()}`),
     tempFileTtlSeconds: 1,
     tokenRefreshSkewSeconds: 30,
     toolsets,
@@ -58,9 +64,9 @@ function config(toolsets: AppConfig["toolsets"]): AppConfig {
   };
 }
 
-test("the stable release starts all internal format versions at one", () => {
+test("the breaking download contract advances only the public contract version", () => {
   const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
-  assert.equal(SERVER_VERSION, "1.0.0");
+  assert.equal(SERVER_VERSION, "1.1.0-beta.1");
   assert.equal(packageJson.version, SERVER_VERSION);
   assert.deepEqual([
     CONTRACT_VERSION,
@@ -69,24 +75,22 @@ test("the stable release starts all internal format versions at one", () => {
     INVENTORY_REF_VERSION,
     SNAPSHOT_SCHEMA_VERSION,
     WORKSPACE_FINGERPRINT_VERSION
-  ], [1, 1, 1, 1, 1, 1]);
+  ], [2, 1, 1, 1, 1, 1]);
 });
 
 test("default catalog exposes the current tools and schemas", async () => {
-  const runtime = await AppRuntime.create(config(["drive", "workspace", "inventory", "evidence", "organization"]));
+  const runtime = await AppRuntime.create(config(["drive", "workspace", "inventory", "organization"]));
   const server = new FakeServer();
   try {
     registerCatalog(server as unknown as McpServer, runtime);
     const expected = [
-      "yfy_browse", "yfy_capture", "yfy_comments", "yfy_department_children", "yfy_department_get", "yfy_department_users",
-      "yfy_get", "yfy_get_many", "yfy_group_list", "yfy_group_users", "yfy_inventory_cancel", "yfy_inventory_create",
-      "yfy_inventory_get", "yfy_inventory_release", "yfy_inventory_search", "yfy_membership_check", "yfy_open", "yfy_resolve", "yfy_resource_release",
-      "yfy_search", "yfy_shares", "yfy_status", "yfy_user_search", "yfy_versions", "yfy_workspace_validate"
+      "yfy_browse", "yfy_comments", "yfy_department_children", "yfy_department_get", "yfy_department_users",
+      "yfy_download", "yfy_download_release", "yfy_get", "yfy_get_many", "yfy_group_list", "yfy_group_users",
+      "yfy_inventory_cancel", "yfy_inventory_create", "yfy_inventory_get", "yfy_inventory_release", "yfy_inventory_search",
+      "yfy_membership_check", "yfy_resolve", "yfy_search", "yfy_shares", "yfy_status", "yfy_user_search", "yfy_versions",
+      "yfy_workspace_validate"
     ];
     assert.deepEqual([...server.tools.keys()].sort(), expected);
-    for (const removed of ["yfy_context_get", "yfy_root_list", "yfy_item_search", "yfy_authority_validate", "yfy_scope_check", "yfy_snapshot_create", "yfy_evidence_capture", "yfy_evidence_release"]) {
-      assert.equal(server.tools.has(removed), false, `${removed} must not be registered`);
-    }
     assert.ok((server.tools.get("yfy_status")!.definition.outputSchema as Record<string, unknown>).places);
     assert.ok(server.tools.get("yfy_inventory_search")!.definition.outputSchema);
     const inventoryInput = server.tools.get("yfy_inventory_search")!.definition.inputSchema as z.ZodObject<z.ZodRawShape>;
@@ -96,14 +100,16 @@ test("default catalog exposes the current tools and schemas", async () => {
     assert.equal((server.tools.get("yfy_inventory_create")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
     assert.equal((server.tools.get("yfy_inventory_cancel")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
     assert.equal((server.tools.get("yfy_inventory_release")!.definition.annotations as { destructiveHint: boolean }).destructiveHint, true);
-    assert.equal((server.tools.get("yfy_capture")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, true);
+    assert.equal((server.tools.get("yfy_download")!.definition.annotations as { readOnlyHint: boolean }).readOnlyHint, false);
+    assert.equal((server.tools.get("yfy_download_release")!.definition.annotations as { destructiveHint: boolean }).destructiveHint, true);
+    assert.equal((server.tools.get("yfy_download_release")!.definition.annotations as { openWorldHint: boolean }).openWorldHint, false);
   } finally {
     await runtime.close();
   }
 });
 
 test("optional toolsets preserve mutation, collaboration, admin and transfer capability", async () => {
-  const runtime = await AppRuntime.create(config(["drive", "workspace", "inventory", "evidence", "organization", "mutation", "collaboration", "admin", "transfer"]));
+  const runtime = await AppRuntime.create(config(["drive", "workspace", "inventory", "organization", "mutation", "collaboration", "admin", "transfer"]));
   const server = new FakeServer();
   try {
     registerCatalog(server as unknown as McpServer, runtime);
@@ -119,9 +125,9 @@ test("optional toolsets preserve mutation, collaboration, admin and transfer cap
 });
 
 test("the MCP client compiles every catalog output schema", async () => {
-  const runtime = await AppRuntime.create(config(["drive", "workspace", "inventory", "evidence", "organization", "mutation", "collaboration", "admin", "transfer"]));
-  const server = new RealMcpServer({ name: "schema-test", version: "1.0.0" });
-  const client = new Client({ name: "schema-client", version: "1.0.0" });
+  const runtime = await AppRuntime.create(config(["drive", "workspace", "inventory", "organization", "mutation", "collaboration", "admin", "transfer"]));
+  const server = new RealMcpServer({ name: "schema-test", version: "1.1.0-beta.1" });
+  const client = new Client({ name: "schema-client", version: "1.1.0-beta.1" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   try {
     registerCatalog(server, runtime);
@@ -160,12 +166,11 @@ test("the MCP client compiles every catalog output schema", async () => {
 });
 
 test("drive tools are absent when the drive toolset is disabled", async () => {
-  const runtime = await AppRuntime.create(config(["evidence"]));
+  const runtime = await AppRuntime.create(config(["workspace"]));
   const server = new FakeServer();
   try {
     registerCatalog(server as unknown as McpServer, runtime);
-    assert.ok(server.tools.has("yfy_capture"));
-    assert.ok(server.tools.has("yfy_resource_release"));
+    assert.ok(!server.tools.has("yfy_download"));
     assert.ok(!server.tools.has("yfy_get"));
     assert.ok(server.tools.has("yfy_status"));
   } finally {
@@ -175,10 +180,9 @@ test("drive tools are absent when the drive toolset is disabled", async () => {
 
 test("status enables only workflows whose complete tool chain is registered", async () => {
   const cases: Array<{ enabled: string[]; toolsets: AppConfig["toolsets"] }> = [
-    { toolsets: ["evidence"], enabled: [] },
-    { toolsets: ["workspace", "evidence"], enabled: [] },
-    { toolsets: ["drive", "evidence"], enabled: ["read_small_text"] },
-    { toolsets: ["drive", "workspace", "evidence"], enabled: ["read_small_text", "capture_evidence"] },
+    { toolsets: ["workspace"], enabled: [] },
+    { toolsets: ["drive"], enabled: ["read_small_text"] },
+    { toolsets: ["drive", "workspace"], enabled: ["read_small_text", "workspace_download"] },
     { toolsets: ["inventory"], enabled: [] },
     { toolsets: ["workspace", "inventory"], enabled: ["absence_audit"] }
   ];
@@ -195,7 +199,8 @@ test("status enables only workflows whose complete tool chain is registered", as
       configFingerprint: "a".repeat(64),
       gateway: { context: () => ({ context: { id: "default", userId: "530" }, identityRef: "a".repeat(24) }) },
       instanceId: "test-instance",
-      startedAtIso: "2026-07-18T00:00:00.000Z"
+      startedAtIso: "2026-07-18T00:00:00.000Z",
+      tempStorage: { usage: () => ({ max_bytes: 1024, reserved_bytes: 0, used_bytes: 0 }) }
     } as unknown as AppRuntime;
     const server = new FakeServer();
     registerCatalog(server as unknown as McpServer, runtime);
@@ -205,6 +210,9 @@ test("status enables only workflows whose complete tool chain is registered", as
     assert.equal(serverIdentity.contract_version, CONTRACT_VERSION);
     const workflows = result.structuredContent?.recommended_workflows as Array<Record<string, unknown>>;
     assert.deepEqual(workflows.filter((workflow) => workflow.enabled === true).map((workflow) => workflow.id), item.enabled);
+    const delivery = result.structuredContent?.download_delivery as Record<string, unknown>;
+    assert.equal(delivery.transport, "stdio");
+    assert.equal(delivery.local_path, true);
   }
 });
 
