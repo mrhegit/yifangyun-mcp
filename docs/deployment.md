@@ -84,6 +84,161 @@ GET /metrics
 
 ---
 
+## HTTP 模式启动
+
+服务**只读进程环境变量**，不会自动加载 `.env`。HTTP 模式必须设置 `YFY_TRANSPORT=http`（未设置时默认 `stdio`，不会监听端口）。
+
+变量语义见 [配置指南 · 传输模式](configuration.md#传输模式transport) 与 [HTTP Server](configuration.md#http-server)。
+
+### 方式一：npx 启动脚本（推荐，Win / macOS / Linux）
+
+仓库提供跨平台脚本 [`scripts/start-npx.mjs`](../scripts/start-npx.mjs)（**需检出本仓库**；不随 `npm install -g` 全局包分发）：通过 `npx` 拉取发布包启动，**无需**在业务目录 `npm install` 业务依赖，也**无需**本地 `npm run build`。
+
+| 项 | 说明 |
+|---|---|
+| 运行时 | Node.js `>=24`，本机 `npm` / `npx` 在 PATH 中 |
+| 默认环境文件 | **脚本同目录** `scripts/.env` |
+| 参数覆盖 | `--env-file` / `-e` 指定任意路径（**优先于**默认文件） |
+| 合并规则 | 进程中**非空**变量优先于文件；**缺失或空字符串**可由文件补全 |
+| env 格式 | 最小 `KEY=VALUE`；`#` 整行注释；未加引号值支持行内 `#`；UTF-8 BOM 可识别 |
+| 包版本 | 默认读取仓库 `package.json` 的 `name@version`；可用 `--package` 覆盖（仅允许安全 npm 说明符） |
+| Transport | 文件与进程均未设置（或为空）`YFY_TRANSPORT` 时，脚本默认注入 `http` |
+| npx 工作目录 | 使用系统临时目录下的中立路径（非仓库根）。在本仓库根执行同名 `npx yifangyun-mcp-server@…` 会与本地 package 冲突，Windows 上常报「不是内部或外部命令」；脚本已规避。仍为 npx 临时缓存，**不**写入项目 `node_modules` |
+| 关闭 | Ctrl+C / SIGTERM；Windows 下脚本会尝试 `taskkill` 清理进程树，若端口仍占用请手动结束残留 `node` |
+
+准备环境文件：
+
+```bash
+# 从示例复制到脚本同目录（默认读取路径）
+cp scripts/http.env.example scripts/.env
+# Windows PowerShell:
+# Copy-Item scripts\http.env.example scripts\.env
+
+# 编辑 scripts/.env，至少填写：
+# YFY_CLIENT_ID / YFY_CLIENT_SECRET / YFY_ENTERPRISE_ID / YFY_DEFAULT_USER_ID
+# YFY_TRANSPORT=http
+# YFY_HTTP_HOST=127.0.0.1
+# YFY_HTTP_PORT=3000
+```
+
+启动：
+
+```bash
+# 默认读取 scripts/.env
+node scripts/start-npx.mjs
+
+# 或 npm script（等价）
+npm run start:http:npx
+
+# 参数指定 env（优先级更高；路径可为绝对或相对当前工作目录）
+node scripts/start-npx.mjs --env-file ./http.prod.env
+node scripts/start-npx.mjs -e /etc/yifangyun-mcp/env
+
+# 固定/覆盖发布包版本
+node scripts/start-npx.mjs --package yifangyun-mcp-server@1.1.0-beta.3
+
+# 帮助
+node scripts/start-npx.mjs --help
+```
+
+本机验证：
+
+```bash
+curl -sS http://127.0.0.1:3000/health
+# 若配置了 YFY_HTTP_BEARER_TOKEN，则所有路径（含 /health）均需：
+# curl -sS -H "Authorization: Bearer <token>" http://127.0.0.1:3000/health
+```
+
+| 端点 | 用途 |
+|---|---|
+| `GET /health` | 存活检查 |
+| `POST/GET/DELETE /mcp` | MCP Streamable HTTP |
+| `GET /staged/v1/{download_id}/...` | `yfy_download` 的 `fetch_url` |
+| `GET /metrics` | 进程内指标快照 |
+
+### 方式二：直接 npx（不经仓库脚本）
+
+适合临时拉起；环境须由 shell 或编排系统注入。
+
+**重要（Windows 尤其）：不要在本仓库根目录执行** `npx -y yifangyun-mcp-server@…`。  
+本仓库 `package.name` 与发布包同名，在仓库根直接 npx 常导致「不是内部或外部命令」或误用本地/祖先目录安装。  
+请先 `cd` 到**非本仓库**路径（如用户主目录或 `%TEMP%`），或改用方式一脚本（已自动使用中立 cwd）。有仓库时**更推荐方式一**。
+
+```bash
+# 先离开本仓库根目录，例如：
+# cd $TEMP          # bash
+# cd $env:TEMP      # PowerShell
+
+export YFY_CLIENT_ID=...
+export YFY_CLIENT_SECRET=...
+export YFY_ENTERPRISE_ID=115
+export YFY_DEFAULT_USER_ID=530
+export YFY_TRANSPORT=http
+export YFY_HTTP_HOST=127.0.0.1
+export YFY_HTTP_PORT=3000
+npx -y yifangyun-mcp-server@1.1.0-beta.3
+```
+
+用 env 文件时（Node 将 `--env-file` 传给子进程）。**路径勿含未转义空格**；`NODE_OPTIONS` 会影响该 npx 链路中的 Node 进程：
+
+```bash
+# 同样须在非本仓库根目录执行
+# Unix（路径无空格时）
+NODE_OPTIONS='--env-file=/path/to/http.env' npx -y yifangyun-mcp-server@1.1.0-beta.3
+
+# Windows PowerShell
+$env:NODE_OPTIONS = "--env-file=C:\path\to\http.env"
+npx -y yifangyun-mcp-server@1.1.0-beta.3
+```
+
+### 方式三：全局安装 / 本地 dist
+
+```bash
+npm install -g yifangyun-mcp-server@1.1.0-beta.3
+# 注入环境后：
+yifangyun-mcp-server
+```
+
+或仓库构建产物：
+
+```bash
+npm run build
+node --env-file=.env dist/index.js
+```
+
+### 本机 HTTP 与生产 HTTP
+
+**本机开发（回环）最小集：**
+
+```env
+YFY_TRANSPORT=http
+YFY_HTTP_HOST=127.0.0.1
+YFY_HTTP_PORT=3000
+```
+
+HTTP 默认：`YFY_DOWNLOAD_STAGED_HTTP=enabled`，`YFY_DOWNLOAD_EXPOSE_LOCAL_PATH=disabled`，下载返回 `fetch_url`。localhost 可不配 Bearer，仅建议可信本机使用。
+
+**生产 / 远程交付**（下列任一成立即须完整安全配置）：
+
+- `YFY_HTTP_HOST` 非回环，或
+- `YFY_DOWNLOAD_STAGED_PUBLIC_BASE_URL` 指向非回环主机
+
+此时必须同时配置：`YFY_HTTP_BEARER_TOKEN`、`YFY_HTTP_ALLOWED_HOSTS`、`YFY_HTTP_ALLOWED_ORIGINS`；非 localhost 的 public base 必须为 HTTPS。推荐进程只监听 `127.0.0.1`，由反向代理终止 TLS（见上一节「远程 HTTP」）。
+
+### 常见启动失败
+
+| 现象 | 原因 |
+|---|---|
+| 无端口监听 | 未设置 `YFY_TRANSPORT=http`（服务默认 stdio；直接 npx 不会自动注入 http） |
+| 启动报 Bearer / Host / Origin | 远程可访问但安全项不全 |
+| 缺 Client ID | env 未注入、文件路径错误，或 shell 里空串未被子进程/文件正确覆盖 |
+| npx 失败 /「不是内部或外部命令」 | ① 在**本仓库根**直接 `npx yifangyun-mcp-server`（应用方式一或先 `cd` 到非仓库目录）；② Node &lt; 24 / npm 不在 PATH |
+| health / 日志版本与请求的 `@版本` 不一致 | 祖先路径上有旧安装（如 `%USERPROFILE%\node_modules\yifangyun-mcp-server`）被优先使用。排查：`npm ls yifangyun-mcp-server --prefix %USERPROFILE%`（Unix: `$HOME`）；卸掉旧包或升到目标版本后重试 |
+| Inventory database already open | 另一实例占用同一 `YFY_STATE_DB`，或异常退出留下 `.lock`。结束旧进程；必要时删除 `<state>.lock`（确认无存活进程后） |
+| Windows 关不干净 | Ctrl+C 后端口仍占用：结束残留 node，或检查防火墙/其它进程 |
+
+---
+
 ## 临时目录与状态库
 
 生产环境建议显式设置：
@@ -163,3 +318,10 @@ npm pack --dry-run
 `npm run build` 会把包版本、构建 ID 和 Git commit 固化到编译产物；本地脏工作区的自动 build ID 带 `.dirty` 后缀。发布 workflow 在 job 级注入 tag 与 commit，只生成一次真实 `.tgz`，检查其 build metadata 和文档 denylist，再发布同一个 tarball。运行时 `yfy_status` 不依赖部署目录存在 `.git`。
 
 发布前还应实际启动一次 HTTP transport，并对 staged 文件做真实 GET，不能只验证 URL 字符串是否生成。
+
+npx 启动脚本冒烟（不拉起长驻服务也可）：
+
+```bash
+node scripts/start-npx.mjs --help
+node --test scripts/start-npx.test.mjs
+```

@@ -158,8 +158,28 @@ npm pack --dry-run
 启动（需 Node.js `>=24`）：
 
 ```bash
+# 本地构建产物 + 项目根 .env
 node --env-file=.env dist/index.js
 ```
+
+### HTTP 模式（npx，跨平台）
+
+需**检出本仓库**（脚本不随全局 npm 包分发）。无需本地 `npm install` 业务依赖、无需 `build`，通过 `npx` 拉发布包启动：
+
+```bash
+# 1) 准备脚本同目录环境文件
+cp scripts/http.env.example scripts/.env   # Windows: Copy-Item scripts\http.env.example scripts\.env
+# 编辑 scripts/.env，填写 Client ID/Secret 等，并保持 YFY_TRANSPORT=http
+
+# 2) 启动（默认读 scripts/.env）
+node scripts/start-npx.mjs
+# 或: npm run start:http:npx
+
+# 指定其它 env 文件（优先级更高）
+node scripts/start-npx.mjs --env-file ./http.prod.env
+```
+
+本机验证：`curl http://127.0.0.1:3000/health`（若 `YFY_HTTP_HOST=0.0.0.0`，仍用 `127.0.0.1` 探测）。完整说明见 [部署指南 · HTTP 模式启动](docs/deployment.md#http-模式启动)。
 
 ## 文档索引
 
@@ -168,6 +188,6 @@ node --env-file=.env dist/index.js
 | [配置指南](docs/configuration.md) | 环境变量、toolset、传输与下载交付 |
 | [工具参考](docs/tools.md) | 各工具契约、参数与错误 |
 | [架构与安全](docs/architecture-security.md) | 模块边界、下载与 staged 完整性 |
-| [部署指南](docs/deployment.md) | stdio/HTTP、反向代理、容器与监控 |
+| [部署指南](docs/deployment.md) | stdio/HTTP、npx 启动、反向代理、容器与监控 |
 | [OpenAPI 覆盖](docs/openapi-coverage.md) | Provider 能力与工具映射 |
 | [测试指南](docs/testing.md) | 单元 / 性能 / Live 测试 |

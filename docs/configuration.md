@@ -116,6 +116,8 @@ HTTP 默认：
 
 localhost 可不配 Bearer，但仅建议用于可信本机开发。
 
+启动方式（npx 脚本 / 全局包 / dist）见 [部署指南 · HTTP 模式启动](deployment.md#http-模式启动)。
+
 ### 远程 HTTP
 
 ```env
